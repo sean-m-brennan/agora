@@ -1,0 +1,24 @@
+# Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors. Apache-2.0.
+name: agora
+description: >-
+  Agora — a decentralized social app on AutonomousTrust (persons = AT nodes,
+  businesses = Ethne polities). Native Flutter client driving the AT C core.
+publish_to: 'none'
+version: 0.0.1
+
+environment:
+  sdk: ^3.5.0
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

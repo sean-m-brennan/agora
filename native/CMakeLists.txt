@@ -1,0 +1,110 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+#
+# Native layer for Agora (Linux + macOS):
+#   - builds the AutonomousTrust C core (libautonomous_trust, SHARED)
+#   - libagora_shim : the flat FFI surface Dart binds
+#   - agorad        : the standalone AT daemon the GUI spawns
+#
+# DTN (AT_NET_DTN) and ZTA (AT_ZTA) are left OFF (their defaults) — do not
+# enable them here; the heavy third_party DTN stack is not needed for Agora.
+
+# The AT C core is project(... C CXX); enable both here so the CXX toolchain is
+# configured before the AT subdirectory is added.
+cmake_minimum_required(VERSION 3.23)
+project(agora_native C CXX)
+
+# Location of the AutonomousTrust C core, inside the autonomous_trust submodule.
+# apps/agora/native -> ../../../lib/autonomous_trust/src/c
+set(AT_C_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../lib/autonomous_trust/src/c"
+    CACHE PATH "AutonomousTrust C core source directory")
+
+if(NOT EXISTS "${AT_C_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "AutonomousTrust C core not found at ${AT_C_DIR}. "
+        "Run: git submodule update --init --recursive")
+endif()
+
+# Don't build AT's own test suite (it needs libcheck/subunit). If the AT core
+# does not honor BUILD_TESTING, build it standalone and link it as an IMPORTED
+# target instead of add_subdirectory (see .claude/TODO.md).
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+
+add_subdirectory("${AT_C_DIR}" at_core)
+
+# AT marks its library sources PUBLIC (`target_sources(autonomous_trust PUBLIC
+# ${libsrc})`), which propagates EVERY AT .c file as an interface source into
+# anything that links the target — recompiling the whole core in the consumer's
+# object dir, and without AT's directory-scoped include paths. Strip the
+# interface sources: we link the built library, not its sources.
+set_property(TARGET autonomous_trust PROPERTY INTERFACE_SOURCES "")
+
+# AT exposes its headers via directory-scoped include_directories() (its
+# CMakeLists line ~747: src/c and src/c/autonomous_trust), which do NOT
+# propagate to this subdirectory. Replicate them, plus AT's generated-header
+# binary dir, for our consumers.
+set(AT_INCLUDE_DIRS
+    "${AT_C_DIR}"
+    "${AT_C_DIR}/autonomous_trust"
+    "${CMAKE_CURRENT_BINARY_DIR}/at_core"
+    "${CMAKE_CURRENT_BINARY_DIR}/at_core/autonomous_trust"
+    # generated protobuf-c headers (AT's PROTO_BINARY_DIR, its CMake line ~879)
+    "${CMAKE_CURRENT_BINARY_DIR}/at_core/protobuf"
+    "${CMAKE_CURRENT_BINARY_DIR}/at_core/protobuf/autonomous_trust/core/protobuf")
+
+# libautonomous_trust.so is deliberately underlinked (AT links its deps only
+# into final executables, not the shared lib — a .so may carry unresolved
+# symbols). So each consumer must resolve AT's own dependencies. It is CXX-
+# linked, hence stdc++.
+find_library(AT_SODIUM_LIB    sodium     REQUIRED)
+find_library(AT_JANSSON_LIB   jansson    REQUIRED)
+find_library(AT_UUID_LIB      uuid       REQUIRED)
+find_library(AT_PROTOBUFC_LIB protobuf-c REQUIRED)
+find_library(AT_PROTOBUF_LIB  protobuf   REQUIRED)  # C++ runtime (ShutdownProtobufLibrary)
+set(AT_LINK_LIBS
+    autonomous_trust
+    ${AT_SODIUM_LIB} ${AT_JANSSON_LIB} ${AT_UUID_LIB}
+    ${AT_PROTOBUFC_LIB} ${AT_PROTOBUF_LIB}
+    pthread m stdc++)
+
+# --- Flat FFI shim -----------------------------------------------------------
+add_library(agora_shim SHARED at_agora_shim.c)
+target_include_directories(agora_shim PRIVATE ${AT_INCLUDE_DIRS})
+target_link_libraries(agora_shim PRIVATE ${AT_LINK_LIBS})
+set_target_properties(agora_shim PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON)
+
+# --- Standalone daemon -------------------------------------------------------
+add_executable(agorad agorad.c)
+target_include_directories(agorad PRIVATE ${AT_INCLUDE_DIRS})
+target_link_libraries(agorad PRIVATE ${AT_LINK_LIBS})
+set_target_properties(agorad PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON)
+
+# --- Relocatable rpath -------------------------------------------------------
+# When these artifacts are copied into the Flutter app bundle they sit in the
+# bundle's lib/ dir alongside libautonomous_trust.so, so `$ORIGIN` resolves the
+# AT core with no LD_LIBRARY_PATH. The build-tree at_core dir is also kept on the
+# rpath so the dev flow (running straight out of native/build/) still finds the
+# core without env setup; that absolute entry is simply inert in the bundle.
+# BUILD_WITH_INSTALL_RPATH bakes this into the build-tree binaries themselves,
+# which is required because the Flutter bundle install copies the files verbatim
+# (install(FILES ...) does no rpath rewriting).
+set_target_properties(agora_shim agorad PROPERTIES
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "$ORIGIN;${CMAKE_CURRENT_BINARY_DIR}/at_core")

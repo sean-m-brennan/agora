@@ -1,0 +1,14 @@
+# Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors. Apache-2.0.
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  exclude:
+    - native/build/**
+    - build/**
+    - macos/**
+    - linux/**
+
+linter:
+  rules:
+    prefer_const_constructors: true
+    prefer_final_locals: true
