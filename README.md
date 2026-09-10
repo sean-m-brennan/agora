@@ -10,11 +10,12 @@ Full design: [`SOCIAL_APP_PLAN.md`](SOCIAL_APP_PLAN.md).
 
 ## Status
 
-**Phase 0 scaffold — Linux + macOS.** This increment stands up the app skeleton
-and a live "people near me" view driven by the AutonomousTrust **C** core. It
-shows each observed peer's short id, rank, **operator-attended presence**, and
-**reputation**. Profile fields and proximity/distance are **not** shown yet —
-see the gap note under Architecture.
+**Phase 0 + RTT proximity — Linux + macOS.** A live "people near me" view driven
+by the AutonomousTrust **C** core, showing each observed peer's short id, rank,
+**operator-attended presence**, **reputation**, and **RTT** (round-trip time, ms).
+RTT is a network-latency **proximity proxy**, not geographic distance. Profile
+fields (`agora.profile`) and true geographic distance are **not** shown yet — see
+the gap note under Architecture.
 
 ## Architecture
 
@@ -31,11 +32,12 @@ constraints is **[`SOCIAL_APP_PLAN.md` §5.1](SOCIAL_APP_PLAN.md)**
 - **`lib/` (Dart)** — FFI bindings, the merged `AgoraPeer` model, the daemon
   supervisor, a poll loop, and the UI.
 
-**Known gap (deferred to AT-core):** AT's C event surface exposes only peer +
-reputation events. `agora.profile` and peer **position/distance are not exposed
-yet**, so the plan's proximity / Dunbar mechanism waits on a new AT-core event
-kind. This app therefore delivers plumbing + presence + reputation, not
-proximity. (`SOCIAL_APP_PLAN.md` §5.1.)
+**Known gap (partly closed):** AT's C event surface now exposes peer, reputation,
+and **RTT** events (`AT_APP_EVENT_PEER_RTT` — the first proximity increment, a
+network-latency proxy). Still deferred to AT-core: `agora.profile` fields and
+**true geographic position/distance**, so the plan's geographic Dunbar mechanism
+still waits on a further AT-core event kind. RTT is a latency proxy, never
+surfaced as distance. (`SOCIAL_APP_PLAN.md` §5.1.)
 
 Windows, iOS, and Android are follow-on ports gated on AT-core changes
 (`FORK=0` in-process runtime + a portable IPC transport).

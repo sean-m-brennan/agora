@@ -14,9 +14,12 @@ import 'package:ffi/ffi.dart';
 
 const int agoraUuidLen = 16;
 const int agoraKeyLen = 32;
+const int agoraGeohashLen = 12; // must match AGORA_GEOHASH_LEN (at_agora_shim.h)
 
 const int agoraEventPeer = 1;
 const int agoraEventReputation = 2;
+const int agoraEventRtt = 3;
+const int agoraEventPosition = 4;
 
 /// dart:ffi mirror of `agora_event_t` (native/at_agora_shim.h). Field order and
 /// element counts MUST match the C struct exactly — the layout is the ABI
@@ -48,6 +51,17 @@ final class AgoraEvent extends Struct {
 
   @Uint8()
   external int repRated;
+
+  /// Only meaningful when [kind] == [agoraEventRtt]; 0 = unknown / not yet
+  /// measured.
+  @Int32()
+  external int rttMs;
+
+  /// Peer's shared coarse geohash bucket (NUL-terminated, "" = none). Appended
+  /// LAST to mirror the C `agora_event_t`. Only meaningful when
+  /// [kind] == [agoraEventPosition].
+  @Array(agoraGeohashLen + 1)
+  external Array<Uint8> geohash;
 }
 
 /// A pure-Dart copy of one decoded event. Decoupled from native memory so it
@@ -63,6 +77,8 @@ class AtRawEvent {
     required this.operatorPubkey,
     required this.repScore,
     required this.repRated,
+    required this.rttMs,
+    this.geohash = '',
   });
 
   final int kind;
@@ -74,6 +90,15 @@ class AtRawEvent {
   final List<int> operatorPubkey;
   final double repScore;
   final bool repRated;
+
+  /// Latest RTT to the peer in milliseconds; 0 = unknown / not yet measured.
+  /// Only set for [agoraEventRtt] events. A network-latency proximity proxy,
+  /// not a geographic distance.
+  final int rttMs;
+
+  /// Peer's shared coarse geohash bucket ("" = none). Only set for
+  /// [agoraEventPosition] events. Opt-in: empty unless the peer chose to share.
+  final String geohash;
 }
 
 typedef _SetRootC = Void Function(Pointer<Utf8>);
@@ -84,6 +109,9 @@ typedef _OpenDart = Pointer<Void> Function(Pointer<Utf8>);
 
 typedef _RosterC = Int32 Function(Pointer<Void>, Pointer<Utf8>);
 typedef _RosterDart = int Function(Pointer<Void>, Pointer<Utf8>);
+
+typedef _SetPosC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _SetPosDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
 
 typedef _PollC = Int32 Function(Pointer<Void>, Pointer<AgoraEvent>, Int32);
 typedef _PollDart = int Function(Pointer<Void>, Pointer<AgoraEvent>, int);
@@ -115,6 +143,17 @@ DynamicLibrary _loadShim() {
 List<int> _copyArray(Array<Uint8> src, int len) =>
     List<int>.generate(len, (i) => src[i], growable: false);
 
+/// Decode a NUL-terminated ASCII geohash from the fixed byte array.
+String _geohashString(Array<Uint8> src) {
+  final bytes = <int>[];
+  for (var i = 0; i < agoraGeohashLen; i++) {
+    final b = src[i];
+    if (b == 0) break;
+    bytes.add(b);
+  }
+  return String.fromCharCodes(bytes);
+}
+
 /// Thin, fork-free client over the AutonomousTrust app-events queue.
 class AtEvents {
   AtEvents._(this._handle);
@@ -128,6 +167,8 @@ class AtEvents {
       _lib.lookupFunction<_OpenC, _OpenDart>('agora_events_open');
   static final _RosterDart _roster = _lib
       .lookupFunction<_RosterC, _RosterDart>('agora_events_request_roster');
+  static final _SetPosDart _setPos =
+      _lib.lookupFunction<_SetPosC, _SetPosDart>('agora_set_position');
   static final _PollDart _poll =
       _lib.lookupFunction<_PollC, _PollDart>('agora_events_poll');
   static final _CloseDart _close =
@@ -170,6 +211,21 @@ class AtEvents {
     }
   }
 
+  /// Set (or clear) this node's opt-in coarse position. [geohash] empty/null
+  /// opts out. STRICTLY OPT-IN: nothing geographic is shared until this is
+  /// called with a non-empty geohash. Returns 0 on success, negative on error
+  /// (-2 == daemon not ready yet).
+  int setPosition(String sendQueue, String? geohash) {
+    final q = sendQueue.toNativeUtf8();
+    final g = (geohash ?? '').toNativeUtf8();
+    try {
+      return _setPos(_handle, q, g);
+    } finally {
+      calloc.free(q);
+      calloc.free(g);
+    }
+  }
+
   /// Non-blocking drain. Returns decoded events (possibly empty). Copies out of
   /// native memory before freeing the buffer, so the results are safe to keep.
   List<AtRawEvent> poll({int max = 64}) {
@@ -189,6 +245,8 @@ class AtEvents {
           operatorPubkey: _copyArray(e.operatorPubkey, agoraKeyLen),
           repScore: e.repScore,
           repRated: e.repRated != 0,
+          rttMs: e.rttMs,
+          geohash: _geohashString(e.geohash),
         );
       }, growable: false);
     } finally {

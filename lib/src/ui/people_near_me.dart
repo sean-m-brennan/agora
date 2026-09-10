@@ -17,11 +17,29 @@ class PeopleNearMePage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('People near me')),
+      appBar: AppBar(
+        title: const Text('People near me'),
+        actions: [
+          ListenableBuilder(
+            listenable: service,
+            builder: (context, _) {
+              final sharing = service.ownGeohash != null;
+              return IconButton(
+                icon: Icon(sharing ? Icons.location_on : Icons.location_off),
+                tooltip: sharing
+                    ? 'Sharing location (~5 km bucket) — tap to change'
+                    : 'Location not shared — tap to opt in',
+                onPressed: () => _editOwnPosition(context, service),
+              );
+            },
+          ),
+        ],
+      ),
       body: ListenableBuilder(
         listenable: service,
         builder: (context, _) {
           final peers = service.peers;
+          final own = service.ownGeohash;
           return Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
@@ -35,7 +53,8 @@ class PeopleNearMePage extends StatelessWidget {
                     : ListView.separated(
                         itemCount: peers.length,
                         separatorBuilder: (_, __) => const Divider(height: 1),
-                        itemBuilder: (context, i) => _PeerTile(peer: peers[i]),
+                        itemBuilder: (context, i) =>
+                            _PeerTile(peer: peers[i], ownGeohash: own),
                       ),
               ),
             ],
@@ -44,12 +63,61 @@ class PeopleNearMePage extends StatelessWidget {
       ),
     );
   }
+
+  /// Opt in (enter a coarse geohash bucket) or out (clear) of sharing location.
+  /// Strictly opt-in: closing without sharing changes nothing.
+  Future<void> _editOwnPosition(BuildContext context, PeerService service) async {
+    final controller = TextEditingController(text: service.ownGeohash ?? '');
+    final result = await showDialog<String?>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Share coarse location'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Opt in to share a ~5 km geohash bucket with connected peers only. '
+              'This is a coarse area, not your exact location, and is never '
+              'broadcast. Leave empty (or Stop sharing) to opt out.',
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              decoration: const InputDecoration(
+                labelText: 'Geohash bucket (e.g. 9q8yy)',
+                hintText: '~5 chars',
+              ),
+              autofocus: true,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, '__optout__'),
+            child: const Text('Stop sharing'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, null),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            child: const Text('Share'),
+          ),
+        ],
+      ),
+    );
+    if (result == null) return; // cancelled — no change
+    service.setOwnPosition(result == '__optout__' ? null : result);
+  }
 }
 
 class _PeerTile extends StatelessWidget {
-  const _PeerTile({required this.peer});
+  const _PeerTile({required this.peer, this.ownGeohash});
 
   final AgoraPeer peer;
+  final String? ownGeohash;
 
   @override
   Widget build(BuildContext context) {
@@ -69,6 +137,10 @@ class _PeerTile extends StatelessWidget {
         children: [
           Text('rank ${peer.rank}'),
           Text('rep ${peer.reputationLabel}',
+              style: Theme.of(context).textTheme.bodySmall),
+          Text('rtt ${peer.rttLabel}',
+              style: Theme.of(context).textTheme.bodySmall),
+          Text('dist ${peer.distanceLabel(ownGeohash)}',
               style: Theme.of(context).textTheme.bodySmall),
         ],
       ),
@@ -104,9 +176,11 @@ class _PendingCapabilitiesBanner extends StatelessWidget {
   Widget build(BuildContext context) {
     return const MaterialBanner(
       content: Text(
-        'Profile and distance are not shown yet: the AutonomousTrust C event '
-        'surface does not expose agora.profile or peer position. Presence and '
-        'reputation are live. (SOCIAL_APP_PLAN.md §5.1)',
+        'Presence, reputation, RTT, and opt-in distance are live. RTT is a '
+        'network-latency proxy (ms); distance is a coarse (~5 km) geographic '
+        'estimate shown only when BOTH you and the peer opt in (tap the '
+        'location icon). Profile fields (agora.profile) are not shown yet. '
+        '(SOCIAL_APP_PLAN.md §5.1)',
       ),
       leading: Icon(Icons.info_outline),
       actions: [SizedBox.shrink()],

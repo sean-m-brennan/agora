@@ -11,9 +11,17 @@
 # discovery between the two namespaces.
 #
 # What it validates: each node's app-events roster observes the OTHER node
-# (peer UUID + presence + reputation). NOTE: agora.profile fields and
-# proximity/distance are NOT in AT's C event surface yet (SOCIAL_APP_PLAN.md
-# §5.1), so this checks discovery + presence + reputation, not distance.
+# (peer UUID + presence + reputation + RTT + opt-in coarse POSITION). RTT is a
+# network-latency proximity proxy in ms (0 = unknown). Position (Increment 2) is
+# an opt-in coarse geohash bucket a node chooses to share; the app decodes it and
+# computes geographic distance (see lib/src/geo/geohash.dart). agora.profile
+# fields remain out of the C event surface (SOCIAL_APP_PLAN.md §5.1).
+#
+# This run exercises BOTH halves of the opt-in position feature in one cohort:
+# node 1 opts IN (AT_OWN_GEOHASH=$GEO1, default u4pruy), node 2 opts OUT. PASS
+# requires: both nodes observe a peer + its RTT event (kind==3); node 2 observes
+# node 1's shared position (kind==4, geohash==$GEO1); and node 1 observes NO
+# position for the opted-out node 2 (the privacy control — silence is correct).
 #
 # Requirements: root (for ip netns/veth/bridge), iproute2 (`ip`), python3, and
 # the built native layer (native/build/{agorad,libagora_shim.so,
@@ -150,22 +158,31 @@ fi
 # Launch the two daemons (each in its own netns + root + identity)
 # --------------------------------------------------------------------------- #
 start_node() {
-  local ns="$1" root="$2" name="$3" seed="$4"
+  local ns="$1" root="$2" name="$3" seed="$4" geo="${5:-}"
+  # AT_OWN_GEOHASH opts this node IN to sharing its coarse position (Increment 2).
+  # agorad's C node reads it once at identity init (_ensure_id_init); empty/unset
+  # => opted OUT, the default, so nothing geographic is advertised or answered.
   # The veth must be up (done above) BEFORE agorad first generates config:
   # discover_network_for() captures the interface CIDR at generation time.
   ip netns exec "$ns" env \
     AUTONOMOUS_TRUST_ROOT="$root" \
     AT_PEER_NAME="$name" AT_PEER_SEED="$seed" \
+    AT_OWN_GEOHASH="$geo" \
     LD_LIBRARY_PATH="$ATCORE:${LD_LIBRARY_PATH:-}" \
     "$AGORAD" extern_to_at at_to_extern 2 \
     >"$root/agorad.log" 2>&1 &
   echo $!
 }
 
-log "Starting node 1 in $NS1 (root=$ROOT1)"
-PID1="$(start_node "$NS1" "$ROOT1" agora-node-1 cohort-seed-1)"
-log "Starting node 2 in $NS2 (root=$ROOT2)"
-PID2="$(start_node "$NS2" "$ROOT2" agora-node-2 cohort-seed-2)"
+# Node 1 opts IN with a fixed coarse bucket; node 2 opts OUT (no geohash). This
+# single cohort exercises BOTH halves of the opt-in position feature: node 2 must
+# OBSERVE node 1's shared bucket, while node 1 must observe NO position for the
+# opted-out node 2 (the privacy control).
+GEO1="${GEO1:-u4pruy}"
+log "Starting node 1 in $NS1 (root=$ROOT1, opted-in geohash=$GEO1)"
+PID1="$(start_node "$NS1" "$ROOT1" agora-node-1 cohort-seed-1 "$GEO1")"
+log "Starting node 2 in $NS2 (root=$ROOT2, opted-out)"
+PID2="$(start_node "$NS2" "$ROOT2" agora-node-2 cohort-seed-2 "")"
 
 # Give them a moment to bootstrap identity + bind their sockets.
 sleep 4
@@ -183,8 +200,13 @@ cat >"$HARNESS" <<'PY'
 import ctypes, os, sys, time
 
 shim, root, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
+# The coarse geohash we EXPECT to observe for the peer (Increment 2, opt-in
+# position). Non-empty => the peer opted in and must be seen sharing exactly this
+# bucket. Empty => the OPT-OUT CONTROL: the peer opted out, so NO position event
+# (kind==4) may arrive for it — silence is the correct, private behavior.
+expect_pos = sys.argv[4] if len(sys.argv) > 4 else ""
 
-UUID, KEY = 16, 32
+UUID, KEY, GEO = 16, 32, 12
 class Ev(ctypes.Structure):
     _fields_ = [
         ("kind", ctypes.c_int32),
@@ -196,7 +218,13 @@ class Ev(ctypes.Structure):
         ("operator_pubkey", ctypes.c_uint8 * KEY),
         ("rep_score", ctypes.c_double),
         ("rep_rated", ctypes.c_uint8),
+        ("rtt_ms", ctypes.c_int32),          # AGORA_EVENT_RTT (offset 116)
+        ("geohash", ctypes.c_char * (GEO + 1)),  # AGORA_EVENT_POSITION, appended LAST
     ]
+# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (136 with
+# the geohash tail). If the C struct grows and this is not updated in lockstep,
+# poll() would misread every field past the drift — fail loudly instead.
+assert ctypes.sizeof(Ev) == 136, f"Ev size {ctypes.sizeof(Ev)} != 136 (ABI drift)"
 
 lib = ctypes.CDLL(shim)
 lib.agora_set_root.argtypes = [ctypes.c_char_p]; lib.agora_set_root.restype = None
@@ -208,9 +236,14 @@ lib.agora_events_close.argtypes = [ctypes.c_void_p]; lib.agora_events_close.rest
 lib.agora_set_root(root.encode())
 h = None
 deadline = time.time() + timeout
-peers = {}   # uuid_hex -> (rank, bound, attested, rep_rated, rep_score)
+peers = {}   # uuid_hex -> dict(rank, bound, att, rated, score, rtt, rtt_seen)
+def _p(uid):
+    return peers.setdefault(uid, dict(rank=0, bound=False, att=0.0,
+                                      rated=False, score=0.0, rtt=0, rtt_seen=False,
+                                      geohash="", pos_seen=False))
 N = 64
 buf = (Ev * N)()
+grace = 0   # opt-out control: extra polls after ready before asserting absence
 while time.time() < deadline:
     if not h:
         h = lib.agora_events_open(b"at_to_extern")
@@ -222,40 +255,92 @@ while time.time() < deadline:
     for i in range(max(n, 0)):
         e = buf[i]
         uid = bytes(e.peer_uuid).hex()
-        if e.kind == 1:  # AGORA_EVENT_PEER
-            r = peers.get(uid, (0, False, 0.0, False, 0.0))
-            peers[uid] = (e.rank, bool(e.operator_bound), e.operator_attested_at, r[3], r[4])
+        p = _p(uid)
+        if e.kind == 1:    # AGORA_EVENT_PEER
+            p.update(rank=e.rank, bound=bool(e.operator_bound), att=e.operator_attested_at)
         elif e.kind == 2:  # AGORA_EVENT_REPUTATION
-            r = peers.get(uid, (0, False, 0.0, False, 0.0))
-            peers[uid] = (r[0], r[1], r[2], bool(e.rep_rated), e.rep_score)
-    if peers:
-        break
+            p.update(rated=bool(e.rep_rated), score=e.rep_score)
+        elif e.kind == 3:  # AGORA_EVENT_RTT
+            p.update(rtt=e.rtt_ms, rtt_seen=True)
+        elif e.kind == 4:  # AGORA_EVENT_POSITION
+            p.update(geohash=e.geohash.decode("ascii", "replace"), pos_seen=True)
+    ready = bool(peers) and any(p["rtt_seen"] for p in peers.values())
+    if expect_pos:
+        # Opt-in run: stop as soon as the peer's shared bucket is observed.
+        if any(p["pos_seen"] and p["geohash"] == expect_pos
+               for p in peers.values()):
+            break
+    elif ready:
+        # Opt-out CONTROL: we cannot "wait for absence", so once the peer + its
+        # RTT are seen (position would ride the SAME post-admission round-trip),
+        # give a short grace for a stray position to arrive, then stop and assert
+        # none did.
+        grace += 1
+        if grace >= 5:
+            break
     time.sleep(0.6)
 if h:
     lib.agora_events_close(h)
 
-if peers:
-    for uid, (rank, bound, att, rated, score) in peers.items():
-        print(f"    peer {uid[:12]}… rank={rank} operator_bound={bound} "
-              f"attested_at={att:.0f} rep={'%.3f' % score if rated else 'n/a'}")
-    sys.exit(0)
-else:
+rtt_seen = any(p["rtt_seen"] for p in peers.values())
+any_pos = any(p["pos_seen"] for p in peers.values())
+pos_match = expect_pos and any(
+    p["pos_seen"] and p["geohash"] == expect_pos for p in peers.values())
+for uid, p in peers.items():
+    # rtt_ms of 0 is a legitimate "unknown / not yet measured" value; report
+    # whether an RTT event arrived at all, not just its magnitude.
+    if p["rtt_seen"]:
+        rtt = f"{p['rtt']}ms" if p["rtt"] > 0 else "observed(0=unknown)"
+    else:
+        rtt = "n/a"
+    pos = f"'{p['geohash']}'" if p["pos_seen"] else "none(opted-out)"
+    print(f"    peer {uid[:12]}… rank={p['rank']} operator_bound={p['bound']} "
+          f"attested_at={p['att']:.0f} rep={'%.3f' % p['score'] if p['rated'] else 'n/a'} "
+          f"rtt={rtt} position={pos}")
+
+if not peers:
     print("    (no peers observed)")
     sys.exit(1)
+
+# Increment 2 (opt-in coarse position) is the exit gate for this run.
+if expect_pos:
+    if pos_match:
+        sys.exit(0)   # PASS: the opted-in peer's coarse bucket was observed
+    print(f"    (expected peer position {expect_pos!r} was not observed)")
+    sys.exit(3)
+else:
+    # Opt-out CONTROL: the peer must NOT have shared a position. Require RTT too,
+    # so we know the event channel actually worked — otherwise "no position"
+    # could just mean "no events at all", and the control would pass vacuously.
+    if any_pos:
+        print("    (opt-out CONTROL VIOLATED: a position event arrived for an "
+              "opted-out peer — it should have shared nothing)")
+        sys.exit(4)
+    if rtt_seen:
+        sys.exit(0)   # PASS: channel works (RTT seen) yet no position leaked
+    print("    (peer observed but no RTT event — cannot confirm the channel "
+          "carried events, so the position silence is inconclusive)")
+    sys.exit(2)
 PY
 
 log "Waiting up to ${WAIT}s for mutual discovery…"
-echo "  node 1 ($IP1) roster:"
-python3 "$HARNESS" "$SHIM" "$ROOT1" "$WAIT"; S1=$?
-echo "  node 2 ($IP2) roster:"
-python3 "$HARNESS" "$SHIM" "$ROOT2" "$WAIT"; S2=$?
+# node 1 opted IN, its peer (node 2) opted OUT -> node 1 must observe NO position
+# for node 2 (EXPECT_POS=""): the privacy control.
+echo "  node 1 ($IP1) roster [opted-in; peer opted-out => expect NO peer position]:"
+python3 "$HARNESS" "$SHIM" "$ROOT1" "$WAIT" ""; S1=$?
+# node 2 opted OUT, its peer (node 1) shares $GEO1 -> node 2 must observe it.
+echo "  node 2 ($IP2) roster [opted-out; peer shares $GEO1 => expect that position]:"
+python3 "$HARNESS" "$SHIM" "$ROOT2" "$WAIT" "$GEO1"; S2=$?
 
 echo
 if [ "$S1" -eq 0 ] && [ "$S2" -eq 0 ]; then
-  log "PASS — both nodes observed a peer. Phase-0 discovery + presence + reputation confirmed."
+  log "PASS — mutual discovery + presence + reputation + RTT confirmed, AND the"
+  log "       opt-in position feature: node 2 observed node 1's shared bucket"
+  log "       ($GEO1), while node 1 observed NO position for the opted-out node 2."
   RESULT=0
 else
-  err "FAIL — mutual discovery not observed (node1 rc=$S1, node2 rc=$S2)."
+  err "FAIL — cohort exit not met (node1 rc=$S1, node2 rc=$S2)."
+  err "  rc legend: 0=pass 1=no-peer 2=no-RTT(inconclusive) 3=expected-position-missing 4=opt-out-leak"
   err "Daemon logs (tail):"
   echo "--- node1 ---"; tail -n 25 "$ROOT1/agorad.log"
   echo "--- node2 ---"; tail -n 25 "$ROOT2/agorad.log"

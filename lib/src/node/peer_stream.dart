@@ -26,7 +26,31 @@ class PeerService extends ChangeNotifier {
   final Map<String, AgoraPeer> _peers = {};
   String _status = 'idle';
 
+  /// This node's own opt-in coarse geohash bucket, or null when opted out (the
+  /// default). Used to compute distance to peers who also opted in. Kept here so
+  /// the UI can render distance and toggle sharing.
+  String? _ownGeohash;
+  String? get ownGeohash => _ownGeohash;
+
   String get status => _status;
+
+  /// Opt in (set) or out (null/empty) of sharing a coarse position. Tells the
+  /// daemon via AT_APP_SET_POSITION so it can answer peers' directed queries,
+  /// and keeps it locally for distance computation. Returns the shim rc (0 ok,
+  /// -2 daemon not ready), or -1 if no event channel is open yet.
+  int setOwnPosition(String? geohash) {
+    final ev = _events;
+    final normalized = (geohash == null || geohash.isEmpty) ? null : geohash;
+    if (ev == null) {
+      _ownGeohash = normalized; // remember; pushed on next start
+      notifyListeners();
+      return -1;
+    }
+    final rc = ev.setPosition(_daemon.queues.appToAt, normalized ?? '');
+    _ownGeohash = normalized;
+    notifyListeners();
+    return rc;
+  }
 
   /// Peers, strongest rank first (a stand-in ordering until proximity/tie
   /// strength lands with the AT-core event extension — see §5.1).
@@ -57,6 +81,10 @@ class PeerService extends ChangeNotifier {
     }
 
     _events!.requestRoster(_daemon.queues.appToAt);
+    // If the operator opted in before the channel was ready, push it now.
+    if (_ownGeohash != null) {
+      _events!.setPosition(_daemon.queues.appToAt, _ownGeohash!);
+    }
     _setStatus('connected');
     _timer = Timer.periodic(pollInterval, (_) => _tick());
   }

@@ -43,10 +43,14 @@ extern "C" {
  * sync via the compile-time assertions in at_agora_shim.c. */
 #define AGORA_UUID_LEN 16
 #define AGORA_KEY_LEN  32
+/* Max geohash length. MUST match AT_APP_GEOHASH_LEN (app_events.h). */
+#define AGORA_GEOHASH_LEN 12
 
 /* kind discriminator (a superset-safe subset of at_app_event_kind_t). */
 #define AGORA_EVENT_PEER       1
 #define AGORA_EVENT_REPUTATION 2
+#define AGORA_EVENT_RTT        3
+#define AGORA_EVENT_POSITION   4
 
 /**
  * One flattened app event. Field order is ABI-significant: the Dart
@@ -62,6 +66,16 @@ typedef struct {
     uint8_t operator_pubkey[AGORA_KEY_LEN];
     double  rep_score;                         /* valid only when rep_rated */
     uint8_t rep_rated;                         /* 0/1 */
+    /* Appended after the earlier fields; every PRIOR field offset is unchanged
+     * (rtt_ms stays at offset 116), so only the tail grew. Field order is
+     * ABI-significant — the Dart `AgoraEvent` struct and the ctypes `Ev` in
+     * test/cohort/two_node_cohort.sh mirror it exactly. */
+    int32_t rtt_ms;                            /* AGORA_EVENT_RTT; 0 = unknown */
+    /* AGORA_EVENT_POSITION: peer's shared coarse geohash bucket; "" = none.
+     * Appended after rtt_ms (offset 120); with it sizeof(agora_event_t) == 136.
+     * The Dart AgoraEvent and the ctypes Ev in the cohort test mirror this
+     * order and total size exactly (both re-check sizeof). */
+    char    geohash[AGORA_GEOHASH_LEN + 1];
 } agora_event_t;
 
 /** Set $AUTONOMOUS_TRUST_ROOT for THIS process, so the app-events client below
@@ -80,6 +94,13 @@ void *agora_events_open(const char *recv_queue);
  *  queue (`q_out` in at_node_config_t terms). Returns 0 on success, negative on
  *  error (including AT_APP_NOT_READY == -2 if the daemon is not up yet). */
 int agora_events_request_roster(void *handle, const char *send_queue);
+
+/** Set (or clear) THIS node's own opt-in coarse position. `send_queue` is the
+ *  app -> AT queue; `geohash` is the operator's chosen bucket, or NULL/"" to opt
+ *  out. STRICTLY OPT-IN: nothing geographic is shared until this is called with a
+ *  non-empty geohash. Returns 0 on success, negative on error (AT_APP_NOT_READY
+ *  == -2 if the daemon is not up yet). */
+int agora_set_position(void *handle, const char *send_queue, const char *geohash);
 
 /** Non-blocking poll. Writes up to @p max flattened events into @p out. Returns
  *  the count written (0 = nothing arrived), or a negative AT error code. */

@@ -22,6 +22,7 @@ void main() {
       operatorPubkey: List<int>.filled(32, 0),
       repScore: 0,
       repRated: false,
+      rttMs: 0,
     ));
 
     expect(peer.rank, 3);
@@ -46,6 +47,7 @@ void main() {
       operatorPubkey: const [],
       repScore: 0.75,
       repRated: true,
+      rttMs: 0,
     ));
 
     expect(peer.reputationRated, isTrue);
@@ -69,8 +71,32 @@ void main() {
       operatorPubkey: List<int>.filled(32, 7),
       repScore: 0,
       repRated: false,
+      rttMs: 0,
     ));
     expect(peer.hasNamedGuardian, isTrue);
     expect(peer.presenceLabel(9999), 'bound · nobody attending');
+  });
+
+  test('rtt event sets rttMs; 0 renders as unknown', () {
+    final peer = AgoraPeer(uuid: List<int>.filled(16, 0));
+    expect(peer.rttMs, 0);
+    expect(peer.rttLabel, '—'); // unknown until measured
+
+    final consumed = peer.applyEvent(AtRawEvent(
+      kind: agoraEventRtt,
+      uuid: List<int>.filled(16, 0),
+      signingPubkey: const [],
+      rank: 0,
+      operatorBound: false,
+      operatorAttestedAt: 0,
+      operatorPubkey: const [],
+      repScore: 0,
+      repRated: false,
+      rttMs: 42,
+    ));
+
+    expect(consumed, isTrue);
+    expect(peer.rttMs, 42);
+    expect(peer.rttLabel, '42ms');
   });
 }
