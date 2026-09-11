@@ -5,6 +5,7 @@
 // (identity/presence from PEER_OBSERVED, score from PEER_REPUTATION).
 
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
@@ -32,6 +33,13 @@ class PeerService extends ChangeNotifier {
   String? _ownGeohash;
   String? get ownGeohash => _ownGeohash;
 
+  /// This node's own opt-in agora.profile fields, or null when opted out (the
+  /// default). Pushed to the daemon via AT_APP_SET_PROFILE and kept here so the
+  /// UI can show/edit the operator's own profile.
+  Map<String, dynamic>? _ownProfile;
+  Map<String, dynamic>? get ownProfile =>
+      _ownProfile == null ? null : Map<String, dynamic>.unmodifiable(_ownProfile!);
+
   String get status => _status;
 
   /// Opt in (set) or out (null/empty) of sharing a coarse position. Tells the
@@ -48,6 +56,25 @@ class PeerService extends ChangeNotifier {
     }
     final rc = ev.setPosition(_daemon.queues.appToAt, normalized ?? '');
     _ownGeohash = normalized;
+    notifyListeners();
+    return rc;
+  }
+
+  /// Opt in (set) or out (null/empty) of sharing an agora.profile. Serializes
+  /// the fields to JSON and tells the daemon via AT_APP_SET_PROFILE so it can
+  /// sign and answer peers' directed queries. Returns the shim rc (0 ok, -2
+  /// daemon not ready), or -1 if no event channel is open yet.
+  int setOwnProfile(Map<String, dynamic>? profile) {
+    final normalized =
+        (profile == null || profile.isEmpty) ? null : Map<String, dynamic>.of(profile);
+    _ownProfile = normalized;
+    final ev = _events;
+    if (ev == null) {
+      notifyListeners(); // remember; pushed on next start
+      return -1;
+    }
+    final rc =
+        ev.setProfile(_daemon.queues.appToAt, normalized == null ? '' : jsonEncode(normalized));
     notifyListeners();
     return rc;
   }
@@ -84,6 +111,9 @@ class PeerService extends ChangeNotifier {
     // If the operator opted in before the channel was ready, push it now.
     if (_ownGeohash != null) {
       _events!.setPosition(_daemon.queues.appToAt, _ownGeohash!);
+    }
+    if (_ownProfile != null) {
+      _events!.setProfile(_daemon.queues.appToAt, jsonEncode(_ownProfile!));
     }
     _setStatus('connected');
     _timer = Timer.periodic(pollInterval, (_) => _tick());

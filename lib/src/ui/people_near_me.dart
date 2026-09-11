@@ -1,8 +1,8 @@
 // Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors. Apache-2.0.
 //
-// Phase-0 "People near me" view. Shows each observed peer's short id, rank,
-// operator-attended presence, and reputation. Profile and distance are shown
-// as explicitly pending AT-core support (see SOCIAL_APP_PLAN.md §5.1).
+// Phase-0 "People near me" view. Shows each observed peer's identity (signed
+// agora.profile when shared, else short id), rank, operator-attended presence,
+// reputation, RTT, and opt-in coarse distance (see SOCIAL_APP_PLAN.md §5.1).
 
 import 'package:flutter/material.dart';
 
@@ -20,6 +20,19 @@ class PeopleNearMePage extends StatelessWidget {
       appBar: AppBar(
         title: const Text('People near me'),
         actions: [
+          ListenableBuilder(
+            listenable: service,
+            builder: (context, _) {
+              final sharing = service.ownProfile != null;
+              return IconButton(
+                icon: Icon(sharing ? Icons.badge : Icons.badge_outlined),
+                tooltip: sharing
+                    ? 'Sharing your profile — tap to edit'
+                    : 'Profile not shared — tap to set one',
+                onPressed: () => _editOwnProfile(context, service),
+              );
+            },
+          ),
           ListenableBuilder(
             listenable: service,
             builder: (context, _) {
@@ -111,6 +124,100 @@ class PeopleNearMePage extends StatelessWidget {
     if (result == null) return; // cancelled — no change
     service.setOwnPosition(result == '__optout__' ? null : result);
   }
+
+  /// Set or edit this node's opt-in agora.profile. Strictly opt-in: cancelling
+  /// changes nothing; "Stop sharing" clears it. Fields are all optional; the
+  /// daemon truncates each to its bound and signs the result.
+  Future<void> _editOwnProfile(BuildContext context, PeerService service) async {
+    final existing = service.ownProfile ?? const {};
+    String s(String k) => (existing[k] is String) ? existing[k] as String : '';
+    final name = TextEditingController(text: s('display_name'));
+    final handle = TextEditingController(text: s('handle'));
+    final bio = TextEditingController(text: s('bio'));
+    final avatar = TextEditingController(text: s('avatar_ref'));
+    final links = TextEditingController(
+      text: (existing['links'] is List)
+          ? (existing['links'] as List).whereType<String>().join(', ')
+          : '',
+    );
+    final action = await showDialog<String?>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Your profile'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Optional fields shared, signed, with connected peers only. '
+                'Leave all empty (or Stop sharing) to opt out.',
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: name,
+                decoration: const InputDecoration(labelText: 'Display name'),
+              ),
+              TextField(
+                controller: handle,
+                decoration: const InputDecoration(
+                  labelText: 'Handle', hintText: 'letters, digits, _.- only'),
+              ),
+              TextField(
+                controller: bio,
+                decoration: const InputDecoration(labelText: 'Bio'),
+                maxLines: 2,
+              ),
+              TextField(
+                controller: avatar,
+                decoration: const InputDecoration(
+                  labelText: 'Avatar reference (URL)'),
+              ),
+              TextField(
+                controller: links,
+                decoration: const InputDecoration(
+                  labelText: 'Links', hintText: 'comma-separated URLs'),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, '__optout__'),
+            child: const Text('Stop sharing'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, null),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, '__save__'),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (action == null) return; // cancelled
+    if (action == '__optout__') {
+      service.setOwnProfile(null);
+      return;
+    }
+    final profile = <String, dynamic>{};
+    void put(String k, String v) {
+      if (v.trim().isNotEmpty) profile[k] = v.trim();
+    }
+    put('display_name', name.text);
+    put('handle', handle.text);
+    put('bio', bio.text);
+    put('avatar_ref', avatar.text);
+    final linkList = links.text
+        .split(',')
+        .map((l) => l.trim())
+        .where((l) => l.isNotEmpty)
+        .toList(growable: false);
+    if (linkList.isNotEmpty) profile['links'] = linkList;
+    service.setOwnProfile(profile.isEmpty ? null : profile);
+  }
 }
 
 class _PeerTile extends StatelessWidget {
@@ -123,14 +230,38 @@ class _PeerTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
     final present = peer.operatorBound && peer.operatorAttestedAt > 0;
+    final title = peer.hasProfile
+        ? Text(peer.displayLabel)
+        : Text(peer.shortId, style: const TextStyle(fontFamily: 'monospace'));
+    final subtitleLines = <Widget>[Text(peer.presenceLabel(now))];
+    // When a display name is shown as the title, surface the @handle and id so
+    // identity stays verifiable (the profile is signed, but a name is not a key).
+    if (peer.hasProfile) {
+      final idBits = <String>[
+        if (peer.handle.isNotEmpty && peer.displayName.isNotEmpty) '@${peer.handle}',
+        peer.shortId,
+      ];
+      subtitleLines.add(Text(idBits.join(' · '),
+          style: Theme.of(context).textTheme.bodySmall));
+      if (peer.bio.isNotEmpty) {
+        subtitleLines.add(Text(peer.bio,
+            maxLines: 2, overflow: TextOverflow.ellipsis));
+      }
+    }
     return ListTile(
-      leading: Icon(
-        present ? Icons.circle : Icons.circle_outlined,
-        size: 14,
-        color: present ? Colors.green : Theme.of(context).disabledColor,
+      isThreeLine: peer.hasProfile,
+      leading: peer.avatarRef.isNotEmpty
+          ? CircleAvatar(child: Text(peer.displayLabel.characters.first))
+          : Icon(
+              present ? Icons.circle : Icons.circle_outlined,
+              size: 14,
+              color: present ? Colors.green : Theme.of(context).disabledColor,
+            ),
+      title: title,
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: subtitleLines,
       ),
-      title: Text(peer.shortId, style: const TextStyle(fontFamily: 'monospace')),
-      subtitle: Text(peer.presenceLabel(now)),
       trailing: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         crossAxisAlignment: CrossAxisAlignment.end,
@@ -176,11 +307,11 @@ class _PendingCapabilitiesBanner extends StatelessWidget {
   Widget build(BuildContext context) {
     return const MaterialBanner(
       content: Text(
-        'Presence, reputation, RTT, and opt-in distance are live. RTT is a '
-        'network-latency proxy (ms); distance is a coarse (~5 km) geographic '
-        'estimate shown only when BOTH you and the peer opt in (tap the '
-        'location icon). Profile fields (agora.profile) are not shown yet. '
-        '(SOCIAL_APP_PLAN.md §5.1)',
+        'Presence, reputation, RTT, opt-in distance, and opt-in signed profiles '
+        'are live. RTT is a network-latency proxy (ms); distance is a coarse '
+        '(~5 km) estimate shown only when BOTH sides opt in (location icon). '
+        'Profiles (agora.profile) are shared, signed, only with connected peers '
+        '(badge icon to set yours). (SOCIAL_APP_PLAN.md §5.1)',
       ),
       leading: Icon(Icons.info_outline),
       actions: [SizedBox.shrink()],

@@ -3,12 +3,13 @@
 // AgoraPeer: the app-facing, merged view of one observed peer, assembled from
 // the PEER_OBSERVED and PEER_REPUTATION events the C event surface exposes.
 //
-// Carries peer + presence + reputation and, since the first AT-core proximity
-// increment, per-peer RTT (a network-latency proxy in ms — NOT a geographic
-// distance). NOTE: profile fields (agora.profile) and true geographic
-// distance are still absent — the AT C event surface does not carry them yet.
-// See SOCIAL_APP_PLAN.md §5.1 ("the gap"): true distance needs a further
-// AT-core extension. RTT is the phased first step.
+// Carries peer + presence + reputation, per-peer RTT (a network-latency proxy
+// in ms — NOT a geographic distance), the opt-in coarse geohash position
+// (Increment 2), and the opt-in, signature-verified agora.profile fields
+// (Increment 3: display name, handle, bio, avatar ref, links). The AT C event
+// surface now carries all of these; see SOCIAL_APP_PLAN.md §5.1.
+
+import 'dart:convert';
 
 import 'at_events_bindings.dart';
 import '../geo/geohash.dart';
@@ -44,6 +45,31 @@ class AgoraPeer {
   /// Peer's shared coarse geohash bucket; empty == not shared (opted out), the
   /// default. Populated only when the peer opts in and shares with us.
   String geohash = '';
+
+  /// Opt-in agora.profile fields (Increment 3), populated from a signed,
+  /// core-verified profile. Empty strings / empty list == not shared (the
+  /// default). All optional and independently absent.
+  String displayName = '';
+  String handle = '';
+  String bio = '';
+  String avatarRef = '';
+  List<String> links = const [];
+
+  /// True once any profile field has been shared by this peer.
+  bool get hasProfile =>
+      displayName.isNotEmpty ||
+      handle.isNotEmpty ||
+      bio.isNotEmpty ||
+      avatarRef.isNotEmpty ||
+      links.isNotEmpty;
+
+  /// Best display name: the shared display name, else the @handle, else the
+  /// short hex id — so a row always has a stable, honest label.
+  String get displayLabel {
+    if (displayName.isNotEmpty) return displayName;
+    if (handle.isNotEmpty) return '@$handle';
+    return shortId;
+  }
 
   /// Short hex form of the UUID, for display.
   String get shortId {
@@ -110,8 +136,47 @@ class AgoraPeer {
       case agoraEventPosition:
         geohash = e.geohash;
         return true;
+      case agoraEventProfile:
+        _applyProfileJson(e.profileJson);
+        return true;
       default:
         return false;
     }
+  }
+
+  /// Merge a compact profile JSON object (the core-verified fields) into this
+  /// peer. An empty/blank payload clears the profile. Malformed JSON or wrong
+  /// types are ignored field-by-field, never thrown — the C core already
+  /// validated and signature-checked, so this is defensive only.
+  void _applyProfileJson(String profileJson) {
+    if (profileJson.isEmpty) {
+      displayName = '';
+      handle = '';
+      bio = '';
+      avatarRef = '';
+      links = const [];
+      return;
+    }
+    Object? decoded;
+    try {
+      decoded = jsonDecode(profileJson);
+    } on FormatException {
+      return;
+    }
+    if (decoded is! Map) return;
+    final Map<dynamic, dynamic> map = decoded;
+    String str(String k) {
+      final v = map[k];
+      return v is String ? v : '';
+    }
+
+    displayName = str('display_name');
+    handle = str('handle');
+    bio = str('bio');
+    avatarRef = str('avatar_ref');
+    final rawLinks = map['links'];
+    links = rawLinks is List
+        ? rawLinks.whereType<String>().toList(growable: false)
+        : const [];
   }
 }

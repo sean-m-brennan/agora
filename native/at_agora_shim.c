@@ -37,6 +37,8 @@ _Static_assert(AGORA_KEY_LEN == AT_APP_SIGNING_KEY_LEN,
                "AGORA_KEY_LEN out of sync with AT_APP_SIGNING_KEY_LEN");
 _Static_assert(AGORA_GEOHASH_LEN == AT_APP_GEOHASH_LEN,
                "AGORA_GEOHASH_LEN out of sync with AT_APP_GEOHASH_LEN");
+_Static_assert(AGORA_PROFILE_JSON_MAX == AT_APP_PROFILE_JSON_LEN,
+               "AGORA_PROFILE_JSON_MAX out of sync with AT_APP_PROFILE_JSON_LEN");
 
 void *agora_events_open(const char *recv_queue)
 {
@@ -51,6 +53,11 @@ int agora_events_request_roster(void *handle, const char *send_queue)
 int agora_set_position(void *handle, const char *send_queue, const char *geohash)
 {
     return at_app_events_set_position((at_app_events_t *)handle, send_queue, geohash);
+}
+
+int agora_set_profile(void *handle, const char *send_queue, const char *profile_json)
+{
+    return at_app_events_set_profile((at_app_events_t *)handle, send_queue, profile_json);
 }
 
 int agora_events_poll(void *handle, agora_event_t *out, int max)
@@ -104,6 +111,16 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             /* raw geohash is already NUL-bounded by AT; copy and re-terminate. */
             memcpy(e->geohash, raw[i].data.position.geohash, AGORA_GEOHASH_LEN);
             e->geohash[AGORA_GEOHASH_LEN] = '\0';
+            w++;
+            break;
+
+        case AT_APP_EVENT_PEER_PROFILE:
+            e->kind = AGORA_EVENT_PROFILE;
+            memcpy(e->peer_uuid, raw[i].data.profile.peer_uuid, AGORA_UUID_LEN);
+            /* raw profile_json is already NUL-bounded by AT; copy and re-terminate. */
+            memcpy(e->profile_json, raw[i].data.profile.profile_json,
+                   AGORA_PROFILE_JSON_MAX);
+            e->profile_json[AGORA_PROFILE_JSON_MAX] = '\0';
             w++;
             break;
 

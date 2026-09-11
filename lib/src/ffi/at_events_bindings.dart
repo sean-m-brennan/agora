@@ -7,6 +7,7 @@
 // AF_UNIX socket I/O, no fork(). The heavy AT node runs in the separate
 // `agorad` process (see node/agora_daemon.dart).
 
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 
@@ -15,11 +16,14 @@ import 'package:ffi/ffi.dart';
 const int agoraUuidLen = 16;
 const int agoraKeyLen = 32;
 const int agoraGeohashLen = 12; // must match AGORA_GEOHASH_LEN (at_agora_shim.h)
+// must match AGORA_PROFILE_JSON_MAX (at_agora_shim.h)
+const int agoraProfileJsonMax = 2560;
 
 const int agoraEventPeer = 1;
 const int agoraEventReputation = 2;
 const int agoraEventRtt = 3;
 const int agoraEventPosition = 4;
+const int agoraEventProfile = 5;
 
 /// dart:ffi mirror of `agora_event_t` (native/at_agora_shim.h). Field order and
 /// element counts MUST match the C struct exactly — the layout is the ABI
@@ -57,11 +61,17 @@ final class AgoraEvent extends Struct {
   @Int32()
   external int rttMs;
 
-  /// Peer's shared coarse geohash bucket (NUL-terminated, "" = none). Appended
-  /// LAST to mirror the C `agora_event_t`. Only meaningful when
-  /// [kind] == [agoraEventPosition].
+  /// Peer's shared coarse geohash bucket (NUL-terminated, "" = none). Only
+  /// meaningful when [kind] == [agoraEventPosition].
   @Array(agoraGeohashLen + 1)
   external Array<Uint8> geohash;
+
+  /// Peer's shared agora.profile as compact JSON (NUL-terminated UTF-8, "" =
+  /// none). Appended LAST to mirror the C `agora_event_t`. Only meaningful when
+  /// [kind] == [agoraEventProfile]. The core already verified the signature, so
+  /// this is trusted data.
+  @Array(agoraProfileJsonMax + 1)
+  external Array<Uint8> profileJson;
 }
 
 /// A pure-Dart copy of one decoded event. Decoupled from native memory so it
@@ -79,6 +89,7 @@ class AtRawEvent {
     required this.repRated,
     required this.rttMs,
     this.geohash = '',
+    this.profileJson = '',
   });
 
   final int kind;
@@ -99,6 +110,10 @@ class AtRawEvent {
   /// Peer's shared coarse geohash bucket ("" = none). Only set for
   /// [agoraEventPosition] events. Opt-in: empty unless the peer chose to share.
   final String geohash;
+
+  /// Peer's shared agora.profile as compact JSON ("" = none). Only set for
+  /// [agoraEventProfile] events. Opt-in; already signature-verified by the core.
+  final String profileJson;
 }
 
 typedef _SetRootC = Void Function(Pointer<Utf8>);
@@ -112,6 +127,9 @@ typedef _RosterDart = int Function(Pointer<Void>, Pointer<Utf8>);
 
 typedef _SetPosC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
 typedef _SetPosDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
+
+typedef _SetProfC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _SetProfDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
 
 typedef _PollC = Int32 Function(Pointer<Void>, Pointer<AgoraEvent>, Int32);
 typedef _PollDart = int Function(Pointer<Void>, Pointer<AgoraEvent>, int);
@@ -154,6 +172,19 @@ String _geohashString(Array<Uint8> src) {
   return String.fromCharCodes(bytes);
 }
 
+/// Decode a NUL-terminated UTF-8 profile JSON string from the fixed byte array.
+/// Malformed bytes are tolerated (allowMalformed) rather than throwing in poll.
+String _profileJsonString(Array<Uint8> src) {
+  final bytes = <int>[];
+  for (var i = 0; i < agoraProfileJsonMax; i++) {
+    final b = src[i];
+    if (b == 0) break;
+    bytes.add(b);
+  }
+  if (bytes.isEmpty) return '';
+  return utf8.decode(bytes, allowMalformed: true);
+}
+
 /// Thin, fork-free client over the AutonomousTrust app-events queue.
 class AtEvents {
   AtEvents._(this._handle);
@@ -169,6 +200,8 @@ class AtEvents {
       .lookupFunction<_RosterC, _RosterDart>('agora_events_request_roster');
   static final _SetPosDart _setPos =
       _lib.lookupFunction<_SetPosC, _SetPosDart>('agora_set_position');
+  static final _SetProfDart _setProf =
+      _lib.lookupFunction<_SetProfC, _SetProfDart>('agora_set_profile');
   static final _PollDart _poll =
       _lib.lookupFunction<_PollC, _PollDart>('agora_events_poll');
   static final _CloseDart _close =
@@ -226,6 +259,22 @@ class AtEvents {
     }
   }
 
+  /// Set (or clear) this node's opt-in agora.profile. [profileJson] is a JSON
+  /// object of the profile fields, or empty/null to opt out. The identity
+  /// process truncates each field to its bound and shares the result, signed,
+  /// only with admitted peers that ask. Returns 0 on success, negative on error
+  /// (-2 == daemon not ready yet).
+  int setProfile(String sendQueue, String? profileJson) {
+    final q = sendQueue.toNativeUtf8();
+    final p = (profileJson ?? '').toNativeUtf8();
+    try {
+      return _setProf(_handle, q, p);
+    } finally {
+      calloc.free(q);
+      calloc.free(p);
+    }
+  }
+
   /// Non-blocking drain. Returns decoded events (possibly empty). Copies out of
   /// native memory before freeing the buffer, so the results are safe to keep.
   List<AtRawEvent> poll({int max = 64}) {
@@ -247,6 +296,7 @@ class AtEvents {
           repRated: e.repRated != 0,
           rttMs: e.rttMs,
           geohash: _geohashString(e.geohash),
+          profileJson: _profileJsonString(e.profileJson),
         );
       }, growable: false);
     } finally {

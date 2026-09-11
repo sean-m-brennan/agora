@@ -206,7 +206,7 @@ shim, root, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
 # (kind==4) may arrive for it — silence is the correct, private behavior.
 expect_pos = sys.argv[4] if len(sys.argv) > 4 else ""
 
-UUID, KEY, GEO = 16, 32, 12
+UUID, KEY, GEO, PROF = 16, 32, 12, 2560
 class Ev(ctypes.Structure):
     _fields_ = [
         ("kind", ctypes.c_int32),
@@ -219,12 +219,14 @@ class Ev(ctypes.Structure):
         ("rep_score", ctypes.c_double),
         ("rep_rated", ctypes.c_uint8),
         ("rtt_ms", ctypes.c_int32),          # AGORA_EVENT_RTT (offset 116)
-        ("geohash", ctypes.c_char * (GEO + 1)),  # AGORA_EVENT_POSITION, appended LAST
+        ("geohash", ctypes.c_char * (GEO + 1)),   # AGORA_EVENT_POSITION (offset 120)
+        ("profile_json", ctypes.c_char * (PROF + 1)),  # AGORA_EVENT_PROFILE (offset 133), appended LAST
     ]
-# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (136 with
-# the geohash tail). If the C struct grows and this is not updated in lockstep,
-# poll() would misread every field past the drift — fail loudly instead.
-assert ctypes.sizeof(Ev) == 136, f"Ev size {ctypes.sizeof(Ev)} != 136 (ABI drift)"
+# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (2696 with
+# the geohash + profile_json tail; rtt@116, geohash@120, profile_json@133). If the
+# C struct grows and this is not updated in lockstep, poll() would misread every
+# field past the drift — fail loudly instead.
+assert ctypes.sizeof(Ev) == 2696, f"Ev size {ctypes.sizeof(Ev)} != 2696 (ABI drift)"
 
 lib = ctypes.CDLL(shim)
 lib.agora_set_root.argtypes = [ctypes.c_char_p]; lib.agora_set_root.restype = None

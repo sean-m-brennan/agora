@@ -80,6 +80,15 @@ set(AT_LINK_LIBS
     ${AT_PROTOBUFC_LIB} ${AT_PROTOBUF_LIB}
     pthread m stdc++)
 
+# AT's public headers embed a typedef'd struct as an UNNAMED member (e.g.
+# structures/array.h: `smrt_ptr_t;`), a Microsoft/plan9 anonymous-member
+# extension. AT's own build enables -fms-extensions (src/c/CMakeLists.txt), and
+# any consumer that includes these headers must do the same or GCC/Clang warns
+# "declaration does not declare anything". Applied here, after add_subdirectory
+# above, so it covers our own targets (agora_shim, agorad) without touching the
+# already-configured AT core, which sets the flag itself.
+add_compile_options(-fms-extensions)
+
 # --- Flat FFI shim -----------------------------------------------------------
 add_library(agora_shim SHARED at_agora_shim.c)
 target_include_directories(agora_shim PRIVATE ${AT_INCLUDE_DIRS})

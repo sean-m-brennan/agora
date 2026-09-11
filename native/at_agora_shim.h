@@ -45,12 +45,16 @@ extern "C" {
 #define AGORA_KEY_LEN  32
 /* Max geohash length. MUST match AT_APP_GEOHASH_LEN (app_events.h). */
 #define AGORA_GEOHASH_LEN 12
+/* Max compact-profile-JSON length. MUST match AT_APP_PROFILE_JSON_LEN
+ * (app_events.h) / AT_PROFILE_JSON_LEN (msg_types.h). */
+#define AGORA_PROFILE_JSON_MAX 2560
 
 /* kind discriminator (a superset-safe subset of at_app_event_kind_t). */
 #define AGORA_EVENT_PEER       1
 #define AGORA_EVENT_REPUTATION 2
 #define AGORA_EVENT_RTT        3
 #define AGORA_EVENT_POSITION   4
+#define AGORA_EVENT_PROFILE    5
 
 /**
  * One flattened app event. Field order is ABI-significant: the Dart
@@ -76,6 +80,12 @@ typedef struct {
      * The Dart AgoraEvent and the ctypes Ev in the cohort test mirror this
      * order and total size exactly (both re-check sizeof). */
     char    geohash[AGORA_GEOHASH_LEN + 1];
+    /* AGORA_EVENT_PROFILE: peer's shared agora.profile as compact field JSON;
+     * "" = none. Appended after geohash; the Dart AgoraEvent and the ctypes Ev
+     * in the cohort test mirror this order and the new total size exactly (both
+     * re-check sizeof). The core already verified the signature, so this is
+     * trusted data — the signature itself does not cross this boundary. */
+    char    profile_json[AGORA_PROFILE_JSON_MAX + 1];
 } agora_event_t;
 
 /** Set $AUTONOMOUS_TRUST_ROOT for THIS process, so the app-events client below
@@ -101,6 +111,14 @@ int agora_events_request_roster(void *handle, const char *send_queue);
  *  non-empty geohash. Returns 0 on success, negative on error (AT_APP_NOT_READY
  *  == -2 if the daemon is not up yet). */
 int agora_set_position(void *handle, const char *send_queue, const char *geohash);
+
+/** Set (or clear) THIS node's own opt-in agora.profile. `send_queue` is the
+ *  app -> AT queue; `profile_json` is a JSON object of the profile fields
+ *  ({display_name, handle, bio, avatar_ref, links}), or NULL/"" to opt out. The
+ *  identity process truncates each field to its bound and shares the result,
+ *  signed, only with admitted peers that ask. Returns 0 on success, negative on
+ *  error (AT_APP_NOT_READY == -2 if the daemon is not up yet). */
+int agora_set_profile(void *handle, const char *send_queue, const char *profile_json);
 
 /** Non-blocking poll. Writes up to @p max flattened events into @p out. Returns
  *  the count written (0 = nothing arrived), or a negative AT error code. */
