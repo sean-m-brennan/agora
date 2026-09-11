@@ -233,20 +233,25 @@ class _PeerTile extends StatelessWidget {
     final title = peer.hasProfile
         ? Text(peer.displayLabel)
         : Text(peer.shortId, style: const TextStyle(fontFamily: 'monospace'));
-    final subtitleLines = <Widget>[Text(peer.presenceLabel(now))];
-    // When a display name is shown as the title, surface the @handle and id so
-    // identity stays verifiable (the profile is signed, but a name is not a key).
+    // Keep the subtitle to at most two lines so it fits a three-line ListTile.
+    // Line 1 is presence, plus — when a display name is the title — the @handle
+    // and short id, so identity stays verifiable (the profile is signed, but a
+    // name is not a key). Line 2, if present, is the bio.
+    final subtitleLines = <Widget>[];
     if (peer.hasProfile) {
-      final idBits = <String>[
+      final bits = <String>[
+        peer.presenceLabel(now),
         if (peer.handle.isNotEmpty && peer.displayName.isNotEmpty) '@${peer.handle}',
         peer.shortId,
       ];
-      subtitleLines.add(Text(idBits.join(' · '),
-          style: Theme.of(context).textTheme.bodySmall));
+      subtitleLines.add(Text(bits.join(' · '),
+          maxLines: 1, overflow: TextOverflow.ellipsis));
       if (peer.bio.isNotEmpty) {
         subtitleLines.add(Text(peer.bio,
-            maxLines: 2, overflow: TextOverflow.ellipsis));
+            maxLines: 1, overflow: TextOverflow.ellipsis));
       }
+    } else {
+      subtitleLines.add(Text(peer.presenceLabel(now)));
     }
     return ListTile(
       isThreeLine: peer.hasProfile,
@@ -262,16 +267,17 @@ class _PeerTile extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: subtitleLines,
       ),
+      // Kept to three compact lines so the trailing column fits the ListTile
+      // height (rtt and distance share a line — both are proximity signals).
       trailing: Column(
+        mainAxisSize: MainAxisSize.min,
         mainAxisAlignment: MainAxisAlignment.center,
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
           Text('rank ${peer.rank}'),
           Text('rep ${peer.reputationLabel}',
               style: Theme.of(context).textTheme.bodySmall),
-          Text('rtt ${peer.rttLabel}',
-              style: Theme.of(context).textTheme.bodySmall),
-          Text('dist ${peer.distanceLabel(ownGeohash)}',
+          Text('${peer.rttLabel} · ${peer.distanceLabel(ownGeohash)}',
               style: Theme.of(context).textTheme.bodySmall),
         ],
       ),

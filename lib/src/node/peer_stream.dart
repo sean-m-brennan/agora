@@ -122,7 +122,15 @@ class PeerService extends ChangeNotifier {
   void _tick() {
     final ev = _events;
     if (ev == null) return;
-    final batch = ev.poll();
+    ingestEvents(ev.poll());
+  }
+
+  /// Merge a batch of decoded events into the roster, notifying listeners if
+  /// any arrived. Extracted from the poll tick so it can be driven directly in
+  /// tests (which never load the native shim). A new peer is created on first
+  /// sighting; subsequent events (reputation, RTT, position, profile) merge in.
+  @visibleForTesting
+  void ingestEvents(List<AtRawEvent> batch) {
     if (batch.isEmpty) return;
     for (final e in batch) {
       final key = _hex(e.uuid);
