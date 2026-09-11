@@ -40,6 +40,9 @@ class _AgoraAppState extends State<AgoraApp> {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Agora',
+      // The debug-build ribbon paints over the AppBar's top-right actions (the
+      // location/profile icons); it adds nothing here, so drop it.
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
       darkTheme: ThemeData(
         colorSchemeSeed: Colors.teal,

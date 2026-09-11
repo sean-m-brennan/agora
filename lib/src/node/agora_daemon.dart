@@ -29,8 +29,20 @@ class AgoraQueues {
 int pid_() => pid;
 
 class AgoraDaemon {
-  AgoraDaemon({required this.queues, String? root, this.logLevel = 3})
-      : root = root ?? defaultRoot();
+  AgoraDaemon({
+    required this.queues,
+    String? root,
+    this.logLevel = 3,
+    this.external = false,
+  }) : root = root ?? defaultRoot();
+
+  /// Attach to an `agorad` that is ALREADY running under [root] instead of
+  /// spawning one. In this mode [start] and [stop] do not launch or kill any
+  /// process — the app is a pure app-events client of the external daemon. Used
+  /// when a daemon is managed separately (a system service, or a netns-isolated
+  /// cohort node the GUI observes over its filesystem socket — see
+  /// test/cohort/two_node_gui.sh). Toggled via $AGORA_EXTERNAL_DAEMON.
+  final bool external;
 
   final AgoraQueues queues;
 
@@ -73,6 +85,11 @@ class AgoraDaemon {
   }
 
   Future<void> start() async {
+    // Attach mode: the daemon is managed elsewhere; nothing to spawn. The
+    // app-events client (opened by the caller under our [root]) reaches its
+    // sockets directly — an AF_UNIX pathname socket is not network-namespace
+    // scoped, so this works even when the daemon runs inside a netns.
+    if (external) return;
     if (_proc != null) return;
     _proc = await Process.start(
       _daemonPath(),
@@ -87,6 +104,9 @@ class AgoraDaemon {
   }
 
   Future<void> stop() async {
+    // Attach mode owns no process: leave the external daemon and its sockets
+    // alone (another owner manages its lifecycle).
+    if (external) return;
     final p = _proc;
     if (p == null) return;
     _proc = null;

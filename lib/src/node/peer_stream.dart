@@ -6,6 +6,7 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show Platform;
 
 import 'package:flutter/foundation.dart';
 
@@ -17,7 +18,19 @@ class PeerService extends ChangeNotifier {
   PeerService({
     AgoraDaemon? daemon,
     this.pollInterval = const Duration(milliseconds: 300),
-  }) : _daemon = daemon ?? AgoraDaemon(queues: AgoraQueues.forThisInstance());
+  }) : _daemon = daemon ?? _defaultDaemon();
+
+  /// Build the default daemon. When $AGORA_EXTERNAL_DAEMON is set (to a non-empty
+  /// value other than "0"/"false"), attach to an already-running `agorad` under
+  /// $AUTONOMOUS_TRUST_ROOT instead of spawning one — see AgoraDaemon.external.
+  static AgoraDaemon _defaultDaemon() {
+    final v = Platform.environment['AGORA_EXTERNAL_DAEMON']?.toLowerCase();
+    final external = v != null && v.isNotEmpty && v != '0' && v != 'false';
+    return AgoraDaemon(
+      queues: AgoraQueues.forThisInstance(),
+      external: external,
+    );
+  }
 
   final AgoraDaemon _daemon;
   final Duration pollInterval;
@@ -26,6 +39,16 @@ class PeerService extends ChangeNotifier {
   Timer? _timer;
   final Map<String, AgoraPeer> _peers = {};
   String _status = 'idle';
+
+  /// Poll ticks between roster re-requests. A single roster pull races with the
+  /// daemon: peers/positions/profiles already exchanged (common when attaching
+  /// to an already-running daemon) arrive as a burst of app-events datagrams,
+  /// and any dropped under that burst are otherwise never re-sent. Re-requesting
+  /// the roster periodically re-emits the full stored roster (identity_emit_all_*
+  /// in id_proc.c), so a late or dropped position/profile is picked up. Cheap:
+  /// it walks the peer table and emits current state, deduped by applyEvent.
+  static const int _rosterEveryTicks = 10; // ~3 s at the 300 ms default
+  int _ticksSinceRoster = 0;
 
   /// This node's own opt-in coarse geohash bucket, or null when opted out (the
   /// default). Used to compute distance to peers who also opted in. Kept here so
@@ -122,6 +145,12 @@ class PeerService extends ChangeNotifier {
   void _tick() {
     final ev = _events;
     if (ev == null) return;
+    // Periodically re-pull the full roster so positions/profiles exchanged just
+    // before we attached (or dropped under the initial emit burst) are surfaced.
+    if (++_ticksSinceRoster >= _rosterEveryTicks) {
+      _ticksSinceRoster = 0;
+      ev.requestRoster(_daemon.queues.appToAt);
+    }
     ingestEvents(ev.poll());
   }
 

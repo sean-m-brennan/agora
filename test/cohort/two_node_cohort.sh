@@ -14,8 +14,10 @@
 # (peer UUID + presence + reputation + RTT + opt-in coarse POSITION). RTT is a
 # network-latency proximity proxy in ms (0 = unknown). Position (Increment 2) is
 # an opt-in coarse geohash bucket a node chooses to share; the app decodes it and
-# computes geographic distance (see lib/src/geo/geohash.dart). agora.profile
-# fields remain out of the C event surface (SOCIAL_APP_PLAN.md §5.1).
+# computes geographic distance (see lib/src/geo/geohash.dart). Opt-in signed
+# agora.profile (Increment 3, kind==5) is now ALSO on the C event surface
+# (SOCIAL_APP_PLAN.md §5.1); this headless harness checks presence/RTT/position —
+# see two_node_gui.sh to watch profiles + distance in the real Flutter UI.
 #
 # This run exercises BOTH halves of the opt-in position feature in one cohort:
 # node 1 opts IN (AT_OWN_GEOHASH=$GEO1, default u4pruy), node 2 opts OUT. PASS
