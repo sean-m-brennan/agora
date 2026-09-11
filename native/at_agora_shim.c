@@ -39,6 +39,16 @@ _Static_assert(AGORA_GEOHASH_LEN == AT_APP_GEOHASH_LEN,
                "AGORA_GEOHASH_LEN out of sync with AT_APP_GEOHASH_LEN");
 _Static_assert(AGORA_PROFILE_JSON_MAX == AT_APP_PROFILE_JSON_LEN,
                "AGORA_PROFILE_JSON_MAX out of sync with AT_APP_PROFILE_JSON_LEN");
+_Static_assert(AGORA_DM_TEXT_MAX == AT_APP_DM_TEXT_LEN,
+               "AGORA_DM_TEXT_MAX out of sync with AT_APP_DM_TEXT_LEN");
+/* ABI lockstep: the Dart AgoraEvent struct and the ctypes Ev in the cohort
+ * tests (test/cohort/two_node_cohort.sh, two_node_gui.sh) all assert this exact
+ * size. Growing agora_event_t REQUIRES bumping all three together. Grew from
+ * 2704 to 3752 with the Increment 6 DM tail (dm_seq@2704, dm_ts, dm_text);
+ * every prior field offset is unchanged (connection_state stays at 2696). */
+_Static_assert(sizeof(agora_event_t) == 3752,
+               "agora_event_t size changed — update the Dart struct and both "
+               "cohort ctypes Ev asserts in lockstep");
 
 void *agora_events_open(const char *recv_queue)
 {
@@ -58,6 +68,27 @@ int agora_set_position(void *handle, const char *send_queue, const char *geohash
 int agora_set_profile(void *handle, const char *send_queue, const char *profile_json)
 {
     return at_app_events_set_profile((at_app_events_t *)handle, send_queue, profile_json);
+}
+
+int agora_connect_request(void *handle, const char *send_queue,
+                          const uint8_t *peer_uuid)
+{
+    return at_app_events_connect_request((at_app_events_t *)handle, send_queue,
+                                         peer_uuid);
+}
+
+int agora_connect_respond(void *handle, const char *send_queue,
+                          const uint8_t *peer_uuid, int accept)
+{
+    return at_app_events_connect_respond((at_app_events_t *)handle, send_queue,
+                                         peer_uuid, accept != 0);
+}
+
+int agora_send_dm(void *handle, const char *send_queue,
+                  const uint8_t *peer_uuid, const char *text)
+{
+    return at_app_events_send_dm((at_app_events_t *)handle, send_queue,
+                                 peer_uuid, text);
 }
 
 int agora_events_poll(void *handle, agora_event_t *out, int max)
@@ -121,6 +152,31 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             memcpy(e->profile_json, raw[i].data.profile.profile_json,
                    AGORA_PROFILE_JSON_MAX);
             e->profile_json[AGORA_PROFILE_JSON_MAX] = '\0';
+            w++;
+            break;
+
+        case AT_APP_EVENT_CONNECTION_REQUEST:
+            e->kind = AGORA_EVENT_CONNECTION_REQUEST;
+            memcpy(e->peer_uuid, raw[i].data.connection.peer_uuid, AGORA_UUID_LEN);
+            e->connection_state = raw[i].data.connection.state;
+            w++;
+            break;
+
+        case AT_APP_EVENT_CONNECTION_STATE:
+            e->kind = AGORA_EVENT_CONNECTION_STATE;
+            memcpy(e->peer_uuid, raw[i].data.connection.peer_uuid, AGORA_UUID_LEN);
+            e->connection_state = raw[i].data.connection.state;
+            w++;
+            break;
+
+        case AT_APP_EVENT_DM:
+            e->kind = AGORA_EVENT_DM;
+            memcpy(e->peer_uuid, raw[i].data.dm.peer_uuid, AGORA_UUID_LEN);
+            e->dm_seq = raw[i].data.dm.seq;
+            e->dm_ts = raw[i].data.dm.ts;
+            /* raw text is already NUL-bounded by AT; copy and re-terminate. */
+            memcpy(e->dm_text, raw[i].data.dm.text, AGORA_DM_TEXT_MAX);
+            e->dm_text[AGORA_DM_TEXT_MAX] = '\0';
             w++;
             break;
 

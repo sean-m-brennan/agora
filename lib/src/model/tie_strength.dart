@@ -149,17 +149,20 @@ double proximityFactor(AgoraPeer peer, String? ownGeohash,
   return 0.0;
 }
 
-/// The interaction-recency term, in [0,1]. Phase-1 STAND-IN: derived from the
+/// The interaction-recency term, in [0,1], decaying as exp(-age/tau).
+///
+/// Increment 5: for peers we actually TEND (a real interaction recorded —
+/// `lastInteractionAt > 0`, stamped on connect/accept/observed-connected), the
+/// real per-peer last-interaction timestamp drives recency, REPLACING the
+/// Phase-1 presence stand-in. For everyone else it falls back to the
 /// operator-attended freshness (`operatorAttestedAt`) as a proxy for "recently
-/// active with me", decaying as exp(-age/tau). Increment 5 (connections) and 6
-/// (DMs) introduce a real per-peer last-interaction timestamp that REPLACES this
-/// proxy — a relationship you actually tend should drive recency, not mere
-/// presence.
-// TODO(inc5/6): replace with a real per-peer last-interaction timestamp.
+/// active with me" — presence, not a tended relationship.
 double recencyFactor(AgoraPeer peer, double nowEpochSeconds,
     {TieStrengthWeights weights = TieStrengthWeights.defaults}) {
-  if (peer.operatorAttestedAt <= 0) return 0.0;
-  final age = nowEpochSeconds - peer.operatorAttestedAt;
+  final anchor =
+      peer.lastInteractionAt > 0 ? peer.lastInteractionAt : peer.operatorAttestedAt;
+  if (anchor <= 0) return 0.0;
+  final age = nowEpochSeconds - anchor;
   if (age <= 0) return 1.0;
   return math.exp(-age / weights.recencyTauSeconds);
 }

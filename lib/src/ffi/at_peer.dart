@@ -14,6 +14,33 @@ import 'dart:convert';
 import 'at_events_bindings.dart';
 import '../geo/geohash.dart';
 
+/// A connection edge state toward a peer (Increment 5), mirroring the AT core's
+/// `at_conn_state_t`. A connection is EXPLICIT, revocable, and SEPARATE from
+/// reputation (trust tier is derived from reputation, not this).
+enum ConnectionState {
+  none, // 0
+  pendingOut, // 1 — we asked
+  pendingIn, // 2 — they asked us
+  connected, // 3
+  declined, // 4
+}
+
+/// Map the raw int (from the app-event surface) to a [ConnectionState].
+ConnectionState connectionStateFromInt(int v) {
+  switch (v) {
+    case 1:
+      return ConnectionState.pendingOut;
+    case 2:
+      return ConnectionState.pendingIn;
+    case 3:
+      return ConnectionState.connected;
+    case 4:
+      return ConnectionState.declined;
+    default:
+      return ConnectionState.none;
+  }
+}
+
 class AgoraPeer {
   AgoraPeer({required this.uuid});
 
@@ -54,6 +81,26 @@ class AgoraPeer {
   String bio = '';
   String avatarRef = '';
   List<String> links = const [];
+
+  /// This node's connection edge state toward the peer (Increment 5), as the
+  /// raw int (none=0 … declined=4). A connection is EXPLICIT and revocable, and
+  /// SEPARATE from reputation.
+  int connectionState = 0;
+
+  /// The edge state as an enum.
+  ConnectionState get connection => connectionStateFromInt(connectionState);
+
+  /// True when an inbound connection request is awaiting our response.
+  bool get hasInboundRequest => connection == ConnectionState.pendingIn;
+
+  /// True once we are connected to this peer.
+  bool get isConnected => connection == ConnectionState.connected;
+
+  /// Epoch seconds of the last real interaction with this peer (Increment 5):
+  /// stamped when a connection is asked, accepted, or observed connected. 0 ==
+  /// no interaction yet. Feeds the tie-strength recency term, REPLACING the
+  /// operator-attended presence stand-in for peers we actually tend.
+  double lastInteractionAt = 0;
 
   /// True once any profile field has been shared by this peer.
   bool get hasProfile =>
@@ -139,9 +186,29 @@ class AgoraPeer {
       case agoraEventProfile:
         _applyProfileJson(e.profileJson);
         return true;
+      case agoraEventConnectionRequest:
+        // An inbound ask: reflect pending_in so the UI can offer accept/decline.
+        connectionState = e.connectionState;
+        return true;
+      case agoraEventConnectionState:
+        connectionState = e.connectionState;
+        // A connection we actually tend stamps a real interaction recency,
+        // replacing the presence stand-in for connected peers (Increment 5).
+        if (connection == ConnectionState.connected ||
+            connection == ConnectionState.pendingOut) {
+          lastInteractionAt = DateTime.now().millisecondsSinceEpoch / 1000.0;
+        }
+        return true;
       default:
         return false;
     }
+  }
+
+  /// Stamp an interaction "now" (Increment 5) — called when the operator asks to
+  /// connect or responds, so tie-strength recency reflects a tie we tend even
+  /// before the round-trip completes. [nowEpochSeconds] is injectable for tests.
+  void markInteraction(double nowEpochSeconds) {
+    lastInteractionAt = nowEpochSeconds;
   }
 
   /// Merge a compact profile JSON object (the core-verified fields) into this

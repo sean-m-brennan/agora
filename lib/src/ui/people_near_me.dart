@@ -4,10 +4,15 @@
 // agora.profile when shared, else short id), rank, operator-attended presence,
 // reputation, RTT, and opt-in coarse distance (see SOCIAL_APP_PLAN.md §5.1).
 
-import 'package:flutter/material.dart';
+// Hide Flutter's own ConnectionState (FutureBuilder/StreamBuilder) — this file
+// uses the peer-edge ConnectionState from at_peer.dart (Increment 5), and does
+// not use async builders.
+import 'package:flutter/material.dart' hide ConnectionState;
 
 import '../node/peer_stream.dart';
 import '../ffi/at_peer.dart';
+import '../model/tie_strength.dart';
+import 'dm_thread.dart';
 
 class PeopleNearMePage extends StatelessWidget {
   const PeopleNearMePage({super.key, required this.service});
@@ -66,8 +71,8 @@ class PeopleNearMePage extends StatelessWidget {
                     : ListView.separated(
                         itemCount: peers.length,
                         separatorBuilder: (_, __) => const Divider(height: 1),
-                        itemBuilder: (context, i) =>
-                            _PeerTile(peer: peers[i], ownGeohash: own),
+                        itemBuilder: (context, i) => _PeerTile(
+                            peer: peers[i], ownGeohash: own, service: service),
                       ),
               ),
             ],
@@ -221,15 +226,19 @@ class PeopleNearMePage extends StatelessWidget {
 }
 
 class _PeerTile extends StatelessWidget {
-  const _PeerTile({required this.peer, this.ownGeohash});
+  const _PeerTile({required this.peer, required this.service, this.ownGeohash});
 
   final AgoraPeer peer;
+  final PeerService service;
   final String? ownGeohash;
 
   @override
   Widget build(BuildContext context) {
     final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
     final present = peer.operatorBound && peer.operatorAttestedAt > 0;
+    final strength =
+        tieStrength(peer, ownGeohash: ownGeohash, nowEpochSeconds: now);
+    final audience = audienceLabel(audienceForTier(trustTier(peer)));
     final title = peer.hasProfile
         ? Text(peer.displayLabel)
         : Text(peer.shortId, style: const TextStyle(fontFamily: 'monospace'));
@@ -269,19 +278,151 @@ class _PeerTile extends StatelessWidget {
       ),
       // Kept to three compact lines so the trailing column fits the ListTile
       // height (rtt and distance share a line — both are proximity signals).
-      trailing: Column(
+      // Three compact lines: the tie strength (§3.2) that drives the ordering,
+      // then the trust band this peer sits in (its post audience), then the
+      // proximity signals (rtt · coarse distance) that feed the strength.
+      trailing: Row(
         mainAxisSize: MainAxisSize.min,
-        mainAxisAlignment: MainAxisAlignment.center,
-        crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          Text('rank ${peer.rank}'),
-          Text('rep ${peer.reputationLabel}',
-              style: Theme.of(context).textTheme.bodySmall),
-          Text('${peer.rttLabel} · ${peer.distanceLabel(ownGeohash)}',
-              style: Theme.of(context).textTheme.bodySmall),
+          _MessageButton(peer: peer, service: service),
+          _ConnectControl(peer: peer, service: service),
+          const SizedBox(width: 4),
+          Builder(builder: (context) {
+            // Compact line style: three signals must fit the trailing box of a
+            // three-line ListTile without overflowing (a taller default line
+            // height spilled it by a few px), so tighten the line height.
+            final small = Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(height: 1.15);
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Text('tie ${strength.toStringAsFixed(2)}',
+                    style: small?.copyWith(fontWeight: FontWeight.w600)),
+                Text('rep ${peer.reputationLabel} · $audience', style: small),
+                Text('${peer.rttLabel} · ${peer.distanceLabel(ownGeohash)}',
+                    style: small),
+              ],
+            );
+          }),
         ],
       ),
     );
+  }
+}
+
+/// The per-peer message affordance (Increment 6): opens the DM thread with this
+/// peer. A DM needs no connection or tier — it is allowed between any two peers —
+/// so this sits alongside the connect control, always available. A dot marks an
+/// unread incoming message.
+class _MessageButton extends StatelessWidget {
+  const _MessageButton({required this.peer, required this.service});
+
+  final AgoraPeer peer;
+  final PeerService service;
+
+  void _open(BuildContext context) {
+    Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => DmThreadPage(peer: peer, service: service),
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final icon = IconButton(
+      icon: const Icon(Icons.chat_bubble_outline),
+      tooltip: 'Message',
+      visualDensity: VisualDensity.compact,
+      onPressed: () => _open(context),
+    );
+    if (!service.hasUnread(peer)) return icon;
+    // A small unread dot in the corner of the icon.
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        icon,
+        Positioned(
+          right: 6,
+          top: 6,
+          child: Container(
+            width: 8,
+            height: 8,
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.error,
+              shape: BoxShape.circle,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// The per-peer connection affordance (Increment 5). Reflects the explicit,
+/// revocable edge state and offers the next action: connect when there is no
+/// edge, accept/decline an inbound request (pending_in), a pending indicator
+/// after we asked (pending_out), and a connected/declined marker otherwise. A
+/// connection is SEPARATE from reputation — this never changes trust.
+class _ConnectControl extends StatelessWidget {
+  const _ConnectControl({required this.peer, required this.service});
+
+  final AgoraPeer peer;
+  final PeerService service;
+
+  @override
+  Widget build(BuildContext context) {
+    switch (peer.connection) {
+      case ConnectionState.pendingIn:
+        // They asked us: accept / decline.
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              icon: const Icon(Icons.check_circle, color: Colors.green),
+              tooltip: 'Accept connection',
+              visualDensity: VisualDensity.compact,
+              onPressed: () => service.respondConnection(peer, true),
+            ),
+            IconButton(
+              icon: const Icon(Icons.cancel_outlined),
+              tooltip: 'Decline connection',
+              visualDensity: VisualDensity.compact,
+              onPressed: () => service.respondConnection(peer, false),
+            ),
+          ],
+        );
+      case ConnectionState.pendingOut:
+        return const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 8),
+          child: Tooltip(
+            message: 'Request sent — awaiting response',
+            child: Icon(Icons.hourglass_top, size: 18),
+          ),
+        );
+      case ConnectionState.connected:
+        return Tooltip(
+          message: 'Connected',
+          child: Icon(Icons.link, color: Theme.of(context).colorScheme.primary),
+        );
+      case ConnectionState.declined:
+        // Declined — allow a fresh ask (connections are revocable).
+        return IconButton(
+          icon: const Icon(Icons.person_off_outlined),
+          tooltip: 'Declined — tap to ask again',
+          visualDensity: VisualDensity.compact,
+          onPressed: () => service.requestConnection(peer),
+        );
+      case ConnectionState.none:
+        return IconButton(
+          icon: const Icon(Icons.person_add_alt_1),
+          tooltip: 'Connect',
+          visualDensity: VisualDensity.compact,
+          onPressed: () => service.requestConnection(peer),
+        );
+    }
   }
 }
 
@@ -313,11 +454,13 @@ class _PendingCapabilitiesBanner extends StatelessWidget {
   Widget build(BuildContext context) {
     return const MaterialBanner(
       content: Text(
-        'Presence, reputation, RTT, opt-in distance, and opt-in signed profiles '
-        'are live. RTT is a network-latency proxy (ms); distance is a coarse '
+        'Ranked by TIE STRENGTH (§3.2): trust tier + interaction recency + '
+        'proximity, so local, tended, trusted ties surface first. "tie" is that '
+        'score; the band beside "rep" is the peer\'s post audience (public → '
+        'close). RTT is a network-latency proxy (ms); distance is a coarse '
         '(~5 km) estimate shown only when BOTH sides opt in (location icon). '
-        'Profiles (agora.profile) are shared, signed, only with connected peers '
-        '(badge icon to set yours). (SOCIAL_APP_PLAN.md §5.1)',
+        'Profiles are shared, signed, only with connected peers (badge icon). '
+        '(SOCIAL_APP_PLAN.md §3, §5.1)',
       ),
       leading: Icon(Icons.info_outline),
       actions: [SizedBox.shrink()],

@@ -18,12 +18,17 @@ const int agoraKeyLen = 32;
 const int agoraGeohashLen = 12; // must match AGORA_GEOHASH_LEN (at_agora_shim.h)
 // must match AGORA_PROFILE_JSON_MAX (at_agora_shim.h)
 const int agoraProfileJsonMax = 2560;
+// must match AGORA_DM_TEXT_MAX (at_agora_shim.h)
+const int agoraDmTextMax = 1024;
 
 const int agoraEventPeer = 1;
 const int agoraEventReputation = 2;
 const int agoraEventRtt = 3;
 const int agoraEventPosition = 4;
 const int agoraEventProfile = 5;
+const int agoraEventConnectionRequest = 6;
+const int agoraEventConnectionState = 7;
+const int agoraEventDm = 8;
 
 /// dart:ffi mirror of `agora_event_t` (native/at_agora_shim.h). Field order and
 /// element counts MUST match the C struct exactly — the layout is the ABI
@@ -72,6 +77,26 @@ final class AgoraEvent extends Struct {
   /// this is trusted data.
   @Array(agoraProfileJsonMax + 1)
   external Array<Uint8> profileJson;
+
+  /// This node's connection edge state toward the peer (Increment 5): none=0,
+  /// pending_out=1, pending_in=2, connected=3, declined=4. Appended LAST to
+  /// mirror the C `agora_event_t`. Only meaningful when [kind] is
+  /// [agoraEventConnectionRequest] or [agoraEventConnectionState].
+  @Int32()
+  external int connectionState;
+
+  /// A directed message received from the peer (Increment 6). Appended LAST to
+  /// mirror the C `agora_event_t`. Only meaningful when [kind] ==
+  /// [agoraEventDm]: [dmSeq] the sender's freshness sequence, [dmTs] the
+  /// sender's send time (epoch seconds), [dmText] the NUL-terminated body.
+  @Int64()
+  external int dmSeq;
+
+  @Double()
+  external double dmTs;
+
+  @Array(agoraDmTextMax + 1)
+  external Array<Uint8> dmText;
 }
 
 /// A pure-Dart copy of one decoded event. Decoupled from native memory so it
@@ -90,6 +115,10 @@ class AtRawEvent {
     required this.rttMs,
     this.geohash = '',
     this.profileJson = '',
+    this.connectionState = 0,
+    this.dmSeq = 0,
+    this.dmTs = 0,
+    this.dmText = '',
   });
 
   final int kind;
@@ -114,6 +143,18 @@ class AtRawEvent {
   /// Peer's shared agora.profile as compact JSON ("" = none). Only set for
   /// [agoraEventProfile] events. Opt-in; already signature-verified by the core.
   final String profileJson;
+
+  /// This node's connection edge state toward the peer (Increment 5): none=0,
+  /// pending_out=1, pending_in=2, connected=3, declined=4. Set for
+  /// [agoraEventConnectionRequest] and [agoraEventConnectionState] events.
+  final int connectionState;
+
+  /// A directed message received from the peer (Increment 6). Set only for
+  /// [agoraEventDm] events: [dmSeq] the sender's freshness sequence, [dmTs] the
+  /// sender's send time (epoch seconds), [dmText] the message body.
+  final int dmSeq;
+  final double dmTs;
+  final String dmText;
 }
 
 typedef _SetRootC = Void Function(Pointer<Utf8>);
@@ -130,6 +171,19 @@ typedef _SetPosDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
 
 typedef _SetProfC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
 typedef _SetProfDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
+
+typedef _ConnReqC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
+typedef _ConnReqDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
+
+typedef _ConnRespC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Int32);
+typedef _ConnRespDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, int);
+
+typedef _SendDmC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Pointer<Utf8>);
+typedef _SendDmDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Pointer<Utf8>);
 
 typedef _PollC = Int32 Function(Pointer<Void>, Pointer<AgoraEvent>, Int32);
 typedef _PollDart = int Function(Pointer<Void>, Pointer<AgoraEvent>, int);
@@ -185,6 +239,19 @@ String _profileJsonString(Array<Uint8> src) {
   return utf8.decode(bytes, allowMalformed: true);
 }
 
+/// Decode a NUL-terminated UTF-8 DM body from the fixed byte array (Increment 6).
+/// Malformed bytes are tolerated (allowMalformed) rather than throwing in poll.
+String _dmTextString(Array<Uint8> src) {
+  final bytes = <int>[];
+  for (var i = 0; i < agoraDmTextMax; i++) {
+    final b = src[i];
+    if (b == 0) break;
+    bytes.add(b);
+  }
+  if (bytes.isEmpty) return '';
+  return utf8.decode(bytes, allowMalformed: true);
+}
+
 /// Thin, fork-free client over the AutonomousTrust app-events queue.
 class AtEvents {
   AtEvents._(this._handle);
@@ -202,6 +269,12 @@ class AtEvents {
       _lib.lookupFunction<_SetPosC, _SetPosDart>('agora_set_position');
   static final _SetProfDart _setProf =
       _lib.lookupFunction<_SetProfC, _SetProfDart>('agora_set_profile');
+  static final _ConnReqDart _connReq =
+      _lib.lookupFunction<_ConnReqC, _ConnReqDart>('agora_connect_request');
+  static final _ConnRespDart _connResp =
+      _lib.lookupFunction<_ConnRespC, _ConnRespDart>('agora_connect_respond');
+  static final _SendDmDart _sendDm =
+      _lib.lookupFunction<_SendDmC, _SendDmDart>('agora_send_dm');
   static final _PollDart _poll =
       _lib.lookupFunction<_PollC, _PollDart>('agora_events_poll');
   static final _CloseDart _close =
@@ -275,6 +348,62 @@ class AtEvents {
     }
   }
 
+  /// Request an explicit connection to [peerUuid] (16 raw identity bytes). The
+  /// core sets our edge to pending_out and sends a directed encrypted request.
+  /// Returns 0 on success, negative on error (-2 == daemon not ready yet). A
+  /// connection is EXPLICIT and revocable, and SEPARATE from reputation.
+  int connectRequest(String sendQueue, List<int> peerUuid) {
+    final q = sendQueue.toNativeUtf8();
+    final u = calloc<Uint8>(agoraUuidLen);
+    try {
+      for (var i = 0; i < agoraUuidLen && i < peerUuid.length; i++) {
+        u[i] = peerUuid[i];
+      }
+      return _connReq(_handle, q, u);
+    } finally {
+      calloc.free(q);
+      calloc.free(u);
+    }
+  }
+
+  /// Respond to an inbound connection request from [peerUuid] (16 raw identity
+  /// bytes): [accept] true connects, false declines. The core sets our edge and
+  /// sends a directed encrypted, SIGNED response. Returns 0 on success, negative
+  /// on error (-2 == daemon not ready yet).
+  int connectRespond(String sendQueue, List<int> peerUuid, bool accept) {
+    final q = sendQueue.toNativeUtf8();
+    final u = calloc<Uint8>(agoraUuidLen);
+    try {
+      for (var i = 0; i < agoraUuidLen && i < peerUuid.length; i++) {
+        u[i] = peerUuid[i];
+      }
+      return _connResp(_handle, q, u, accept ? 1 : 0);
+    } finally {
+      calloc.free(q);
+      calloc.free(u);
+    }
+  }
+
+  /// Send a directed text message to [peerUuid] (16 raw identity bytes). The
+  /// core sends a directed encrypted peer_dm and does NOT echo it back — the app
+  /// echoes locally. Returns 0 on success, negative on error (-2 == daemon not
+  /// ready yet).
+  int sendDm(String sendQueue, List<int> peerUuid, String text) {
+    final q = sendQueue.toNativeUtf8();
+    final t = text.toNativeUtf8();
+    final u = calloc<Uint8>(agoraUuidLen);
+    try {
+      for (var i = 0; i < agoraUuidLen && i < peerUuid.length; i++) {
+        u[i] = peerUuid[i];
+      }
+      return _sendDm(_handle, q, u, t);
+    } finally {
+      calloc.free(q);
+      calloc.free(t);
+      calloc.free(u);
+    }
+  }
+
   /// Non-blocking drain. Returns decoded events (possibly empty). Copies out of
   /// native memory before freeing the buffer, so the results are safe to keep.
   List<AtRawEvent> poll({int max = 64}) {
@@ -297,6 +426,10 @@ class AtEvents {
           rttMs: e.rttMs,
           geohash: _geohashString(e.geohash),
           profileJson: _profileJsonString(e.profileJson),
+          connectionState: e.connectionState,
+          dmSeq: e.dmSeq,
+          dmTs: e.dmTs,
+          dmText: _dmTextString(e.dmText),
         );
       }, growable: false);
     } finally {

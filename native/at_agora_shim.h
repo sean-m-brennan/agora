@@ -48,13 +48,19 @@ extern "C" {
 /* Max compact-profile-JSON length. MUST match AT_APP_PROFILE_JSON_LEN
  * (app_events.h) / AT_PROFILE_JSON_LEN (msg_types.h). */
 #define AGORA_PROFILE_JSON_MAX 2560
+/* Max DM body length. MUST match AT_APP_DM_TEXT_LEN (app_events.h) /
+ * AT_DM_TEXT_LEN (msg_types.h). */
+#define AGORA_DM_TEXT_MAX 1024
 
 /* kind discriminator (a superset-safe subset of at_app_event_kind_t). */
-#define AGORA_EVENT_PEER       1
-#define AGORA_EVENT_REPUTATION 2
-#define AGORA_EVENT_RTT        3
-#define AGORA_EVENT_POSITION   4
-#define AGORA_EVENT_PROFILE    5
+#define AGORA_EVENT_PEER               1
+#define AGORA_EVENT_REPUTATION         2
+#define AGORA_EVENT_RTT                3
+#define AGORA_EVENT_POSITION           4
+#define AGORA_EVENT_PROFILE            5
+#define AGORA_EVENT_CONNECTION_REQUEST 6
+#define AGORA_EVENT_CONNECTION_STATE   7
+#define AGORA_EVENT_DM                 8
 
 /**
  * One flattened app event. Field order is ABI-significant: the Dart
@@ -86,6 +92,25 @@ typedef struct {
      * re-check sizeof). The core already verified the signature, so this is
      * trusted data — the signature itself does not cross this boundary. */
     char    profile_json[AGORA_PROFILE_JSON_MAX + 1];
+    /* AGORA_EVENT_CONNECTION_REQUEST / AGORA_EVENT_CONNECTION_STATE (Increment
+     * 5): this node's local connection edge state toward the peer — none=0,
+     * pending_out=1, pending_in=2, connected=3, declined=4. Appended LAST after
+     * profile_json so every prior field offset is unchanged; the Dart AgoraEvent
+     * and the ctypes Ev in the cohort tests mirror this order and the new total
+     * size exactly (all re-check sizeof). A connection is EXPLICIT and separate
+     * from reputation — NO trust tier crosses here. */
+    int32_t connection_state;
+    /* AGORA_EVENT_DM (Increment 6): a directed text message received from the
+     * peer. Appended LAST after connection_state so every prior field offset is
+     * unchanged; the Dart AgoraEvent and the ctypes Ev in the cohort test mirror
+     * this order and the new total size exactly (all re-check sizeof). A DM is a
+     * live stream — dm_seq is the sender's freshness sequence (a replay guard),
+     * dm_ts the sender's send time (epoch seconds), dm_text the NUL-terminated
+     * body (bound-truncated to AGORA_DM_TEXT_MAX). crypto_box already
+     * authenticated the sender, so peer_uuid is trustworthy. */
+    int64_t dm_seq;
+    double  dm_ts;
+    char    dm_text[AGORA_DM_TEXT_MAX + 1];
 } agora_event_t;
 
 /** Set $AUTONOMOUS_TRUST_ROOT for THIS process, so the app-events client below
@@ -119,6 +144,29 @@ int agora_set_position(void *handle, const char *send_queue, const char *geohash
  *  signed, only with admitted peers that ask. Returns 0 on success, negative on
  *  error (AT_APP_NOT_READY == -2 if the daemon is not up yet). */
 int agora_set_profile(void *handle, const char *send_queue, const char *profile_json);
+
+/** Request an explicit connection to a peer (Increment 5). `send_queue` is the
+ *  app -> AT queue; `peer_uuid` is the peer's 16 raw identity bytes. The identity
+ *  process sets our edge to pending_out and sends a directed encrypted request.
+ *  Returns 0 on success, negative on error (AT_APP_NOT_READY == -2). */
+int agora_connect_request(void *handle, const char *send_queue,
+                          const uint8_t *peer_uuid);
+
+/** Respond to an inbound connection request (Increment 5). `send_queue` is the
+ *  app -> AT queue; `peer_uuid` is the requester's 16 raw identity bytes;
+ *  `accept` non-zero connects, zero declines. The identity process sets our edge
+ *  and sends a directed encrypted, SIGNED response. Returns 0 on success,
+ *  negative on error (AT_APP_NOT_READY == -2). */
+int agora_connect_respond(void *handle, const char *send_queue,
+                          const uint8_t *peer_uuid, int accept);
+
+/** Send a directed text message to a peer (Increment 6). `send_queue` is the
+ *  app -> AT queue; `peer_uuid` is the recipient's 16 raw identity bytes; `text`
+ *  is the message body (truncated to AGORA_DM_TEXT_MAX bytes). The identity
+ *  process sends a directed encrypted peer_dm; the core does NOT echo it back.
+ *  Returns 0 on success, negative on error (AT_APP_NOT_READY == -2). */
+int agora_send_dm(void *handle, const char *send_queue,
+                  const uint8_t *peer_uuid, const char *text);
 
 /** Non-blocking poll. Writes up to @p max flattened events into @p out. Returns
  *  the count written (0 = nothing arrived), or a negative AT error code. */

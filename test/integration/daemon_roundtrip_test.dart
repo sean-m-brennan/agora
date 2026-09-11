@@ -18,6 +18,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:agora/src/ffi/at_peer.dart';
 import 'package:agora/src/node/agora_daemon.dart';
 import 'package:agora/src/node/peer_stream.dart';
 
@@ -92,6 +93,36 @@ void main() {
       expect(pos, anyOf(0, -2), reason: 'set-position must be a defined shim rc');
       expect(prof, anyOf(0, -2), reason: 'set-profile must be a defined shim rc');
       expect(svc.ownProfile, isNotNull);
+
+      // Exercise the connection FFI wrappers (Increment 5): agora_connect_request
+      // / agora_connect_respond through dart:ffi. A single node has no real peer,
+      // so the core drops these as "unknown peer"; the point is that the app->AT
+      // connect verbs traverse the ffi + shim + dispatch path and return a
+      // defined rc (0 accepted, -2 not-ready).
+      final synthetic = AgoraPeer(uuid: List<int>.filled(16, 0xAB));
+      int creq = -2, cresp = -2;
+      for (var i = 0; i < 20 && !(creq == 0 && cresp == 0); i++) {
+        creq = svc.requestConnection(synthetic);
+        cresp = svc.respondConnection(synthetic, true);
+        if (creq == 0 && cresp == 0) break;
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+      }
+      expect(creq, anyOf(0, -2), reason: 'connect-request must be a defined rc');
+      expect(cresp, anyOf(0, -2), reason: 'connect-respond must be a defined rc');
+
+      // Exercise the DM FFI wrapper (Increment 6): agora_send_dm through
+      // dart:ffi. A single node has no real peer, so the core drops it as
+      // "unknown peer"; the point is the app->AT send-dm verb traverses the ffi +
+      // shim + dispatch path and returns a defined rc (0 accepted, -2 not-ready).
+      int dmRc = -2;
+      for (var i = 0; i < 20 && dmRc != 0; i++) {
+        dmRc = svc.sendDm(synthetic, 'hello over ffi');
+        if (dmRc == 0) break;
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+      }
+      expect(dmRc, anyOf(0, -2), reason: 'send-dm must be a defined rc');
+      // The outgoing message is echoed locally regardless of the wire rc.
+      expect(svc.messagesFor(synthetic).where((m) => m.outgoing), isNotEmpty);
 
       // Let a few poll ticks run (agora_events_poll over ffi). A single node has
       // no peers, so the roster stays empty.

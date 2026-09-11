@@ -12,6 +12,8 @@ import 'package:flutter/foundation.dart';
 
 import '../ffi/at_events_bindings.dart';
 import '../ffi/at_peer.dart';
+import '../model/dm.dart';
+import '../model/tie_strength.dart';
 import 'agora_daemon.dart';
 
 class PeerService extends ChangeNotifier {
@@ -39,6 +41,16 @@ class PeerService extends ChangeNotifier {
   Timer? _timer;
   final Map<String, AgoraPeer> _peers = {};
   String _status = 'idle';
+
+  /// Per-peer direct-message threads (Increment 6), keyed by peer uuid hex.
+  /// Incoming messages arrive via ingestEvents (AT_APP_EVENT_DM); outgoing ones
+  /// are echoed locally at send time (the core does not echo them). A live
+  /// stream, not roster state — never re-requested.
+  final Map<String, List<DmMessage>> _dms = {};
+
+  /// Peers with unread incoming DMs (uuid hex). Cleared by [markThreadRead] when
+  /// the operator opens the thread.
+  final Set<String> _unreadPeers = {};
 
   /// Poll ticks between roster re-requests. A single roster pull races with the
   /// daemon: peers/positions/profiles already exchanged (common when attaching
@@ -102,13 +114,141 @@ class PeerService extends ChangeNotifier {
     return rc;
   }
 
-  /// Peers, strongest rank first (a stand-in ordering until proximity/tie
-  /// strength lands with the AT-core event extension — see §5.1).
+  /// Peers with an inbound connection request awaiting our response
+  /// (pending_in). The UI surfaces an accept/decline affordance for each.
+  List<AgoraPeer> get inboundRequests =>
+      _peers.values.where((p) => p.hasInboundRequest).toList();
+
+  /// Ask to connect to [peer] (Increment 5). A connection is EXPLICIT and
+  /// revocable, SEPARATE from reputation. Stamps a real interaction recency now
+  /// (a tie we tend outranks mere presence) and tells the daemon, which sets our
+  /// edge to pending_out and sends a directed encrypted request. Returns the
+  /// shim rc (0 ok, -2 daemon not ready), or -1 if no channel is open yet.
+  int requestConnection(AgoraPeer peer) {
+    peer.markInteraction(DateTime.now().millisecondsSinceEpoch / 1000.0);
+    final ev = _events;
+    if (ev == null) {
+      notifyListeners();
+      return -1;
+    }
+    final rc = ev.connectRequest(_daemon.queues.appToAt, peer.uuid);
+    notifyListeners();
+    return rc;
+  }
+
+  /// Respond to an inbound connection request from [peer]: [accept] true
+  /// connects, false declines. On accept, stamps an interaction recency. The
+  /// daemon sets our edge and sends a directed encrypted, SIGNED response.
+  /// Returns the shim rc (0 ok, -2 daemon not ready), or -1 if no channel.
+  int respondConnection(AgoraPeer peer, bool accept) {
+    if (accept) {
+      peer.markInteraction(DateTime.now().millisecondsSinceEpoch / 1000.0);
+    }
+    final ev = _events;
+    if (ev == null) {
+      notifyListeners();
+      return -1;
+    }
+    final rc = ev.connectRespond(_daemon.queues.appToAt, peer.uuid, accept);
+    notifyListeners();
+    return rc;
+  }
+
+  /// The DM thread with [peer] (Increment 6), oldest first. Empty if none yet.
+  List<DmMessage> messagesFor(AgoraPeer peer) =>
+      List<DmMessage>.unmodifiable(_dms[_hex(peer.uuid)] ?? const []);
+
+  /// True if [peer] has unread incoming DMs (cleared by [markThreadRead]).
+  bool hasUnread(AgoraPeer peer) => _unreadPeers.contains(_hex(peer.uuid));
+
+  /// Total peers with unread DMs — a badge count for the roster.
+  int get unreadPeerCount => _unreadPeers.length;
+
+  /// Mark [peer]'s thread read (call when the operator opens it).
+  void markThreadRead(AgoraPeer peer) {
+    if (_unreadPeers.remove(_hex(peer.uuid))) notifyListeners();
+  }
+
+  /// Send a direct message to [peer] (Increment 6). A DM is one-way and
+  /// ENCRYPTED. The outgoing message is echoed into the local thread IMMEDIATELY
+  /// (the core does not echo it back), and sending a DM tends the tie — it stamps
+  /// interaction recency, feeding the tie-strength kernel. Returns the shim rc
+  /// (0 ok, -2 daemon not ready), or -1 if no channel is open yet.
+  int sendDm(AgoraPeer peer, String text) {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return -1;
+    final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
+    peer.markInteraction(now);
+    (_dms[_hex(peer.uuid)] ??= <DmMessage>[]).add(DmMessage(
+      peerUuidHex: _hex(peer.uuid),
+      seq: 0, // the wire seq is stamped by the core and never returns to the app
+      ts: now,
+      text: trimmed,
+      outgoing: true,
+    ));
+    final ev = _events;
+    if (ev == null) {
+      notifyListeners();
+      return -1;
+    }
+    final rc = ev.sendDm(_daemon.queues.appToAt, peer.uuid, trimmed);
+    notifyListeners();
+    return rc;
+  }
+
+  /// Route one decoded DM event into the per-peer thread. Appends an incoming
+  /// message (deduped by (peer, seq)), stamps interaction recency on the peer
+  /// (a received DM tends the tie), and flags it unread. Returns true if the
+  /// event was a DM (consumed here rather than by [AgoraPeer.applyEvent]).
+  bool _ingestDm(AtRawEvent e) {
+    if (e.kind != agoraEventDm) return false;
+    final key = _hex(e.uuid);
+    final peer = _peers.putIfAbsent(key, () => AgoraPeer(uuid: e.uuid));
+    final thread = _dms[key] ??= <DmMessage>[];
+    // Dedup by seq: the core may re-deliver, but incoming seqs are monotone per
+    // sender (the freshness gate guarantees it), so an already-seen incoming
+    // seq is a duplicate.
+    final seen = thread.any((m) => !m.outgoing && m.seq == e.dmSeq);
+    if (!seen) {
+      thread.add(DmMessage(
+        peerUuidHex: key,
+        seq: e.dmSeq,
+        ts: e.dmTs,
+        text: e.dmText,
+        outgoing: false,
+      ));
+      _unreadPeers.add(key);
+      peer.markInteraction(DateTime.now().millisecondsSinceEpoch / 1000.0);
+    }
+    return true;
+  }
+
+  /// Peers ordered by tie strength (§3.2) descending — the proximity-weighted
+  /// social ranking that makes local, tended, trusted ties surface first. Ties
+  /// break by topology rank then a stable id, so the order is deterministic.
+  /// The strength itself is exposed via [strengthOf] for the UI.
   List<AgoraPeer> get peers {
+    final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
     final list = _peers.values.toList();
-    list.sort((a, b) => b.rank.compareTo(a.rank));
+    list.sort((a, b) {
+      final sa = tieStrength(a, ownGeohash: _ownGeohash, nowEpochSeconds: now);
+      final sb = tieStrength(b, ownGeohash: _ownGeohash, nowEpochSeconds: now);
+      final byStrength = sb.compareTo(sa);
+      if (byStrength != 0) return byStrength;
+      final byRank = b.rank.compareTo(a.rank);
+      if (byRank != 0) return byRank;
+      return _hex(a.uuid).compareTo(_hex(b.uuid));
+    });
     return list;
   }
+
+  /// Tie strength S ∈ [0,1] for [peer] from this node's viewpoint (own opt-in
+  /// bucket + current time), for the UI to render alongside the roster.
+  double strengthOf(AgoraPeer peer) => tieStrength(
+        peer,
+        ownGeohash: _ownGeohash,
+        nowEpochSeconds: DateTime.now().millisecondsSinceEpoch / 1000.0,
+      );
 
   Future<void> start() async {
     _setStatus('starting daemon…');
@@ -157,11 +297,15 @@ class PeerService extends ChangeNotifier {
   /// Merge a batch of decoded events into the roster, notifying listeners if
   /// any arrived. Extracted from the poll tick so it can be driven directly in
   /// tests (which never load the native shim). A new peer is created on first
-  /// sighting; subsequent events (reputation, RTT, position, profile) merge in.
+  /// sighting; subsequent events (reputation, RTT, position, profile, and
+  /// connection request/state — all peer-scoped, handled by applyEvent) merge in.
   @visibleForTesting
   void ingestEvents(List<AtRawEvent> batch) {
     if (batch.isEmpty) return;
     for (final e in batch) {
+      // A DM is a live-stream message, not peer state — routed into the per-peer
+      // thread rather than merged into the AgoraPeer by applyEvent.
+      if (_ingestDm(e)) continue;
       final key = _hex(e.uuid);
       final peer = _peers.putIfAbsent(key, () => AgoraPeer(uuid: e.uuid));
       peer.applyEvent(e);

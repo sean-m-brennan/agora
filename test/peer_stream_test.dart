@@ -37,6 +37,19 @@ AtRawEvent _profileEvent(List<int> uuid, String json) => AtRawEvent(
       profileJson: json,
     );
 
+AtRawEvent _repEvent(List<int> uuid, double score) => AtRawEvent(
+      kind: agoraEventReputation,
+      uuid: uuid,
+      signingPubkey: const [],
+      rank: 0,
+      operatorBound: false,
+      operatorAttestedAt: 0,
+      operatorPubkey: const [],
+      repScore: score,
+      repRated: true,
+      rttMs: 0,
+    );
+
 void main() {
   final u1 = List<int>.filled(16, 0x11);
   final u2 = List<int>.filled(16, 0x22);
@@ -111,13 +124,29 @@ void main() {
       expect(notified, 0);
     });
 
-    test('peers are sorted by rank, strongest first', () {
+    test('equal tie strength falls back to rank, strongest first', () {
       final svc = PeerService();
+      // Two bare peers (no reputation, position, or attendance) both score S=0,
+      // so the deterministic tiebreak is topology rank descending.
       svc.ingestEvents([
         _peerEvent(u1, rank: 1),
         _peerEvent(u2, rank: 5),
       ]);
       expect(svc.peers.map((p) => p.rank).toList(), [5, 1]);
+    });
+
+    test('tie strength outranks topology rank', () {
+      final svc = PeerService();
+      // u1 has high topology rank but no trust; u2 has low rank but a tier-4
+      // reputation. Tie strength (trust-weighted) must place u2 first.
+      svc.ingestEvents([
+        _peerEvent(u1, rank: 9),
+        _peerEvent(u2, rank: 1),
+        _repEvent(u2, 0.95),
+      ]);
+      expect(svc.strengthOf(svc.peers.first), greaterThan(0));
+      expect(svc.peers.first.uuid, u2);
+      expect(svc.peers.last.uuid, u1);
     });
   });
 }
