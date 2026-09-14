@@ -66,6 +66,16 @@ class PeerService extends ChangeNotifier {
   /// state (the reputation effect flows separately through the earned score).
   final Map<String, int> _reactionCounts = {};
 
+  /// Peers whose connect request we optimistically flipped to pending_out and are
+  /// still awaiting the core's confirming (or reverting) edge-state echo for.
+  final Set<String> _awaitingConnect = {};
+
+  /// Hex id of a peer whose connect request the core could NOT issue — it echoed
+  /// the edge back to `none`/`declined` (the peer is not an admitted identity), so
+  /// the optimistic pending was reverted. The UI consumes this once to tell the
+  /// operator why the request bounced. Null when there is nothing to report.
+  String? _connectRejectedHex;
+
   /// Poll ticks between roster re-requests. A single roster pull races with the
   /// daemon: peers/positions/profiles already exchanged (common when attaching
   /// to an already-running daemon) arrive as a burst of app-events datagrams,
@@ -146,8 +156,26 @@ class PeerService extends ChangeNotifier {
       return -1;
     }
     final rc = ev.connectRequest(_daemon.queues.appToAt, peer.uuid);
+    if (rc == 0) {
+      // Optimistic: flip to pending_out immediately so the UI responds on tap
+      // rather than waiting for the core's echo. The core emits the confirming
+      // PEER_CONNECTION_STATE_OBSERVED(pending_out) shortly after — or a NONE if
+      // the peer is not admitted and the request could not go out, which reverts
+      // this and is reported via [consumeConnectRejection].
+      peer.connectionState = ConnectionState.pendingOut.index;
+      _awaitingConnect.add(_hex(peer.uuid));
+    }
     notifyListeners();
     return rc;
+  }
+
+  /// The hex id of a peer whose connect request the core could not issue (it
+  /// reverted the optimistic pending to none/declined). Returned once, then
+  /// cleared — the UI calls this to surface a one-time message.
+  String? consumeConnectRejection() {
+    final r = _connectRejectedHex;
+    _connectRejectedHex = null;
+    return r;
   }
 
   /// Respond to an inbound connection request from [peer]: [accept] true
@@ -164,6 +192,14 @@ class PeerService extends ChangeNotifier {
       return -1;
     }
     final rc = ev.connectRespond(_daemon.queues.appToAt, peer.uuid, accept);
+    if (rc == 0) {
+      // Optimistic: reflect the decision immediately; the core echoes the same
+      // PEER_CONNECTION_STATE_OBSERVED, re-applied idempotently by applyEvent.
+      peer.connectionState = (accept
+              ? ConnectionState.connected
+              : ConnectionState.declined)
+          .index;
+    }
     notifyListeners();
     return rc;
   }
@@ -441,6 +477,17 @@ class PeerService extends ChangeNotifier {
       final key = _hex(e.uuid);
       final peer = _peers.putIfAbsent(key, () => AgoraPeer(uuid: e.uuid));
       peer.applyEvent(e);
+      // Resolve an optimistic connect (Increment 5 UX): the core echoes the real
+      // edge state after handle_app_connect_request. pending_out/connected confirm
+      // the request; a revert to none/declined means it could not be issued (the
+      // peer is not admitted), which we surface once to the operator.
+      if (e.kind == agoraEventConnectionState && _awaitingConnect.remove(key)) {
+        final st = peer.connection;
+        if (st != ConnectionState.pendingOut &&
+            st != ConnectionState.connected) {
+          _connectRejectedHex = key;
+        }
+      }
     }
     notifyListeners();
   }

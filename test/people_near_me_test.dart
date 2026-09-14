@@ -105,4 +105,62 @@ void main() {
 
     expect(svc.ownProfile, isNull);
   });
+
+  testWidgets('a peer tile offers a local Block action (Increment 8)',
+      (tester) async {
+    final svc = PeerService();
+    svc.ingestEvents([_peerEvent(u1, rank: 1)]);
+    await _pump(tester, svc);
+
+    // Open the per-peer overflow menu and choose Block.
+    await tester.tap(find.byIcon(Icons.more_vert).first);
+    await tester.pumpAndSettle();
+    expect(find.text('Block'), findsOneWidget);
+    await tester.tap(find.text('Block'));
+    await tester.pumpAndSettle();
+    // No channel in a pure-Dart test -> a SnackBar reports the outcome, no throw.
+    expect(find.byType(SnackBar), findsOneWidget);
+  });
+
+  testWidgets('an inbound connection request shows accept/decline buttons',
+      (tester) async {
+    // Reproduces exactly what a peer's daemon emits when it receives our connect
+    // request: a connection event carrying pending_in (state 2). Bob's GUI must
+    // render the accept/decline affordance for it.
+    final svc = PeerService();
+    svc.ingestEvents([
+      _peerEvent(u1, rank: 1),
+      AtRawEvent(
+        kind: agoraEventConnectionRequest,
+        uuid: u1,
+        signingPubkey: const [],
+        rank: 0,
+        operatorBound: false,
+        operatorAttestedAt: 0,
+        operatorPubkey: const [],
+        repScore: 0,
+        repRated: false,
+        rttMs: 0,
+        connectionState: 2, // pending_in
+      ),
+    ]);
+    await _pump(tester, svc);
+    expect(find.byIcon(Icons.check_circle), findsOneWidget); // Accept
+    expect(find.byIcon(Icons.cancel_outlined), findsOneWidget); // Decline
+  });
+
+  testWidgets('tapping Connect with no channel surfaces feedback', (tester) async {
+    final svc = PeerService();
+    svc.ingestEvents([_peerEvent(u1, rank: 1)]);
+    await _pump(tester, svc);
+
+    // A fresh peer shows the "Connect" (person_add) affordance.
+    final connect = find.byIcon(Icons.person_add_alt_1);
+    expect(connect, findsOneWidget);
+    await tester.tap(connect);
+    await tester.pump();
+    // No daemon channel -> the request cannot be sent, so the user is told
+    // (previously it failed silently). No optimistic pending on a failed send.
+    expect(find.byType(SnackBar), findsOneWidget);
+  });
 }

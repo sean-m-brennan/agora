@@ -59,7 +59,8 @@ class _FeedPageState extends State<FeedPage> {
                   padding: const EdgeInsets.all(8),
                   itemCount: posts.length,
                   separatorBuilder: (_, __) => const Divider(height: 1),
-                  itemBuilder: (context, i) => _PostTile(post: posts[i]),
+                  itemBuilder: (context, i) =>
+                      _PostTile(post: posts[i], service: widget.service),
                 );
               },
             ),
@@ -123,9 +124,10 @@ class _FeedPageState extends State<FeedPage> {
 }
 
 class _PostTile extends StatelessWidget {
-  const _PostTile({required this.post});
+  const _PostTile({required this.post, required this.service});
 
   final Post post;
+  final PeerService service;
 
   @override
   Widget build(BuildContext context) {
@@ -136,6 +138,12 @@ class _PostTile extends StatelessWidget {
             ? post.authorHex
             : post.authorHex.substring(0, 12));
     final audience = audienceLabel(audienceForTier(post.requiredTier));
+    // A received post (not our own echo) that carries an author + content id can
+    // be reacted to (Increment 8): a reaction is the directed return signal that
+    // lets the engagement accrue reputation for both peers. Our own posts have no
+    // content id at the app boundary, so no react affordance there.
+    final canReact =
+        !post.outgoing && post.authorUuid.isNotEmpty && post.postId.isNotEmpty;
     return ListTile(
       leading: CircleAvatar(
         backgroundColor:
@@ -144,6 +152,20 @@ class _PostTile extends StatelessWidget {
       ),
       title: Text(post.body),
       subtitle: Text('$who · $audience'),
+      trailing: canReact
+          ? IconButton(
+              icon: const Icon(Icons.favorite_border, size: 20),
+              tooltip: 'React',
+              onPressed: () {
+                final rc = service.reactToPost(post);
+                final msg = rc == 0
+                    ? 'Reaction sent'
+                    : (rc == -2 ? 'Not connected yet' : 'Could not react');
+                ScaffoldMessenger.of(context)
+                    .showSnackBar(SnackBar(content: Text(msg)));
+              },
+            )
+          : null,
       dense: true,
     );
   }

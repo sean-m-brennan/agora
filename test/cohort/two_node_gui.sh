@@ -175,7 +175,7 @@ start_headless() {
     AT_PEER_NAME="$name" AT_PEER_SEED="$seed" \
     AT_OWN_GEOHASH="$geo" AT_OWN_PROFILE="$prof" \
     LD_LIBRARY_PATH="$ATCORE:${LD_LIBRARY_PATH:-}" \
-    "$AGORAD" extern_to_at at_to_extern 2 \
+    "$AGORAD" extern_to_at at_to_extern 1 \
     >"$root/agorad.log" 2>&1 &
   echo $!
 }

@@ -120,6 +120,18 @@ void main() {
       expect(rc, -1);
       expect(peer.lastInteractionAt, 0); // decline is not an interaction
     });
+
+    test('a none/declined state for a peer we never asked raises no rejection', () {
+      final svc = PeerService();
+      // The core echoes edge-state for many reasons; only a revert of an
+      // optimistic connect WE initiated is a "connect rejected". A plain
+      // none/declined for a peer we never asked must not be reported.
+      svc.ingestEvents([
+        _connEvent(u1, agoraEventConnectionState, 0), // none
+        _connEvent(u2, agoraEventConnectionState, 4), // declined
+      ]);
+      expect(svc.consumeConnectRejection(), isNull);
+    });
   });
 
   group('interaction recency feeds tie strength', () {

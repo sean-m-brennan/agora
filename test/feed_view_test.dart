@@ -62,4 +62,28 @@ void main() {
     expect(svc.feed.single.outgoing, isTrue);
     expect(find.text('a fresh post'), findsOneWidget);
   });
+
+  testWidgets('a received post shows a react affordance that can be tapped',
+      (tester) async {
+    // Increment 8: a received post (author + content id) offers a react button.
+    final svc = PeerService();
+    svc.ingestEvents([_postEvent(u1, 'id1', 'react to me')]);
+    await pumpFeed(tester, svc);
+    final reactBtn = find.byIcon(Icons.favorite_border);
+    expect(reactBtn, findsOneWidget);
+    await tester.tap(reactBtn);
+    await tester.pump();
+    // No channel in a pure-Dart test -> a failure SnackBar, but no throw.
+    expect(find.byType(SnackBar), findsOneWidget);
+  });
+
+  testWidgets('an own (outgoing) post shows no react affordance', (tester) async {
+    final svc = PeerService();
+    await pumpFeed(tester, svc);
+    await tester.enterText(find.byType(TextField), 'my own post');
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pump();
+    // Our own echoed post has no content id, so no react button.
+    expect(find.byIcon(Icons.favorite_border), findsNothing);
+  });
 }

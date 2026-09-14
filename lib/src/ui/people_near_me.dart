@@ -15,13 +15,46 @@ import '../model/tie_strength.dart';
 import 'dm_thread.dart';
 import 'feed_view.dart';
 
-class PeopleNearMePage extends StatelessWidget {
+class PeopleNearMePage extends StatefulWidget {
   const PeopleNearMePage({super.key, required this.service});
 
   final PeerService service;
 
   @override
+  State<PeopleNearMePage> createState() => _PeopleNearMePageState();
+}
+
+class _PeopleNearMePageState extends State<PeopleNearMePage> {
+  @override
+  void initState() {
+    super.initState();
+    widget.service.addListener(_onServiceChanged);
+  }
+
+  @override
+  void dispose() {
+    widget.service.removeListener(_onServiceChanged);
+    super.dispose();
+  }
+
+  /// Surface a one-time message when the core could not issue a connect request
+  /// (it reverted the optimistic pending). Runs after the frame so it can show a
+  /// SnackBar without mutating state during build.
+  void _onServiceChanged() {
+    final hex = widget.service.consumeConnectRejection();
+    if (hex == null || !mounted) return;
+    final short = hex.length <= 12 ? hex : hex.substring(0, 12);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Could not connect to $short — peer is not admitted yet'),
+      ));
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final service = widget.service;
     return Scaffold(
       appBar: AppBar(
         title: const Text('People near me'),
@@ -294,6 +327,7 @@ class _PeerTile extends StatelessWidget {
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
+          _PeerOverflowMenu(peer: peer, service: service),
           _MessageButton(peer: peer, service: service),
           _ConnectControl(peer: peer, service: service),
           const SizedBox(width: 4),
@@ -320,6 +354,47 @@ class _PeerTile extends StatelessWidget {
           }),
         ],
       ),
+    );
+  }
+}
+
+/// The per-peer overflow menu. Holds the local BLOCK action (Increment 8): a
+/// block clamps this peer's effective trust tier to 0 for THIS node only — purely
+/// local, no wire traffic and no reputation transaction, so it is a self-protection
+/// affordance distinct from a decline (which is a shared, accruing signal).
+class _PeerOverflowMenu extends StatelessWidget {
+  const _PeerOverflowMenu({required this.peer, required this.service});
+
+  final AgoraPeer peer;
+  final PeerService service;
+
+  @override
+  Widget build(BuildContext context) {
+    return PopupMenuButton<String>(
+      icon: const Icon(Icons.more_vert, size: 18),
+      tooltip: 'More',
+      padding: EdgeInsets.zero,
+      onSelected: (value) {
+        if (value == 'block') {
+          final rc = service.blockPeer(peer);
+          final msg = rc == 0
+              ? 'Peer blocked (local)'
+              : (rc == -2 ? 'Not connected yet' : 'Could not block');
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text(msg)));
+        }
+      },
+      itemBuilder: (context) => const [
+        PopupMenuItem<String>(
+          value: 'block',
+          child: ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.block, size: 18),
+            title: Text('Block'),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -382,6 +457,17 @@ class _ConnectControl extends StatelessWidget {
   final AgoraPeer peer;
   final PeerService service;
 
+  /// Report a failed connection action. Success is silent — the tile itself
+  /// flips to the new state (optimistically, then confirmed by the core's echo).
+  void _report(BuildContext context, int rc, String action) {
+    if (rc == 0) return;
+    final msg = rc == -2
+        ? 'Not connected to the daemon yet — try again in a moment'
+        : 'Could not $action (no channel)';
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(msg)));
+  }
+
   @override
   Widget build(BuildContext context) {
     switch (peer.connection) {
@@ -394,13 +480,15 @@ class _ConnectControl extends StatelessWidget {
               icon: const Icon(Icons.check_circle, color: Colors.green),
               tooltip: 'Accept connection',
               visualDensity: VisualDensity.compact,
-              onPressed: () => service.respondConnection(peer, true),
+              onPressed: () =>
+                  _report(context, service.respondConnection(peer, true), 'accept'),
             ),
             IconButton(
               icon: const Icon(Icons.cancel_outlined),
               tooltip: 'Decline connection',
               visualDensity: VisualDensity.compact,
-              onPressed: () => service.respondConnection(peer, false),
+              onPressed: () => _report(
+                  context, service.respondConnection(peer, false), 'decline'),
             ),
           ],
         );
@@ -423,14 +511,16 @@ class _ConnectControl extends StatelessWidget {
           icon: const Icon(Icons.person_off_outlined),
           tooltip: 'Declined — tap to ask again',
           visualDensity: VisualDensity.compact,
-          onPressed: () => service.requestConnection(peer),
+          onPressed: () =>
+              _report(context, service.requestConnection(peer), 'connect'),
         );
       case ConnectionState.none:
         return IconButton(
           icon: const Icon(Icons.person_add_alt_1),
           tooltip: 'Connect',
           visualDensity: VisualDensity.compact,
-          onPressed: () => service.requestConnection(peer),
+          onPressed: () =>
+              _report(context, service.requestConnection(peer), 'connect'),
         );
     }
   }

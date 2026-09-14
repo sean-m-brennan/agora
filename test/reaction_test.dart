@@ -9,6 +9,8 @@
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:agora/src/ffi/at_events_bindings.dart';
+import 'package:agora/src/ffi/at_peer.dart';
+import 'package:agora/src/model/post.dart';
 import 'package:agora/src/node/peer_stream.dart';
 
 AtRawEvent _reactionEvent(List<int> uuid, String postId, {int seq = 1}) =>
@@ -78,6 +80,35 @@ void main() {
       svc.ingestEvents([_reactionEvent(reactor, postId)]);
       // A reaction is consumed by the tally, not surfaced as a roster peer.
       expect(svc.peers, isEmpty);
+    });
+  });
+
+  group('reactToPost / blockPeer (no channel)', () {
+    Post received(List<int> author, String pid) => Post(
+          authorUuid: author,
+          postId: pid,
+          seq: 1,
+          ts: 1000,
+          requiredTier: 0,
+          body: 'hi',
+          outgoing: false,
+        );
+
+    test('reactToPost on a post with no author/content id returns -1', () {
+      final svc = PeerService();
+      expect(svc.reactToPost(received(const [], '')), -1);
+      expect(svc.reactToPost(received(reactor, '')), -1);
+    });
+
+    test('reactToPost with a valid post but no open channel returns -1', () {
+      final svc = PeerService();
+      // No daemon/event channel in a pure-Dart test -> graceful -1, no throw.
+      expect(svc.reactToPost(received(reactor, postId)), -1);
+    });
+
+    test('blockPeer with no open channel returns -1', () {
+      final svc = PeerService();
+      expect(svc.blockPeer(AgoraPeer(uuid: reactor)), -1);
     });
   });
 }
