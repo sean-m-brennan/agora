@@ -20,6 +20,10 @@ const int agoraGeohashLen = 12; // must match AGORA_GEOHASH_LEN (at_agora_shim.h
 const int agoraProfileJsonMax = 2560;
 // must match AGORA_DM_TEXT_MAX (at_agora_shim.h)
 const int agoraDmTextMax = 1024;
+// must match AGORA_POST_BODY_MAX (at_agora_shim.h)
+const int agoraPostBodyMax = 4096;
+// must match AGORA_POST_ID_MAX (at_agora_shim.h)
+const int agoraPostIdMax = 64;
 
 const int agoraEventPeer = 1;
 const int agoraEventReputation = 2;
@@ -29,6 +33,8 @@ const int agoraEventProfile = 5;
 const int agoraEventConnectionRequest = 6;
 const int agoraEventConnectionState = 7;
 const int agoraEventDm = 8;
+const int agoraEventPost = 9;
+const int agoraEventReaction = 10;
 
 /// dart:ffi mirror of `agora_event_t` (native/at_agora_shim.h). Field order and
 /// element counts MUST match the C struct exactly — the layout is the ABI
@@ -97,6 +103,45 @@ final class AgoraEvent extends Struct {
 
   @Array(agoraDmTextMax + 1)
   external Array<Uint8> dmText;
+
+  /// A signed feed post received over the group channel (Increment 7). Appended
+  /// LAST to mirror the C `agora_event_t`. Only meaningful when [kind] ==
+  /// [agoraEventPost]: [peerUuid] carries the SIGNATURE-BOUND author, [postId] is
+  /// the blake2b content-address (dedup key), [postSeq] the author's post
+  /// sequence, [postTs] the author's post time (epoch seconds),
+  /// [postRequiredTier] the audience floor (0..4), [postBody] the NUL-terminated
+  /// body. The core already verified the signature, tier-gated and deduped the
+  /// post before it crossed, so this is trusted data; the signature does not
+  /// cross.
+  @Array(agoraPostIdMax + 1)
+  external Array<Uint8> postId;
+
+  @Int64()
+  external int postSeq;
+
+  @Double()
+  external double postTs;
+
+  @Int32()
+  external int postRequiredTier;
+
+  @Array(agoraPostBodyMax + 1)
+  external Array<Uint8> postBody;
+
+  /// A reaction to one of THIS node's posts (Increment 8). Appended LAST to
+  /// mirror the C `agora_event_t`. Only meaningful when [kind] ==
+  /// [agoraEventReaction]: [peerUuid] carries the REACTOR (crypto_box-
+  /// authenticated), [reactionPostId] the content-id of the post reacted to,
+  /// [reactionSeq] the reactor's freshness sequence, [reactionTs] the reactor's
+  /// send time (epoch seconds).
+  @Array(agoraPostIdMax + 1)
+  external Array<Uint8> reactionPostId;
+
+  @Int64()
+  external int reactionSeq;
+
+  @Double()
+  external double reactionTs;
 }
 
 /// A pure-Dart copy of one decoded event. Decoupled from native memory so it
@@ -119,6 +164,14 @@ class AtRawEvent {
     this.dmSeq = 0,
     this.dmTs = 0,
     this.dmText = '',
+    this.postId = '',
+    this.postSeq = 0,
+    this.postTs = 0,
+    this.postRequiredTier = 0,
+    this.postBody = '',
+    this.reactionPostId = '',
+    this.reactionSeq = 0,
+    this.reactionTs = 0,
   });
 
   final int kind;
@@ -155,6 +208,26 @@ class AtRawEvent {
   final int dmSeq;
   final double dmTs;
   final String dmText;
+
+  /// A signed feed post received over the group channel (Increment 7). Set only
+  /// for [agoraEventPost] events: [uuid] is the SIGNATURE-BOUND author, [postId]
+  /// the blake2b content-address (dedup key), [postSeq] the author's post
+  /// sequence, [postTs] the author's post time (epoch seconds),
+  /// [postRequiredTier] the audience floor (0..4), [postBody] the body. Already
+  /// verified, tier-gated and deduped by the core.
+  final String postId;
+  final int postSeq;
+  final double postTs;
+  final int postRequiredTier;
+  final String postBody;
+
+  /// A reaction to one of THIS node's posts (Increment 8). Set only for
+  /// [agoraEventReaction] events: [uuid] is the REACTOR, [reactionPostId] the
+  /// content-id of the post reacted to, [reactionSeq] the reactor's freshness
+  /// sequence, [reactionTs] the reactor's send time (epoch seconds).
+  final String reactionPostId;
+  final int reactionSeq;
+  final double reactionTs;
 }
 
 typedef _SetRootC = Void Function(Pointer<Utf8>);
@@ -184,6 +257,19 @@ typedef _SendDmC = Int32 Function(
     Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Pointer<Utf8>);
 typedef _SendDmDart = int Function(
     Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Pointer<Utf8>);
+
+typedef _PublishPostC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Int32);
+typedef _PublishPostDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, int);
+
+typedef _ReactC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Pointer<Utf8>);
+typedef _ReactDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Pointer<Utf8>);
+
+typedef _BlockC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
+typedef _BlockDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
 
 typedef _PollC = Int32 Function(Pointer<Void>, Pointer<AgoraEvent>, Int32);
 typedef _PollDart = int Function(Pointer<Void>, Pointer<AgoraEvent>, int);
@@ -252,6 +338,31 @@ String _dmTextString(Array<Uint8> src) {
   return utf8.decode(bytes, allowMalformed: true);
 }
 
+/// Decode a NUL-terminated ASCII post content-id (lowercase hex) from the fixed
+/// byte array (Increment 7).
+String _postIdString(Array<Uint8> src) {
+  final bytes = <int>[];
+  for (var i = 0; i < agoraPostIdMax; i++) {
+    final b = src[i];
+    if (b == 0) break;
+    bytes.add(b);
+  }
+  return String.fromCharCodes(bytes);
+}
+
+/// Decode a NUL-terminated UTF-8 post body from the fixed byte array
+/// (Increment 7). Malformed bytes are tolerated rather than throwing in poll.
+String _postBodyString(Array<Uint8> src) {
+  final bytes = <int>[];
+  for (var i = 0; i < agoraPostBodyMax; i++) {
+    final b = src[i];
+    if (b == 0) break;
+    bytes.add(b);
+  }
+  if (bytes.isEmpty) return '';
+  return utf8.decode(bytes, allowMalformed: true);
+}
+
 /// Thin, fork-free client over the AutonomousTrust app-events queue.
 class AtEvents {
   AtEvents._(this._handle);
@@ -275,6 +386,12 @@ class AtEvents {
       _lib.lookupFunction<_ConnRespC, _ConnRespDart>('agora_connect_respond');
   static final _SendDmDart _sendDm =
       _lib.lookupFunction<_SendDmC, _SendDmDart>('agora_send_dm');
+  static final _PublishPostDart _publishPost = _lib
+      .lookupFunction<_PublishPostC, _PublishPostDart>('agora_publish_post');
+  static final _ReactDart _react =
+      _lib.lookupFunction<_ReactC, _ReactDart>('agora_react_post');
+  static final _BlockDart _block =
+      _lib.lookupFunction<_BlockC, _BlockDart>('agora_block');
   static final _PollDart _poll =
       _lib.lookupFunction<_PollC, _PollDart>('agora_events_poll');
   static final _CloseDart _close =
@@ -404,6 +521,60 @@ class AtEvents {
     }
   }
 
+  /// Publish a feed post to the local group (Increment 7). [requiredTier] is the
+  /// audience floor (0..4). The core signs the post, group-encrypts it and
+  /// multicasts it; it does NOT echo it back — the app echoes locally. Returns 0
+  /// on success, negative on error (-2 == daemon not ready yet).
+  int publishPost(String sendQueue, String body, int requiredTier) {
+    final q = sendQueue.toNativeUtf8();
+    final b = body.toNativeUtf8();
+    try {
+      return _publishPost(_handle, q, b, requiredTier);
+    } finally {
+      calloc.free(q);
+      calloc.free(b);
+    }
+  }
+
+  /// React to a post authored by [authorUuid] (16 raw identity bytes),
+  /// identified by its content-id [postId] (Increment 8). The core sends a
+  /// directed encrypted reaction to the author, and both peers accrue reputation
+  /// for the engagement. Returns 0 on success, negative on error (-2 == daemon
+  /// not ready yet).
+  int reactToPost(String sendQueue, List<int> authorUuid, String postId) {
+    final q = sendQueue.toNativeUtf8();
+    final p = postId.toNativeUtf8();
+    final u = calloc<Uint8>(agoraUuidLen);
+    try {
+      for (var i = 0; i < agoraUuidLen && i < authorUuid.length; i++) {
+        u[i] = authorUuid[i];
+      }
+      return _react(_handle, q, u, p);
+    } finally {
+      calloc.free(q);
+      calloc.free(p);
+      calloc.free(u);
+    }
+  }
+
+  /// Locally block [peerUuid] (16 raw identity bytes) (Increment 8): clamps the
+  /// peer's effective trust tier to 0 for THIS node only. Purely local — no wire
+  /// traffic, no reputation transaction. Returns 0 on success, negative on error
+  /// (-2 == daemon not ready yet).
+  int block(String sendQueue, List<int> peerUuid) {
+    final q = sendQueue.toNativeUtf8();
+    final u = calloc<Uint8>(agoraUuidLen);
+    try {
+      for (var i = 0; i < agoraUuidLen && i < peerUuid.length; i++) {
+        u[i] = peerUuid[i];
+      }
+      return _block(_handle, q, u);
+    } finally {
+      calloc.free(q);
+      calloc.free(u);
+    }
+  }
+
   /// Non-blocking drain. Returns decoded events (possibly empty). Copies out of
   /// native memory before freeing the buffer, so the results are safe to keep.
   List<AtRawEvent> poll({int max = 64}) {
@@ -430,6 +601,14 @@ class AtEvents {
           dmSeq: e.dmSeq,
           dmTs: e.dmTs,
           dmText: _dmTextString(e.dmText),
+          postId: _postIdString(e.postId),
+          postSeq: e.postSeq,
+          postTs: e.postTs,
+          postRequiredTier: e.postRequiredTier,
+          postBody: _postBodyString(e.postBody),
+          reactionPostId: _postIdString(e.reactionPostId),
+          reactionSeq: e.reactionSeq,
+          reactionTs: e.reactionTs,
         );
       }, growable: false);
     } finally {

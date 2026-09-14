@@ -41,12 +41,19 @@ _Static_assert(AGORA_PROFILE_JSON_MAX == AT_APP_PROFILE_JSON_LEN,
                "AGORA_PROFILE_JSON_MAX out of sync with AT_APP_PROFILE_JSON_LEN");
 _Static_assert(AGORA_DM_TEXT_MAX == AT_APP_DM_TEXT_LEN,
                "AGORA_DM_TEXT_MAX out of sync with AT_APP_DM_TEXT_LEN");
+_Static_assert(AGORA_POST_BODY_MAX == AT_APP_POST_BODY_LEN,
+               "AGORA_POST_BODY_MAX out of sync with AT_APP_POST_BODY_LEN");
+_Static_assert(AGORA_POST_ID_MAX == AT_APP_POST_ID_LEN,
+               "AGORA_POST_ID_MAX out of sync with AT_APP_POST_ID_LEN");
 /* ABI lockstep: the Dart AgoraEvent struct and the ctypes Ev in the cohort
  * tests (test/cohort/two_node_cohort.sh, two_node_gui.sh) all assert this exact
  * size. Growing agora_event_t REQUIRES bumping all three together. Grew from
- * 2704 to 3752 with the Increment 6 DM tail (dm_seq@2704, dm_ts, dm_text);
- * every prior field offset is unchanged (connection_state stays at 2696). */
-_Static_assert(sizeof(agora_event_t) == 3752,
+ * 3752 to 7936 with the Increment 7 post tail (post_id@3745, post_seq@3752,
+ * post_ts, post_required_tier, post_body); every prior field offset is unchanged
+ * (dm_seq stays at 2704, connection_state at 2696). Grew again from 7936 to 8016
+ * with the Increment 8 reaction tail (reaction_post_id, reaction_seq, reaction_ts)
+ * appended after post_body; every prior field offset is unchanged. */
+_Static_assert(sizeof(agora_event_t) == 8016,
                "agora_event_t size changed — update the Dart struct and both "
                "cohort ctypes Ev asserts in lockstep");
 
@@ -89,6 +96,25 @@ int agora_send_dm(void *handle, const char *send_queue,
 {
     return at_app_events_send_dm((at_app_events_t *)handle, send_queue,
                                  peer_uuid, text);
+}
+
+int agora_publish_post(void *handle, const char *send_queue,
+                       const char *body, int required_tier)
+{
+    return at_app_events_publish_post((at_app_events_t *)handle, send_queue,
+                                      body, required_tier);
+}
+
+int agora_react_post(void *handle, const char *send_queue,
+                     const uint8_t *author_uuid, const char *post_id)
+{
+    return at_app_events_react_post((at_app_events_t *)handle, send_queue,
+                                    author_uuid, post_id);
+}
+
+int agora_block(void *handle, const char *send_queue, const uint8_t *peer_uuid)
+{
+    return at_app_events_block((at_app_events_t *)handle, send_queue, peer_uuid);
 }
 
 int agora_events_poll(void *handle, agora_event_t *out, int max)
@@ -177,6 +203,32 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             /* raw text is already NUL-bounded by AT; copy and re-terminate. */
             memcpy(e->dm_text, raw[i].data.dm.text, AGORA_DM_TEXT_MAX);
             e->dm_text[AGORA_DM_TEXT_MAX] = '\0';
+            w++;
+            break;
+
+        case AT_APP_EVENT_POST:
+            e->kind = AGORA_EVENT_POST;
+            memcpy(e->peer_uuid, raw[i].data.post.author_uuid, AGORA_UUID_LEN);
+            /* raw strings are already NUL-bounded by AT; copy and re-terminate. */
+            memcpy(e->post_id, raw[i].data.post.post_id, AGORA_POST_ID_MAX);
+            e->post_id[AGORA_POST_ID_MAX] = '\0';
+            e->post_seq = raw[i].data.post.seq;
+            e->post_ts = raw[i].data.post.ts;
+            e->post_required_tier = raw[i].data.post.required_tier;
+            memcpy(e->post_body, raw[i].data.post.body, AGORA_POST_BODY_MAX);
+            e->post_body[AGORA_POST_BODY_MAX] = '\0';
+            w++;
+            break;
+
+        case AT_APP_EVENT_REACTION:
+            e->kind = AGORA_EVENT_REACTION;
+            memcpy(e->peer_uuid, raw[i].data.reaction.peer_uuid, AGORA_UUID_LEN);
+            /* raw id is already NUL-bounded by AT; copy and re-terminate. */
+            memcpy(e->reaction_post_id, raw[i].data.reaction.post_id,
+                   AGORA_POST_ID_MAX);
+            e->reaction_post_id[AGORA_POST_ID_MAX] = '\0';
+            e->reaction_seq = raw[i].data.reaction.seq;
+            e->reaction_ts = raw[i].data.reaction.ts;
             w++;
             break;
 

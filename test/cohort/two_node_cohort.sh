@@ -208,7 +208,7 @@ shim, root, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
 # (kind==4) may arrive for it — silence is the correct, private behavior.
 expect_pos = sys.argv[4] if len(sys.argv) > 4 else ""
 
-UUID, KEY, GEO, PROF, DM = 16, 32, 12, 2560, 1024
+UUID, KEY, GEO, PROF, DM, PID, PBODY = 16, 32, 12, 2560, 1024, 64, 4096
 class Ev(ctypes.Structure):
     _fields_ = [
         ("kind", ctypes.c_int32),
@@ -227,12 +227,21 @@ class Ev(ctypes.Structure):
         ("dm_seq", ctypes.c_int64),          # AGORA_EVENT_DM (offset 2704), appended LAST
         ("dm_ts", ctypes.c_double),
         ("dm_text", ctypes.c_char * (DM + 1)),
+        ("post_id", ctypes.c_char * (PID + 1)),  # AGORA_EVENT_POST (offset 3745), appended LAST
+        ("post_seq", ctypes.c_int64),
+        ("post_ts", ctypes.c_double),
+        ("post_required_tier", ctypes.c_int32),
+        ("post_body", ctypes.c_char * (PBODY + 1)),
+        ("reaction_post_id", ctypes.c_char * (PID + 1)),  # AGORA_EVENT_REACTION, appended LAST
+        ("reaction_seq", ctypes.c_int64),
+        ("reaction_ts", ctypes.c_double),
     ]
-# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (3752 with
-# the geohash + profile_json + connection_state + DM tail; rtt@116, geohash@120,
-# profile_json@133, connection_state@2696, dm_seq@2704). If the C struct grows and
-# this is not updated in lockstep, poll() would misread every field past the drift.
-assert ctypes.sizeof(Ev) == 3752, f"Ev size {ctypes.sizeof(Ev)} != 3752 (ABI drift)"
+# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (8016 with
+# the geohash + profile_json + connection_state + DM + POST + REACTION tail; rtt@116,
+# geohash@120, profile_json@133, connection_state@2696, dm_seq@2704, post_id@3745,
+# post_seq@3752, reaction tail after post_body). If the C struct grows and this is
+# not updated in lockstep, poll() would misread every field past the drift.
+assert ctypes.sizeof(Ev) == 8016, f"Ev size {ctypes.sizeof(Ev)} != 8016 (ABI drift)"
 
 lib = ctypes.CDLL(shim)
 lib.agora_set_root.argtypes = [ctypes.c_char_p]; lib.agora_set_root.restype = None

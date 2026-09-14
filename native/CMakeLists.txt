@@ -21,6 +21,8 @@
 #
 # DTN (AT_NET_DTN) and ZTA (AT_ZTA) are left OFF (their defaults) — do not
 # enable them here; the heavy third_party DTN stack is not needed for Agora.
+# AT_SOCIAL, by contrast, is forced ON below — Agora is exactly the social-app
+# consumer that flag gates.
 
 # The AT C core is project(... C CXX); enable both here so the CXX toolchain is
 # configured before the AT subdirectory is added.
@@ -42,6 +44,21 @@ endif()
 # does not honor BUILD_TESTING, build it standalone and link it as an IMPORTED
 # target instead of add_subdirectory (see .claude/TODO.md).
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+
+# Agora IS the social-app consumer of the AT core: the shim (at_agora_shim.c) and
+# agorad call the social at_app_events_* API and reference event kinds 4-9, which
+# the core compiles in only when AT_SOCIAL is ON (default OFF for lean M2M nodes).
+# Force it ON before the AT subdirectory is added so the whole core agrees on the
+# AT_SOCIAL_ENABLED struct layout.
+set(AT_SOCIAL ON CACHE BOOL "Agora requires AT social features" FORCE)
+
+# The AT core defines AT_SOCIAL_ENABLED for its OWN targets (via
+# add_compile_definitions inside its CMakeLists), but that does not propagate up
+# to THIS directory's targets. The shim (at_agora_shim.c) and agorad include AT's
+# app_events.h / msg_types.h and use the social event kinds + payload members,
+# which are guarded by AT_SOCIAL_ENABLED — so define it here too, before any target
+# in this directory (and the AT subdirectory) is created.
+add_compile_definitions(AT_SOCIAL_ENABLED)
 
 add_subdirectory("${AT_C_DIR}" at_core)
 

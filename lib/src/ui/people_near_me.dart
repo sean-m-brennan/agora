@@ -13,6 +13,7 @@ import '../node/peer_stream.dart';
 import '../ffi/at_peer.dart';
 import '../model/tie_strength.dart';
 import 'dm_thread.dart';
+import 'feed_view.dart';
 
 class PeopleNearMePage extends StatelessWidget {
   const PeopleNearMePage({super.key, required this.service});
@@ -25,6 +26,15 @@ class PeopleNearMePage extends StatelessWidget {
       appBar: AppBar(
         title: const Text('People near me'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.dynamic_feed),
+            tooltip: 'Feed',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => FeedPage(service: service),
+              ),
+            ),
+          ),
           ListenableBuilder(
             listenable: service,
             builder: (context, _) {

@@ -13,6 +13,8 @@ import 'package:flutter/foundation.dart';
 import '../ffi/at_events_bindings.dart';
 import '../ffi/at_peer.dart';
 import '../model/dm.dart';
+import '../model/feed_store.dart';
+import '../model/post.dart';
 import '../model/tie_strength.dart';
 import 'agora_daemon.dart';
 
@@ -51,6 +53,18 @@ class PeerService extends ChangeNotifier {
   /// Peers with unread incoming DMs (uuid hex). Cleared by [markThreadRead] when
   /// the operator opens the thread.
   final Set<String> _unreadPeers = {};
+
+  /// The merged feed (Increment 7). Posts arrive via ingestEvents
+  /// (AT_APP_EVENT_POST, already verified/tier-gated/deduped by the core);
+  /// outgoing posts are echoed locally at publish time (the core does not echo
+  /// them). Deduped by post content id, ranked by S × recency (the Inc-4 kernel).
+  /// A live stream, not roster state.
+  final FeedStore _feed = FeedStore();
+
+  /// Reaction tallies for OUR posts (Increment 8), keyed by post content id.
+  /// A reaction is a peer engaging with one of our posts; the count is display
+  /// state (the reputation effect flows separately through the earned score).
+  final Map<String, int> _reactionCounts = {};
 
   /// Poll ticks between roster re-requests. A single roster pull races with the
   /// daemon: peers/positions/profiles already exchanged (common when attaching
@@ -196,6 +210,120 @@ class PeerService extends ChangeNotifier {
     return rc;
   }
 
+  /// The feed ranked by S × recency (Increment 7), newest/strongest first. S is
+  /// the tie strength to each post's author (the Inc-4 kernel); recency is post
+  /// freshness. Empty until posts arrive or one is published locally.
+  List<Post> get feed => _feed.ranked(
+        strengthOfAuthor: _strengthOfAuthor,
+        nowEpochSeconds: DateTime.now().millisecondsSinceEpoch / 1000.0,
+      );
+
+  /// Total posts held in the feed store.
+  int get feedCount => _feed.length;
+
+  /// Tie strength to a post's author by uuid: the roster peer's S if we know
+  /// them, else 0 (an author we cannot place is not "near"). Reuses the same
+  /// [tieStrength] kernel the roster ranking uses.
+  double _strengthOfAuthor(List<int> authorUuid) {
+    final peer = _peers[_hex(authorUuid)];
+    if (peer == null) return 0.0;
+    return strengthOf(peer);
+  }
+
+  /// Publish a feed post to the local group (Increment 7) with the given
+  /// [audience] band (mapped to a required trust tier the core enforces). The
+  /// post is echoed into the local feed IMMEDIATELY (the core does not echo it
+  /// back). Returns the shim rc (0 ok, -2 daemon not ready), or -1 if no channel
+  /// is open yet or the body is empty.
+  int publishPost(String body, PostAudience audience) {
+    final trimmed = body.trim();
+    if (trimmed.isEmpty) return -1;
+    final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
+    final tier = minTierForAudience(audience);
+    _feed.add(Post(
+      authorUuid: const [],
+      postId: '', // the core computes the real content id; not returned to app
+      seq: 0,
+      ts: now,
+      requiredTier: tier,
+      body: trimmed,
+      outgoing: true,
+    ));
+    final ev = _events;
+    if (ev == null) {
+      notifyListeners();
+      return -1;
+    }
+    final rc = ev.publishPost(_daemon.queues.appToAt, trimmed, tier);
+    notifyListeners();
+    return rc;
+  }
+
+  /// React to [post] (Increment 8). Sends a directed encrypted reaction to the
+  /// post's author; both peers accrue reputation for the engagement (the effect
+  /// surfaces later through the earned score the tie-strength kernel reads).
+  /// Reacting also tends the tie locally (interaction recency). Returns the shim
+  /// rc (0 ok, -2 daemon not ready), or -1 if no channel is open or the post has
+  /// no author/content id (e.g. our own not-yet-addressed echo).
+  int reactToPost(Post post) {
+    if (post.authorUuid.isEmpty || post.postId.isEmpty) return -1;
+    final author = _peers[_hex(post.authorUuid)];
+    if (author != null) {
+      author.markInteraction(DateTime.now().millisecondsSinceEpoch / 1000.0);
+    }
+    final ev = _events;
+    if (ev == null) {
+      notifyListeners();
+      return -1;
+    }
+    final rc = ev.reactToPost(_daemon.queues.appToAt, post.authorUuid, post.postId);
+    notifyListeners();
+    return rc;
+  }
+
+  /// Locally block [peer] (Increment 8): asks the core to clamp the peer's
+  /// effective trust tier to 0 for this node only. Purely local — no wire traffic
+  /// and no reputation transaction. Returns the shim rc (0 ok, -2 daemon not
+  /// ready), or -1 if no channel is open yet.
+  int blockPeer(AgoraPeer peer) {
+    final ev = _events;
+    if (ev == null) return -1;
+    final rc = ev.block(_daemon.queues.appToAt, peer.uuid);
+    notifyListeners();
+    return rc;
+  }
+
+  /// Reaction tally for one of our posts by content id (Increment 8); 0 if none.
+  int reactionsFor(String postId) => _reactionCounts[postId] ?? 0;
+
+  /// Route one decoded reaction event (Increment 8): a peer reacted to one of OUR
+  /// posts. Tally it for display and tend the tie to the reactor (a reaction is a
+  /// bilateral interaction). Returns true if the event was a reaction (consumed
+  /// here rather than by [AgoraPeer.applyEvent]).
+  bool _ingestReaction(AtRawEvent e) {
+    if (e.kind != agoraEventReaction) return false;
+    if (e.reactionPostId.isNotEmpty) {
+      _reactionCounts.update(e.reactionPostId, (c) => c + 1, ifAbsent: () => 1);
+    }
+    final peer = _peers[_hex(e.uuid)];
+    if (peer != null) {
+      peer.markInteraction(DateTime.now().millisecondsSinceEpoch / 1000.0);
+    }
+    return true;
+  }
+
+  /// Route one decoded post event into the feed store, deduped by content id.
+  /// Returns true if the event was a post (consumed here rather than by
+  /// [AgoraPeer.applyEvent]). A post is a live-stream feed item, not peer state.
+  bool _ingestPost(AtRawEvent e) {
+    if (e.kind != agoraEventPost) return false;
+    // Ensure the author is at least a known roster entry, so tie-strength ranking
+    // can place their posts (the peer's other events fill in richer state).
+    _peers.putIfAbsent(_hex(e.uuid), () => AgoraPeer(uuid: e.uuid));
+    _feed.add(Post.fromEvent(e));
+    return true;
+  }
+
   /// Route one decoded DM event into the per-peer thread. Appends an incoming
   /// message (deduped by (peer, seq)), stamps interaction recency on the peer
   /// (a received DM tends the tie), and flags it unread. Returns true if the
@@ -306,6 +434,10 @@ class PeerService extends ChangeNotifier {
       // A DM is a live-stream message, not peer state — routed into the per-peer
       // thread rather than merged into the AgoraPeer by applyEvent.
       if (_ingestDm(e)) continue;
+      // A post is a live-stream feed item — routed into the FeedStore.
+      if (_ingestPost(e)) continue;
+      // A reaction to one of our posts — tallied, not merged into a peer.
+      if (_ingestReaction(e)) continue;
       final key = _hex(e.uuid);
       final peer = _peers.putIfAbsent(key, () => AgoraPeer(uuid: e.uuid));
       peer.applyEvent(e);

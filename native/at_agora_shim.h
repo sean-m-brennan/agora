@@ -51,6 +51,12 @@ extern "C" {
 /* Max DM body length. MUST match AT_APP_DM_TEXT_LEN (app_events.h) /
  * AT_DM_TEXT_LEN (msg_types.h). */
 #define AGORA_DM_TEXT_MAX 1024
+/* Max feed-post body length. MUST match AT_APP_POST_BODY_LEN (app_events.h) /
+ * AT_POST_BODY_LEN (msg_types.h). */
+#define AGORA_POST_BODY_MAX 4096
+/* Post content-id length (blake2b-256 lowercase hex). MUST match
+ * AT_APP_POST_ID_LEN (app_events.h) / AT_POST_ID_LEN (msg_types.h). */
+#define AGORA_POST_ID_MAX 64
 
 /* kind discriminator (a superset-safe subset of at_app_event_kind_t). */
 #define AGORA_EVENT_PEER               1
@@ -61,6 +67,8 @@ extern "C" {
 #define AGORA_EVENT_CONNECTION_REQUEST 6
 #define AGORA_EVENT_CONNECTION_STATE   7
 #define AGORA_EVENT_DM                 8
+#define AGORA_EVENT_POST               9
+#define AGORA_EVENT_REACTION           10
 
 /**
  * One flattened app event. Field order is ABI-significant: the Dart
@@ -111,6 +119,31 @@ typedef struct {
     int64_t dm_seq;
     double  dm_ts;
     char    dm_text[AGORA_DM_TEXT_MAX + 1];
+    /* AGORA_EVENT_POST (Increment 7): a signed feed post received over the group
+     * channel. Appended LAST after dm_text so every prior field offset is
+     * unchanged; the Dart AgoraEvent and the ctypes Ev in the cohort test mirror
+     * this order and the new total size exactly (all re-check sizeof). peer_uuid
+     * carries the SIGNATURE-BOUND author. post_id is the blake2b content-address
+     * (dedup key); post_seq the author's post sequence; post_ts the author's post
+     * time (epoch seconds); post_required_tier the audience floor (0..4);
+     * post_body the NUL-terminated body (bound-truncated to AGORA_POST_BODY_MAX).
+     * The core verified the author's signature, tier-gated and deduped the post
+     * before it crossed, so this is trusted data; the signature does not cross. */
+    char    post_id[AGORA_POST_ID_MAX + 1];
+    int64_t post_seq;
+    double  post_ts;
+    int32_t post_required_tier;
+    char    post_body[AGORA_POST_BODY_MAX + 1];
+    /* AGORA_EVENT_REACTION (Increment 8): a peer reacted to one of OUR posts.
+     * Appended LAST after post_body so every prior field offset is unchanged; the
+     * Dart AgoraEvent and the ctypes Ev in the cohort test mirror this order and
+     * the new total size exactly (all re-check sizeof). peer_uuid carries the
+     * REACTOR (crypto_box-authenticated); reaction_post_id is the content-id of the
+     * post reacted to; reaction_seq the reactor's freshness sequence; reaction_ts
+     * the reactor's send time (epoch seconds). */
+    char    reaction_post_id[AGORA_POST_ID_MAX + 1];
+    int64_t reaction_seq;
+    double  reaction_ts;
 } agora_event_t;
 
 /** Set $AUTONOMOUS_TRUST_ROOT for THIS process, so the app-events client below
@@ -167,6 +200,30 @@ int agora_connect_respond(void *handle, const char *send_queue,
  *  Returns 0 on success, negative on error (AT_APP_NOT_READY == -2). */
 int agora_send_dm(void *handle, const char *send_queue,
                   const uint8_t *peer_uuid, const char *text);
+
+/** Publish a feed post to the local group (Increment 7). `send_queue` is the
+ *  app -> AT queue; `body` is the post body (truncated to AGORA_POST_BODY_MAX
+ *  bytes); `required_tier` is the audience floor (0..4). The identity process
+ *  signs the post, group-encrypts it and multicasts it on the group channel; the
+ *  core does NOT echo it back. Returns 0 on success, negative on error
+ *  (AT_APP_NOT_READY == -2). */
+int agora_publish_post(void *handle, const char *send_queue,
+                       const char *body, int required_tier);
+
+/** React to a peer's post (Increment 8). `send_queue` is the app -> AT queue;
+ *  `author_uuid` is the post author's 16 raw identity bytes; `post_id` is the
+ *  post's content-id hex. The identity process sends a directed encrypted reaction
+ *  to the author, and both peers accrue reputation for the engagement. Returns 0
+ *  on success, negative on error (AT_APP_NOT_READY == -2). */
+int agora_react_post(void *handle, const char *send_queue,
+                     const uint8_t *author_uuid, const char *post_id);
+
+/** Locally block a peer (Increment 8). `send_queue` is the app -> AT queue;
+ *  `peer_uuid` is the peer's 16 raw identity bytes. The identity process clamps
+ *  that peer's effective trust tier to 0 for THIS node only — purely local, no
+ *  wire traffic and no reputation transaction. Returns 0 on success, negative on
+ *  error (AT_APP_NOT_READY == -2). */
+int agora_block(void *handle, const char *send_queue, const uint8_t *peer_uuid);
 
 /** Non-blocking poll. Writes up to @p max flattened events into @p out. Returns
  *  the count written (0 = nothing arrived), or a negative AT error code. */
