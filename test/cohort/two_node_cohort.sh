@@ -235,13 +235,15 @@ class Ev(ctypes.Structure):
         ("reaction_post_id", ctypes.c_char * (PID + 1)),  # AGORA_EVENT_REACTION, appended LAST
         ("reaction_seq", ctypes.c_int64),
         ("reaction_ts", ctypes.c_double),
+        ("in_group", ctypes.c_uint8),  # AGORA_EVENT_PEER, appended LAST
     ]
-# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (8016 with
-# the geohash + profile_json + connection_state + DM + POST + REACTION tail; rtt@116,
-# geohash@120, profile_json@133, connection_state@2696, dm_seq@2704, post_id@3745,
-# post_seq@3752, reaction tail after post_body). If the C struct grows and this is
-# not updated in lockstep, poll() would misread every field past the drift.
-assert ctypes.sizeof(Ev) == 8016, f"Ev size {ctypes.sizeof(Ev)} != 8016 (ABI drift)"
+# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (8024 with
+# the geohash + profile_json + connection_state + DM + POST + REACTION + in_group tail;
+# rtt@116, geohash@120, profile_json@133, connection_state@2696, dm_seq@2704, post_id@3745,
+# post_seq@3752, reaction tail after post_body, in_group after reaction_ts + tail padding).
+# If the C struct grows and this is not updated in lockstep, poll() would misread every
+# field past the drift.
+assert ctypes.sizeof(Ev) == 8024, f"Ev size {ctypes.sizeof(Ev)} != 8024 (ABI drift)"
 
 lib = ctypes.CDLL(shim)
 lib.agora_set_root.argtypes = [ctypes.c_char_p]; lib.agora_set_root.restype = None

@@ -87,6 +87,13 @@ class AgoraPeer {
   /// SEPARATE from reputation.
   int connectionState = 0;
 
+  /// True iff this peer shares OUR group (its address is in our group's
+  /// address_map, as the core reports on the peer-observed event). Distinct from
+  /// a connection: group co-membership is automatic once the cohort converges,
+  /// while a connection is an explicit, revocable edge. Surfaced as an "in your
+  /// group" indicator on the peer tile.
+  bool inGroup = false;
+
   /// The edge state as an enum.
   ConnectionState get connection => connectionStateFromInt(connectionState);
 
@@ -172,6 +179,7 @@ class AgoraPeer {
         operatorBound = e.operatorBound;
         operatorAttestedAt = e.operatorAttestedAt;
         operatorPubkey = e.operatorPubkey;
+        inGroup = e.inGroup;
         return true;
       case agoraEventReputation:
         reputationScore = e.repScore;

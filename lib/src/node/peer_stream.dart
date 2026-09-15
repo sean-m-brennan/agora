@@ -6,7 +6,7 @@
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show Platform;
+import 'dart:io' show File, Platform;
 
 import 'package:flutter/foundation.dart';
 
@@ -98,6 +98,63 @@ class PeerService extends ChangeNotifier {
   Map<String, dynamic>? _ownProfile;
   Map<String, dynamic>? get ownProfile =>
       _ownProfile == null ? null : Map<String, dynamic>.unmodifiable(_ownProfile!);
+
+  /// This node's own identity, read once from `<root>/etc/at/identity.cfg.json`
+  /// (the daemon's config). Empty until [start] has loaded it. Used for the
+  /// window header (so Bob's window is distinguishable from Ada's) and to filter
+  /// our own identity out of the roster — belt to the core's self-peer guard.
+  String _ownUuidHex = '';
+  String _ownNickname = '';
+
+  /// The node nickname (e.g. "agora-node-2"), or '' if not yet loaded.
+  String get ownNickname => _ownNickname;
+
+  /// Our own identity uuid as 32 lowercase hex chars (no dashes), matching the
+  /// [_hex] roster keys; '' until loaded.
+  String get ownUuidHex => _ownUuidHex;
+
+  /// A short, human-scannable form of our own uuid (first 12 hex), matching the
+  /// short id shown for peers. '' until loaded.
+  String get ownShortId =>
+      _ownUuidHex.length >= 12 ? _ownUuidHex.substring(0, 12) : _ownUuidHex;
+
+  /// The best human label for THIS node: the operator's own profile display
+  /// name when shared, else the node nickname. '' only before [start].
+  String get ownDisplayName {
+    final dn = _ownProfile?['display_name'];
+    if (dn is String && dn.trim().isNotEmpty) return dn.trim();
+    return _ownNickname;
+  }
+
+  /// Inject this node's own identity directly, for tests that drive
+  /// [ingestEvents] without starting the daemon (which is where
+  /// [_loadOwnIdentity] normally runs). [uuidHex] is the 32-char hex form.
+  @visibleForTesting
+  void setOwnIdentityForTest(String uuidHex, String nickname) {
+    _ownUuidHex = uuidHex;
+    _ownNickname = nickname;
+  }
+
+  /// Load our own uuid + nickname from the daemon's identity config. Best-effort:
+  /// a missing/malformed file just leaves the fields empty (the header falls back
+  /// gracefully and the self-filter simply does nothing).
+  Future<void> _loadOwnIdentity() async {
+    try {
+      final f = File('${_daemon.root}/etc/at/identity.cfg.json');
+      if (!await f.exists()) return;
+      final obj = jsonDecode(await f.readAsString());
+      if (obj is Map) {
+        final uuid = obj['uuid'];
+        if (uuid is String) {
+          _ownUuidHex = uuid.replaceAll('-', '').toLowerCase();
+        }
+        final nick = obj['nickname'];
+        if (nick is String) _ownNickname = nick;
+      }
+    } catch (_) {
+      // Best-effort: leave own identity empty on any read/parse error.
+    }
+  }
 
   String get status => _status;
 
@@ -418,6 +475,10 @@ class PeerService extends ChangeNotifier {
     _setStatus('starting daemon…');
     await _daemon.start();
 
+    // Learn our own identity (nickname + uuid) from the daemon's config, for the
+    // window header and the self-filter below. Best-effort; never fatal.
+    await _loadOwnIdentity();
+
     // Resolve our in-process event sockets under the same config root as the
     // daemon (Dart cannot setenv its own process; the shim does it in C).
     AtEvents.setRoot(_daemon.root);
@@ -475,6 +536,11 @@ class PeerService extends ChangeNotifier {
       // A reaction to one of our posts — tallied, not merged into a peer.
       if (_ingestReaction(e)) continue;
       final key = _hex(e.uuid);
+      // Never surface our own identity as a peer. The core already guards this
+      // (a `peer_accepted` naming us no longer self-adds), but a stale roster
+      // from before that fix, or any other producer, could still emit self —
+      // drop it here so the UI never shows a self tile. Cheap defense-in-depth.
+      if (_ownUuidHex.isNotEmpty && key == _ownUuidHex) continue;
       final peer = _peers.putIfAbsent(key, () => AgoraPeer(uuid: e.uuid));
       peer.applyEvent(e);
       // Resolve an optimistic connect (Increment 5 UX): the core echoes the real

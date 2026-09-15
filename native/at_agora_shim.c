@@ -53,7 +53,10 @@ _Static_assert(AGORA_POST_ID_MAX == AT_APP_POST_ID_LEN,
  * (dm_seq stays at 2704, connection_state at 2696). Grew again from 7936 to 8016
  * with the Increment 8 reaction tail (reaction_post_id, reaction_seq, reaction_ts)
  * appended after post_body; every prior field offset is unchanged. */
-_Static_assert(sizeof(agora_event_t) == 8016,
+/* Grew again from 8016 to 8024 with the in_group flag (a uint8 + tail padding
+ * to the struct's 8-byte alignment) appended after reaction_ts; every prior
+ * field offset is unchanged. */
+_Static_assert(sizeof(agora_event_t) == 8024,
                "agora_event_t size changed — update the Dart struct and both "
                "cohort ctypes Ev asserts in lockstep");
 
@@ -144,6 +147,9 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             e->operator_bound = raw[i].data.peer.operator_bound ? 1 : 0;
             e->operator_attested_at = raw[i].data.peer.operator_attested_at;
             memcpy(e->operator_pubkey, raw[i].data.peer.operator_pubkey, AGORA_KEY_LEN);
+#ifdef AT_SOCIAL_ENABLED
+            e->in_group = raw[i].data.peer.in_group ? 1 : 0;
+#endif /* AT_SOCIAL_ENABLED */
             w++;
             break;
 

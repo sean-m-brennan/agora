@@ -104,6 +104,10 @@ class _PeopleNearMePageState extends State<PeopleNearMePage> {
           return Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              _OwnerBanner(
+                name: service.ownDisplayName,
+                shortId: service.ownShortId,
+              ),
               const _PendingCapabilitiesBanner(),
               _StatusBar(status: service.status, count: peers.length),
               Expanded(
@@ -282,9 +286,30 @@ class _PeerTile extends StatelessWidget {
     final strength =
         tieStrength(peer, ownGeohash: ownGeohash, nowEpochSeconds: now);
     final audience = audienceLabel(audienceForTier(trustTier(peer)));
-    final title = peer.hasProfile
+    final nameText = peer.hasProfile
         ? Text(peer.displayLabel)
         : Text(peer.shortId, style: const TextStyle(fontFamily: 'monospace'));
+    // Group co-membership indicator (distinct from a connection edge): shown
+    // once the cohort converges and this peer's address is in our group. A quiet
+    // badge next to the name, not a peer you "connect" to.
+    final title = peer.inGroup
+        ? Row(mainAxisSize: MainAxisSize.min, children: [
+            Flexible(child: nameText),
+            const SizedBox(width: 6),
+            Tooltip(
+              message: 'In your group',
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.group,
+                    size: 14, color: Theme.of(context).colorScheme.primary),
+                const SizedBox(width: 2),
+                Text('in your group',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: Theme.of(context).colorScheme.primary)),
+              ]),
+            ),
+          ])
+        : nameText;
     // Keep the subtitle to at most two lines so it fits a three-line ListTile.
     // Line 1 is presence, plus — when a display name is the title — the @handle
     // and short id, so identity stays verifiable (the profile is signed, but a
@@ -523,6 +548,54 @@ class _ConnectControl extends StatelessWidget {
               _report(context, service.requestConnection(peer), 'connect'),
         );
     }
+  }
+}
+
+/// A prominent banner at the very top of the window identifying WHOSE node this
+/// is — the operator's own display name (or nickname) plus a short id — so two
+/// cohort windows on one screen are never confused. Empty until the identity
+/// config has loaded, in which case it shows a neutral placeholder.
+class _OwnerBanner extends StatelessWidget {
+  const _OwnerBanner({required this.name, required this.shortId});
+
+  final String name;
+  final String shortId;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final label = name.isNotEmpty ? name : 'This node';
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      color: scheme.primaryContainer,
+      child: Row(
+        children: [
+          Icon(Icons.account_circle, size: 20, color: scheme.onPrimaryContainer),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              label,
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                color: scheme.onPrimaryContainer,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if (shortId.isNotEmpty)
+            Text(
+              shortId,
+              style: TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 12,
+                color: scheme.onPrimaryContainer.withValues(alpha: 0.75),
+              ),
+            ),
+        ],
+      ),
+    );
   }
 }
 

@@ -144,6 +144,13 @@ typedef struct {
     char    reaction_post_id[AGORA_POST_ID_MAX + 1];
     int64_t reaction_seq;
     double  reaction_ts;
+    /* AGORA_EVENT_PEER: true iff this peer shares OUR group (its address is in
+     * our group's address_map). Appended LAST after reaction_ts so every prior
+     * field offset is unchanged; the Dart AgoraEvent and the ctypes Ev in the
+     * cohort tests mirror this order and the new total size exactly (all re-check
+     * sizeof). Distinct from connection_state: an "in your group" indicator, not
+     * an explicit connection edge. */
+    uint8_t in_group;                          /* AGORA_EVENT_PEER; 0/1 */
 } agora_event_t;
 
 /** Set $AUTONOMOUS_TRUST_ROOT for THIS process, so the app-events client below

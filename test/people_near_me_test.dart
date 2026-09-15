@@ -163,4 +163,38 @@ void main() {
     // (previously it failed silently). No optimistic pending on a failed send.
     expect(find.byType(SnackBar), findsOneWidget);
   });
+
+  testWidgets('owner banner shows this node name + short id', (tester) async {
+    final svc = PeerService();
+    final ownHex = List<int>.filled(16, 0xAB)
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
+    svc.setOwnIdentityForTest(ownHex, 'agora-node-2');
+    await _pump(tester, svc);
+
+    expect(find.text('agora-node-2'), findsOneWidget); // banner name
+    expect(find.text(ownHex.substring(0, 12)), findsOneWidget); // short id
+  });
+
+  testWidgets('a peer sharing our group shows the in-your-group badge',
+      (tester) async {
+    final svc = PeerService();
+    svc.ingestEvents([
+      AtRawEvent(
+        kind: agoraEventPeer,
+        uuid: u1,
+        signingPubkey: const [],
+        rank: 0,
+        operatorBound: false,
+        operatorAttestedAt: 0,
+        operatorPubkey: const [],
+        repScore: 0,
+        repRated: false,
+        rttMs: 0,
+        inGroup: true,
+      ),
+    ]);
+    await _pump(tester, svc);
+    expect(find.text('in your group'), findsOneWidget);
+  });
 }

@@ -142,6 +142,13 @@ final class AgoraEvent extends Struct {
 
   @Double()
   external double reactionTs;
+
+  /// AGORA_EVENT_PEER: 1 iff this peer shares OUR group (its address is in our
+  /// group's address_map). Appended LAST after reactionTs so every prior field
+  /// offset is unchanged; the C `agora_event_t` and the cohort ctypes Ev mirror
+  /// this order and total size (8024) exactly.
+  @Uint8()
+  external int inGroup;
 }
 
 /// A pure-Dart copy of one decoded event. Decoupled from native memory so it
@@ -172,6 +179,7 @@ class AtRawEvent {
     this.reactionPostId = '',
     this.reactionSeq = 0,
     this.reactionTs = 0,
+    this.inGroup = false,
   });
 
   final int kind;
@@ -228,6 +236,10 @@ class AtRawEvent {
   final String reactionPostId;
   final int reactionSeq;
   final double reactionTs;
+
+  /// AGORA_EVENT_PEER: true iff this peer shares OUR group. Surfaced by the UI
+  /// as an "in your group" indicator, distinct from an explicit connection edge.
+  final bool inGroup;
 }
 
 typedef _SetRootC = Void Function(Pointer<Utf8>);
@@ -609,6 +621,7 @@ class AtEvents {
           reactionPostId: _postIdString(e.reactionPostId),
           reactionSeq: e.reactionSeq,
           reactionTs: e.reactionTs,
+          inGroup: e.inGroup != 0,
         );
       }, growable: false);
     } finally {

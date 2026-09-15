@@ -149,4 +149,51 @@ void main() {
       expect(svc.peers.last.uuid, u1);
     });
   });
+
+  group('own identity + group co-membership', () {
+    String hex(List<int> b) =>
+        b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
+
+    test('own identity is never surfaced as a peer', () {
+      final svc = PeerService();
+      svc.setOwnIdentityForTest(hex(u1), 'agora-node-1');
+      // u1 is us; u2 is a real peer. The self event must be dropped.
+      svc.ingestEvents([_peerEvent(u1), _peerEvent(u2)]);
+      expect(svc.peers.length, 1);
+      expect(svc.peers.single.uuid, u2);
+    });
+
+    test('own short id and display name (nickname fallback then profile)', () {
+      final svc = PeerService();
+      svc.setOwnIdentityForTest(hex(u2), 'agora-node-2');
+      expect(svc.ownShortId, hex(u2).substring(0, 12));
+      // No profile yet -> nickname.
+      expect(svc.ownDisplayName, 'agora-node-2');
+      // With a shared profile -> its display name wins.
+      svc.setOwnProfile({'display_name': 'Bob'});
+      expect(svc.ownDisplayName, 'Bob');
+    });
+
+    test('inGroup flag on a peer event surfaces on the peer', () {
+      final svc = PeerService();
+      svc.ingestEvents([
+        _peerEvent(u1),
+        AtRawEvent(
+          kind: agoraEventPeer,
+          uuid: u2,
+          signingPubkey: const [],
+          rank: 0,
+          operatorBound: false,
+          operatorAttestedAt: 0,
+          operatorPubkey: const [],
+          repScore: 0,
+          repRated: false,
+          rttMs: 0,
+          inGroup: true,
+        ),
+      ]);
+      expect(svc.peers.firstWhere((p) => p.uuid == u1).inGroup, isFalse);
+      expect(svc.peers.firstWhere((p) => p.uuid == u2).inGroup, isTrue);
+    });
+  });
 }
