@@ -235,7 +235,8 @@ class Ev(ctypes.Structure):
         ("reaction_post_id", ctypes.c_char * (PID + 1)),  # AGORA_EVENT_REACTION, appended LAST
         ("reaction_seq", ctypes.c_int64),
         ("reaction_ts", ctypes.c_double),
-        ("in_group", ctypes.c_uint8),  # AGORA_EVENT_PEER, appended LAST
+        ("in_group", ctypes.c_uint8),  # AGORA_EVENT_PEER
+        ("proximity_band", ctypes.c_int32),  # AGORA_EVENT_PROXIMITY, appended LAST (reuses tail padding)
     ]
 # ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (8024 with
 # the geohash + profile_json + connection_state + DM + POST + REACTION + in_group tail;

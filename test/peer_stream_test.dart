@@ -7,6 +7,7 @@
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:agora/src/ffi/at_events_bindings.dart';
+import 'package:agora/src/ffi/at_peer.dart';
 import 'package:agora/src/node/peer_stream.dart';
 
 AtRawEvent _peerEvent(List<int> uuid, {int rank = 0, double attested = 0}) =>
@@ -92,6 +93,12 @@ void main() {
       expect(svc.ownGeohash, 'u4pruy');
       svc.setOwnPosition(null);
       expect(svc.ownGeohash, isNull);
+    });
+
+    test('pingPresence before channel open returns -1 (no channel)', () {
+      final svc = PeerService();
+      final peer = AgoraPeer(uuid: List<int>.filled(16, 0x11));
+      expect(svc.pingPresence(peer), -1);
     });
   });
 

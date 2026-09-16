@@ -35,6 +35,7 @@ const int agoraEventConnectionState = 7;
 const int agoraEventDm = 8;
 const int agoraEventPost = 9;
 const int agoraEventReaction = 10;
+const int agoraEventProximity = 11;
 
 /// dart:ffi mirror of `agora_event_t` (native/at_agora_shim.h). Field order and
 /// element counts MUST match the C struct exactly — the layout is the ABI
@@ -149,6 +150,13 @@ final class AgoraEvent extends Struct {
   /// this order and total size (8024) exactly.
   @Uint8()
   external int inGroup;
+
+  /// AGORA_EVENT_PROXIMITY: coarse distance band to a CONNECTED peer (0 unknown,
+  /// 1 near, 2 mid, 3 far). Appended LAST after inGroup (Phase 2); it occupies
+  /// the struct's former tail padding, so the total size stays 8024 and every
+  /// prior offset is unchanged. No coordinates cross this boundary.
+  @Int32()
+  external int proximityBand;
 }
 
 /// A pure-Dart copy of one decoded event. Decoupled from native memory so it
@@ -180,6 +188,7 @@ class AtRawEvent {
     this.reactionSeq = 0,
     this.reactionTs = 0,
     this.inGroup = false,
+    this.proximityBand = 0,
   });
 
   final int kind;
@@ -240,6 +249,11 @@ class AtRawEvent {
   /// AGORA_EVENT_PEER: true iff this peer shares OUR group. Surfaced by the UI
   /// as an "in your group" indicator, distinct from an explicit connection edge.
   final bool inGroup;
+
+  /// AGORA_EVENT_PROXIMITY: coarse distance band to a CONNECTED peer (Phase 2):
+  /// 0 unknown, 1 near (~1km), 2 mid (~5km), 3 far. Set only for
+  /// [agoraEventProximity] events; no coordinates are ever carried.
+  final int proximityBand;
 }
 
 typedef _SetRootC = Void Function(Pointer<Utf8>);
@@ -282,6 +296,17 @@ typedef _ReactDart = int Function(
 
 typedef _BlockC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
 typedef _BlockDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
+
+typedef _AttendC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
+typedef _AttendDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
+
+typedef _ProxC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
+typedef _ProxDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
+
+typedef _SetExactC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Int32, Double, Double);
+typedef _SetExactDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, int, double, double);
 
 typedef _PollC = Int32 Function(Pointer<Void>, Pointer<AgoraEvent>, Int32);
 typedef _PollDart = int Function(Pointer<Void>, Pointer<AgoraEvent>, int);
@@ -404,6 +429,12 @@ class AtEvents {
       _lib.lookupFunction<_ReactC, _ReactDart>('agora_react_post');
   static final _BlockDart _block =
       _lib.lookupFunction<_BlockC, _BlockDart>('agora_block');
+  static final _AttendDart _requestAttend =
+      _lib.lookupFunction<_AttendC, _AttendDart>('agora_request_attend');
+  static final _ProxDart _requestProximity =
+      _lib.lookupFunction<_ProxC, _ProxDart>('agora_request_proximity');
+  static final _SetExactDart _setExactPosition = _lib
+      .lookupFunction<_SetExactC, _SetExactDart>('agora_set_exact_position');
   static final _PollDart _poll =
       _lib.lookupFunction<_PollC, _PollDart>('agora_events_poll');
   static final _CloseDart _close =
@@ -587,6 +618,58 @@ class AtEvents {
     }
   }
 
+  /// Pull a fresh operator-attendance attestation from [peerUuid] (16 raw
+  /// identity bytes) NOW (Phase 2, presence). The identity process issues a
+  /// nonce-fresh attest query; the refreshed operator_attested_at rides the next
+  /// peer-observed event. Returns 0 on success, negative on error (-2 == daemon
+  /// not ready yet).
+  int requestAttend(String sendQueue, List<int> peerUuid) {
+    final q = sendQueue.toNativeUtf8();
+    final u = calloc<Uint8>(agoraUuidLen);
+    try {
+      for (var i = 0; i < agoraUuidLen && i < peerUuid.length; i++) {
+        u[i] = peerUuid[i];
+      }
+      return _requestAttend(_handle, q, u);
+    } finally {
+      calloc.free(q);
+      calloc.free(u);
+    }
+  }
+
+  /// Run a private-proximity probe against [peerUuid] (16 raw identity bytes), a
+  /// CONNECTED peer (Phase 2). The coarse distance band arrives later as an
+  /// [agoraEventProximity] event. Returns 0 on success, negative on error
+  /// (-2 == daemon not ready yet).
+  int requestProximity(String sendQueue, List<int> peerUuid) {
+    final q = sendQueue.toNativeUtf8();
+    final u = calloc<Uint8>(agoraUuidLen);
+    try {
+      for (var i = 0; i < agoraUuidLen && i < peerUuid.length; i++) {
+        u[i] = peerUuid[i];
+      }
+      return _requestProximity(_handle, q, u);
+    } finally {
+      calloc.free(q);
+      calloc.free(u);
+    }
+  }
+
+  /// Set ([optIn] true) or clear ([optIn] false) THIS node's opt-in EXACT
+  /// position (Phase 2, private proximity). [lat]/[lon] are degrees. The core
+  /// keeps it LOCAL-ONLY and never advertises it — it feeds only the pairwise
+  /// distance-band probe. Returns 0 on success, negative on error (-2 == daemon
+  /// not ready yet).
+  int setExactPosition(String sendQueue,
+      {required bool optIn, double lat = 0, double lon = 0}) {
+    final q = sendQueue.toNativeUtf8();
+    try {
+      return _setExactPosition(_handle, q, optIn ? 1 : 0, lat, lon);
+    } finally {
+      calloc.free(q);
+    }
+  }
+
   /// Non-blocking drain. Returns decoded events (possibly empty). Copies out of
   /// native memory before freeing the buffer, so the results are safe to keep.
   List<AtRawEvent> poll({int max = 64}) {
@@ -622,6 +705,7 @@ class AtEvents {
           reactionSeq: e.reactionSeq,
           reactionTs: e.reactionTs,
           inGroup: e.inGroup != 0,
+          proximityBand: e.proximityBand,
         );
       }, growable: false);
     } finally {

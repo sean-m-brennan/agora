@@ -69,6 +69,7 @@ extern "C" {
 #define AGORA_EVENT_DM                 8
 #define AGORA_EVENT_POST               9
 #define AGORA_EVENT_REACTION           10
+#define AGORA_EVENT_PROXIMITY          11
 
 /**
  * One flattened app event. Field order is ABI-significant: the Dart
@@ -151,6 +152,11 @@ typedef struct {
      * sizeof). Distinct from connection_state: an "in your group" indicator, not
      * an explicit connection edge. */
     uint8_t in_group;                          /* AGORA_EVENT_PEER; 0/1 */
+    /* AGORA_EVENT_PROXIMITY: the coarse distance band to a CONNECTED peer
+     * (0 unknown, 1 near ~1km, 2 mid ~5km, 3 far). Appended LAST after in_group
+     * (Phase 2); the Dart AgoraEvent and the cohort ctypes Ev mirror this order
+     * and re-check the new sizeof. No coordinates cross this boundary. */
+    int32_t proximity_band;                    /* AGORA_EVENT_PROXIMITY */
 } agora_event_t;
 
 /** Set $AUTONOMOUS_TRUST_ROOT for THIS process, so the app-events client below
@@ -231,6 +237,28 @@ int agora_react_post(void *handle, const char *send_queue,
  *  wire traffic and no reputation transaction. Returns 0 on success, negative on
  *  error (AT_APP_NOT_READY == -2). */
 int agora_block(void *handle, const char *send_queue, const uint8_t *peer_uuid);
+
+/** Pull a fresh operator-attendance attestation from a peer NOW (Phase 2,
+ *  presence). `send_queue` is the app -> AT queue; `peer_uuid` is the peer's 16
+ *  raw identity bytes. The identity process issues a nonce-fresh attest query;
+ *  the refreshed operator_attested_at rides the next peer-observed event.
+ *  Returns 0 on success, negative on error (AT_APP_NOT_READY == -2). */
+int agora_request_attend(void *handle, const char *send_queue,
+                         const uint8_t *peer_uuid);
+
+/** Run a private-proximity probe against a CONNECTED peer (Phase 2). The
+ *  identity process exchanges pairwise-keyed grid tags; both sides learn a
+ *  coarse distance BAND (an AGORA_EVENT_PROXIMITY), never coordinates. Returns 0
+ *  on success, negative on error (AT_APP_NOT_READY == -2). */
+int agora_request_proximity(void *handle, const char *send_queue,
+                            const uint8_t *peer_uuid);
+
+/** Set (`opt_in` != 0) or clear THIS node's opt-in EXACT position (Phase 2).
+ *  `lat`/`lon` are degrees. Stored LOCAL-ONLY by identity and never advertised —
+ *  it feeds only the pairwise proximity probe. Returns 0 on success, negative on
+ *  error (AT_APP_NOT_READY == -2). */
+int agora_set_exact_position(void *handle, const char *send_queue, int opt_in,
+                             double lat, double lon);
 
 /** Non-blocking poll. Writes up to @p max flattened events into @p out. Returns
  *  the count written (0 = nothing arrived), or a negative AT error code. */

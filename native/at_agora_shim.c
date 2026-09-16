@@ -120,6 +120,27 @@ int agora_block(void *handle, const char *send_queue, const uint8_t *peer_uuid)
     return at_app_events_block((at_app_events_t *)handle, send_queue, peer_uuid);
 }
 
+int agora_request_attend(void *handle, const char *send_queue,
+                         const uint8_t *peer_uuid)
+{
+    return at_app_events_request_attend((at_app_events_t *)handle, send_queue,
+                                        peer_uuid);
+}
+
+int agora_request_proximity(void *handle, const char *send_queue,
+                            const uint8_t *peer_uuid)
+{
+    return at_app_events_request_proximity((at_app_events_t *)handle, send_queue,
+                                           peer_uuid);
+}
+
+int agora_set_exact_position(void *handle, const char *send_queue, int opt_in,
+                             double lat, double lon)
+{
+    return at_app_events_set_exact_position((at_app_events_t *)handle,
+                                            send_queue, opt_in != 0, lat, lon);
+}
+
 int agora_events_poll(void *handle, agora_event_t *out, int max)
 {
     if (handle == NULL || out == NULL || max <= 0)
@@ -235,6 +256,13 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             e->reaction_post_id[AGORA_POST_ID_MAX] = '\0';
             e->reaction_seq = raw[i].data.reaction.seq;
             e->reaction_ts = raw[i].data.reaction.ts;
+            w++;
+            break;
+
+        case AT_APP_EVENT_PROXIMITY:
+            e->kind = AGORA_EVENT_PROXIMITY;
+            memcpy(e->peer_uuid, raw[i].data.proximity.peer_uuid, AGORA_UUID_LEN);
+            e->proximity_band = raw[i].data.proximity.band;
             w++;
             break;
 

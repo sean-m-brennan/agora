@@ -11,7 +11,9 @@ import 'package:flutter/material.dart' hide ConnectionState;
 
 import '../node/peer_stream.dart';
 import '../ffi/at_peer.dart';
+import '../model/attention_budget.dart';
 import '../model/tie_strength.dart';
+import 'circles_view.dart';
 import 'dm_thread.dart';
 import 'feed_view.dart';
 
@@ -60,6 +62,15 @@ class _PeopleNearMePageState extends State<PeopleNearMePage> {
         title: const Text('People near me'),
         actions: [
           IconButton(
+            icon: const Icon(Icons.bubble_chart_outlined),
+            tooltip: 'Circles',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => CirclesPage(service: service),
+              ),
+            ),
+          ),
+          IconButton(
             icon: const Icon(Icons.dynamic_feed),
             tooltip: 'Feed',
             onPressed: () => Navigator.of(context).push(
@@ -94,6 +105,19 @@ class _PeopleNearMePageState extends State<PeopleNearMePage> {
               );
             },
           ),
+          ListenableBuilder(
+            listenable: service,
+            builder: (context, _) {
+              final on = service.ownExactOptIn;
+              return IconButton(
+                icon: Icon(on ? Icons.my_location : Icons.location_searching),
+                tooltip: on
+                    ? 'Private proximity ON (exact position local-only) — tap to change'
+                    : 'Private proximity off — tap to opt in (never shared)',
+                onPressed: () => _editOwnExactPosition(context, service),
+              );
+            },
+          ),
         ],
       ),
       body: ListenableBuilder(
@@ -101,6 +125,9 @@ class _PeopleNearMePageState extends State<PeopleNearMePage> {
         builder: (context, _) {
           final peers = service.peers;
           final own = service.ownGeohash;
+          final ledger = service.budgetLedger;
+          // Over-budget strong ties (§3.3): faded, never severed — advisory only.
+          final overBudget = ledger.overBudgetTies.map((t) => t.peer).toSet();
           return Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
@@ -109,7 +136,8 @@ class _PeopleNearMePageState extends State<PeopleNearMePage> {
                 shortId: service.ownShortId,
               ),
               const _PendingCapabilitiesBanner(),
-              _StatusBar(status: service.status, count: peers.length),
+              _StatusBar(
+                  status: service.status, count: peers.length, ledger: ledger),
               Expanded(
                 child: peers.isEmpty
                     ? const Center(
@@ -118,8 +146,11 @@ class _PeopleNearMePageState extends State<PeopleNearMePage> {
                     : ListView.separated(
                         itemCount: peers.length,
                         separatorBuilder: (_, __) => const Divider(height: 1),
-                        itemBuilder: (context, i) => _PeerTile(
-                            peer: peers[i], ownGeohash: own, service: service),
+                        itemBuilder: (context, i) => Opacity(
+                          opacity: overBudget.contains(peers[i]) ? 0.55 : 1.0,
+                          child: _PeerTile(
+                              peer: peers[i], ownGeohash: own, service: service),
+                        ),
                       ),
               ),
             ],
@@ -175,6 +206,85 @@ class _PeopleNearMePageState extends State<PeopleNearMePage> {
     );
     if (result == null) return; // cancelled — no change
     service.setOwnPosition(result == '__optout__' ? null : result);
+  }
+
+  /// Opt in to (or out of) EXACT-position sharing for PRIVATE proximity. Unlike
+  /// the coarse bucket, the exact position is kept LOCAL-ONLY and never sent — it
+  /// only feeds the encrypted grid-tag probe with connected peers, who learn just
+  /// a coarse band (near/mid/far). Strictly opt-in.
+  Future<void> _editOwnExactPosition(
+      BuildContext context, PeerService service) async {
+    final lat = TextEditingController();
+    final lon = TextEditingController();
+    final result = await showDialog<String?>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Private proximity (exact position)'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Enter your exact latitude/longitude to enable private-proximity '
+              'checks with connected peers. Your coordinates are kept ON THIS '
+              'DEVICE and are NEVER sent — only pairwise-encrypted grid tags are '
+              'exchanged, so a connected peer learns just a coarse band '
+              '(<1 km / <5 km / far), never your location.',
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: lat,
+              keyboardType: const TextInputType.numberWithOptions(
+                  signed: true, decimal: true),
+              decoration: const InputDecoration(
+                  labelText: 'Latitude (deg)', hintText: 'e.g. 37.7749'),
+              autofocus: true,
+            ),
+            TextField(
+              controller: lon,
+              keyboardType: const TextInputType.numberWithOptions(
+                  signed: true, decimal: true),
+              decoration: const InputDecoration(
+                  labelText: 'Longitude (deg)', hintText: 'e.g. -122.4194'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, '__optout__'),
+            child: const Text('Stop sharing'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, null),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, 'set'),
+            child: const Text('Enable'),
+          ),
+        ],
+      ),
+    );
+    if (result == null) return; // cancelled
+    if (result == '__optout__') {
+      service.setOwnExactPosition(optIn: false);
+      return;
+    }
+    final la = double.tryParse(lat.text.trim());
+    final lo = double.tryParse(lon.text.trim());
+    if (la == null ||
+        lo == null ||
+        la < -90 ||
+        la > 90 ||
+        lo < -180 ||
+        lo > 180) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('Enter a valid latitude and longitude')));
+      }
+      return;
+    }
+    service.setOwnExactPosition(optIn: true, lat: la, lon: lo);
   }
 
   /// Set or edit this node's opt-in agora.profile. Strictly opt-in: cancelling
@@ -372,7 +482,11 @@ class _PeerTile extends StatelessWidget {
                 Text('tie ${strength.toStringAsFixed(2)}',
                     style: small?.copyWith(fontWeight: FontWeight.w600)),
                 Text('rep ${peer.reputationLabel} · $audience', style: small),
-                Text('${peer.rttLabel} · ${peer.distanceLabel(ownGeohash)}',
+                Text(
+                    '${peer.rttLabel} · ${peer.distanceLabel(ownGeohash)}'
+                    // Private-proximity band (Phase 2): shown only for a
+                    // connected peer that has a probe result. No coordinates.
+                    '${peer.proximityLabel != null ? ' · ~${peer.proximityLabel}' : ''}',
                     style: small),
               ],
             );
@@ -407,10 +521,45 @@ class _PeerOverflowMenu extends StatelessWidget {
               : (rc == -2 ? 'Not connected yet' : 'Could not block');
           ScaffoldMessenger.of(context)
               .showSnackBar(SnackBar(content: Text(msg)));
+        } else if (value == 'presence') {
+          final rc = service.pingPresence(peer);
+          final msg = rc == 0
+              ? 'Checking if they are at the console…'
+              : (rc == -2 ? 'Not connected yet' : 'Could not check presence');
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text(msg)));
+        } else if (value == 'proximity') {
+          final rc = service.requestProximity(peer);
+          final msg = rc == 0
+              ? 'Checking how near you are (no location shared)…'
+              : (rc == -2 ? 'Not connected yet' : 'Could not check proximity');
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text(msg)));
         }
       },
-      itemBuilder: (context) => const [
-        PopupMenuItem<String>(
+      itemBuilder: (context) => [
+        const PopupMenuItem<String>(
+          value: 'presence',
+          child: ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.sensors, size: 18),
+            title: Text('Check presence now'),
+          ),
+        ),
+        // Private-proximity only makes sense with a connected peer (both sides
+        // consented; they share the pairwise key). No coordinates are revealed.
+        if (peer.isConnected)
+          const PopupMenuItem<String>(
+            value: 'proximity',
+            child: ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.social_distance, size: 18),
+              title: Text('Check how near (private)'),
+            ),
+          ),
+        const PopupMenuItem<String>(
           value: 'block',
           child: ListTile(
             dense: true,
@@ -600,21 +749,68 @@ class _OwnerBanner extends StatelessWidget {
 }
 
 class _StatusBar extends StatelessWidget {
-  const _StatusBar({required this.status, required this.count});
+  const _StatusBar(
+      {required this.status, required this.count, required this.ledger});
 
   final String status;
   final int count;
 
+  /// Attention-budget ledger (§3.3) — drives the "stretched" indicator: how many
+  /// strong ties are being tended vs. how many the budget affords.
+  final BudgetLedger ledger;
+
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      color: scheme.surfaceContainerHighest,
       child: Row(
         children: [
           Expanded(child: Text('Status: $status')),
+          if (ledger.strongTieCount > 0) ...[
+            _BudgetChip(ledger: ledger),
+            const SizedBox(width: 12),
+          ],
           Text('$count peer${count == 1 ? '' : 's'}'),
         ],
+      ),
+    );
+  }
+}
+
+/// A compact indicator of attention-budget pressure (§3.3). Shows strong-tie
+/// spend vs. budget; turns to a "stretched" warning when the node holds more
+/// strong ties than its budget affords. Advisory only — nothing is severed.
+class _BudgetChip extends StatelessWidget {
+  const _BudgetChip({required this.ledger});
+
+  final BudgetLedger ledger;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final stretched = ledger.isStretched;
+    final pct = (ledger.utilization * 100).round();
+    final label = stretched
+        ? 'stretched · ${ledger.overBudgetTies.length} fading'
+        : 'attention $pct%';
+    return Tooltip(
+      message: 'Attention budget (§3.3): ${ledger.spent.toStringAsFixed(0)} of '
+          '${ledger.budget.toStringAsFixed(0)} spent across '
+          '${ledger.strongTieCount} strong ties. Distant, neglected ties cost '
+          'more; over budget, the weakest fade but are never dropped for you.',
+      child: Chip(
+        visualDensity: VisualDensity.compact,
+        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        avatar: Icon(
+          stretched ? Icons.local_fire_department : Icons.people_alt_outlined,
+          size: 16,
+          color: stretched ? scheme.onErrorContainer : scheme.onSurfaceVariant,
+        ),
+        label: Text(label),
+        backgroundColor:
+            stretched ? scheme.errorContainer : scheme.surfaceContainerHigh,
       ),
     );
   }

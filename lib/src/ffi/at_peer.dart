@@ -94,6 +94,26 @@ class AgoraPeer {
   /// group" indicator on the peer tile.
   bool inGroup = false;
 
+  /// The coarse distance BAND to this CONNECTED peer from a private-proximity
+  /// probe (Phase 2): 0 unknown, 1 near (~1km), 2 mid (~5km), 3 far. No exact
+  /// position is ever revealed — only this band. Set by [agoraEventProximity].
+  int proximityBand = 0;
+
+  /// Human label for [proximityBand], or null when unknown (no probe yet, or a
+  /// side opted out of exact position).
+  String? get proximityLabel {
+    switch (proximityBand) {
+      case 1:
+        return '<1 km';
+      case 2:
+        return '<5 km';
+      case 3:
+        return 'far';
+      default:
+        return null;
+    }
+  }
+
   /// The edge state as an enum.
   ConnectionState get connection => connectionStateFromInt(connectionState);
 
@@ -206,6 +226,9 @@ class AgoraPeer {
             connection == ConnectionState.pendingOut) {
           lastInteractionAt = DateTime.now().millisecondsSinceEpoch / 1000.0;
         }
+        return true;
+      case agoraEventProximity:
+        proximityBand = e.proximityBand;
         return true;
       default:
         return false;

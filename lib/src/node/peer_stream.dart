@@ -12,9 +12,11 @@ import 'package:flutter/foundation.dart';
 
 import '../ffi/at_events_bindings.dart';
 import '../ffi/at_peer.dart';
+import '../model/attention_budget.dart';
 import '../model/dm.dart';
 import '../model/feed_store.dart';
 import '../model/post.dart';
+import '../model/tie_settings.dart';
 import '../model/tie_strength.dart';
 import 'agora_daemon.dart';
 
@@ -43,6 +45,49 @@ class PeerService extends ChangeNotifier {
   Timer? _timer;
   final Map<String, AgoraPeer> _peers = {};
   String _status = 'idle';
+
+  /// Per-user persisted tuning + durable per-peer last-interaction (Phase 2,
+  /// §3.3). Loaded in [start]; null until then (unit tests that never start the
+  /// daemon simply run on the in-memory defaults). Writes are debounced.
+  TieSettingsStore? _settings;
+  Timer? _saveTimer;
+
+  /// The tie-strength weights currently in force (persisted tuning if loaded,
+  /// else the defaults).
+  TieStrengthWeights get _weights =>
+      _settings?.settings.weights ?? TieStrengthWeights.defaults;
+
+  /// The attention-budget parameters currently in force.
+  AttentionBudgetParams get budgetParams =>
+      _settings?.settings.budget ?? AttentionBudgetParams.defaults;
+
+  /// Create a peer, seeding its last-interaction time from durable storage so a
+  /// tie we tended before this launch does not spuriously read as "cold".
+  AgoraPeer _newPeer(List<int> uuid) {
+    final p = AgoraPeer(uuid: uuid);
+    final durable = _settings?.lastInteractionFor(_hex(uuid));
+    if (durable != null && durable > p.lastInteractionAt) {
+      p.lastInteractionAt = durable;
+    }
+    return p;
+  }
+
+  /// Stamp an interaction with [peer] (tends the tie, feeding the recency term),
+  /// and persist it durably so the tie survives a restart. Debounced save.
+  void _tend(AgoraPeer peer, [double? nowSec]) {
+    final now = nowSec ?? DateTime.now().millisecondsSinceEpoch / 1000.0;
+    peer.markInteraction(now);
+    final s = _settings;
+    if (s != null) {
+      s.recordInteraction(_hex(peer.uuid), now);
+      _scheduleSave();
+    }
+  }
+
+  void _scheduleSave() {
+    _saveTimer?.cancel();
+    _saveTimer = Timer(const Duration(seconds: 2), () => _settings?.save());
+  }
 
   /// Per-peer direct-message threads (Increment 6), keyed by peer uuid hex.
   /// Incoming messages arrive via ingestEvents (AT_APP_EVENT_DM); outgoing ones
@@ -206,7 +251,7 @@ class PeerService extends ChangeNotifier {
   /// edge to pending_out and sends a directed encrypted request. Returns the
   /// shim rc (0 ok, -2 daemon not ready), or -1 if no channel is open yet.
   int requestConnection(AgoraPeer peer) {
-    peer.markInteraction(DateTime.now().millisecondsSinceEpoch / 1000.0);
+    _tend(peer);
     final ev = _events;
     if (ev == null) {
       notifyListeners();
@@ -241,7 +286,7 @@ class PeerService extends ChangeNotifier {
   /// Returns the shim rc (0 ok, -2 daemon not ready), or -1 if no channel.
   int respondConnection(AgoraPeer peer, bool accept) {
     if (accept) {
-      peer.markInteraction(DateTime.now().millisecondsSinceEpoch / 1000.0);
+      _tend(peer);
     }
     final ev = _events;
     if (ev == null) {
@@ -285,7 +330,7 @@ class PeerService extends ChangeNotifier {
     final trimmed = text.trim();
     if (trimmed.isEmpty) return -1;
     final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
-    peer.markInteraction(now);
+    _tend(peer, now);
     (_dms[_hex(peer.uuid)] ??= <DmMessage>[]).add(DmMessage(
       peerUuidHex: _hex(peer.uuid),
       seq: 0, // the wire seq is stamped by the core and never returns to the app
@@ -362,7 +407,7 @@ class PeerService extends ChangeNotifier {
     if (post.authorUuid.isEmpty || post.postId.isEmpty) return -1;
     final author = _peers[_hex(post.authorUuid)];
     if (author != null) {
-      author.markInteraction(DateTime.now().millisecondsSinceEpoch / 1000.0);
+      _tend(author);
     }
     final ev = _events;
     if (ev == null) {
@@ -386,6 +431,53 @@ class PeerService extends ChangeNotifier {
     return rc;
   }
 
+  /// Pull a FRESH attendance attestation from [peer] NOW (Phase 2, presence):
+  /// asks the core to issue a nonce-fresh operator_attest_query. The refreshed
+  /// operator_attested_at (and thus the presence dot) arrives on the next
+  /// peer-observed event, not synchronously. Returns the shim rc (0 ok, -2
+  /// daemon not ready), or -1 if no channel is open yet.
+  int pingPresence(AgoraPeer peer) {
+    final ev = _events;
+    if (ev == null) return -1;
+    return ev.requestAttend(_daemon.queues.appToAt, peer.uuid);
+  }
+
+  /// Run a private-proximity probe against [peer] (Phase 2): the coarse distance
+  /// band arrives later as a proximity event and updates [AgoraPeer.proximityBand].
+  /// Only meaningful for a CONNECTED peer (the core refuses others). Returns the
+  /// shim rc (0 ok, -2 daemon not ready), or -1 if no channel is open yet.
+  int requestProximity(AgoraPeer peer) {
+    final ev = _events;
+    if (ev == null) return -1;
+    return ev.requestProximity(_daemon.queues.appToAt, peer.uuid);
+  }
+
+  /// This node's opt-in EXACT-position state (Phase 2). Local-only in the core;
+  /// kept here so the UI can reflect whether sharing is on.
+  bool _ownExactOptIn = false;
+  double _ownExactLat = 0;
+  double _ownExactLon = 0;
+  bool get ownExactOptIn => _ownExactOptIn;
+
+  /// Opt in to (or out of, [optIn] false) sharing an EXACT position for private-
+  /// proximity probes with connected peers. Stored LOCAL-ONLY by the core and
+  /// never advertised. Remembered so it is pushed once the channel opens.
+  /// Returns the shim rc (0 ok, -2 daemon not ready), or -1 if no channel yet.
+  int setOwnExactPosition({required bool optIn, double lat = 0, double lon = 0}) {
+    _ownExactOptIn = optIn;
+    _ownExactLat = optIn ? lat : 0;
+    _ownExactLon = optIn ? lon : 0;
+    final ev = _events;
+    if (ev == null) {
+      notifyListeners();
+      return -1;
+    }
+    final rc = ev.setExactPosition(_daemon.queues.appToAt,
+        optIn: optIn, lat: _ownExactLat, lon: _ownExactLon);
+    notifyListeners();
+    return rc;
+  }
+
   /// Reaction tally for one of our posts by content id (Increment 8); 0 if none.
   int reactionsFor(String postId) => _reactionCounts[postId] ?? 0;
 
@@ -400,7 +492,7 @@ class PeerService extends ChangeNotifier {
     }
     final peer = _peers[_hex(e.uuid)];
     if (peer != null) {
-      peer.markInteraction(DateTime.now().millisecondsSinceEpoch / 1000.0);
+      _tend(peer);
     }
     return true;
   }
@@ -412,7 +504,7 @@ class PeerService extends ChangeNotifier {
     if (e.kind != agoraEventPost) return false;
     // Ensure the author is at least a known roster entry, so tie-strength ranking
     // can place their posts (the peer's other events fill in richer state).
-    _peers.putIfAbsent(_hex(e.uuid), () => AgoraPeer(uuid: e.uuid));
+    _peers.putIfAbsent(_hex(e.uuid), () => _newPeer(e.uuid));
     _feed.add(Post.fromEvent(e));
     return true;
   }
@@ -424,7 +516,7 @@ class PeerService extends ChangeNotifier {
   bool _ingestDm(AtRawEvent e) {
     if (e.kind != agoraEventDm) return false;
     final key = _hex(e.uuid);
-    final peer = _peers.putIfAbsent(key, () => AgoraPeer(uuid: e.uuid));
+    final peer = _peers.putIfAbsent(key, () => _newPeer(e.uuid));
     final thread = _dms[key] ??= <DmMessage>[];
     // Dedup by seq: the core may re-deliver, but incoming seqs are monotone per
     // sender (the freshness gate guarantees it), so an already-seen incoming
@@ -439,7 +531,7 @@ class PeerService extends ChangeNotifier {
         outgoing: false,
       ));
       _unreadPeers.add(key);
-      peer.markInteraction(DateTime.now().millisecondsSinceEpoch / 1000.0);
+      _tend(peer);
     }
     return true;
   }
@@ -452,8 +544,10 @@ class PeerService extends ChangeNotifier {
     final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
     final list = _peers.values.toList();
     list.sort((a, b) {
-      final sa = tieStrength(a, ownGeohash: _ownGeohash, nowEpochSeconds: now);
-      final sb = tieStrength(b, ownGeohash: _ownGeohash, nowEpochSeconds: now);
+      final sa = tieStrength(a,
+          ownGeohash: _ownGeohash, nowEpochSeconds: now, weights: _weights);
+      final sb = tieStrength(b,
+          ownGeohash: _ownGeohash, nowEpochSeconds: now, weights: _weights);
       final byStrength = sb.compareTo(sa);
       if (byStrength != 0) return byStrength;
       final byRank = b.rank.compareTo(a.rank);
@@ -469,6 +563,19 @@ class PeerService extends ChangeNotifier {
         peer,
         ownGeohash: _ownGeohash,
         nowEpochSeconds: DateTime.now().millisecondsSinceEpoch / 1000.0,
+        weights: _weights,
+      );
+
+  /// The attention-budget ledger over this node's strong ties (§3.3): how much
+  /// of the budget the tended, proximity-weighted connections consume, and which
+  /// weakest ties are over the line (advisory — never severed). The UI reads this
+  /// for the "stretched" indicator and to fade over-budget tiles.
+  BudgetLedger get budgetLedger => BudgetLedger.compute(
+        _peers.values,
+        ownGeohash: _ownGeohash,
+        nowEpochSeconds: DateTime.now().millisecondsSinceEpoch / 1000.0,
+        weights: _weights,
+        params: budgetParams,
       );
 
   Future<void> start() async {
@@ -478,6 +585,12 @@ class PeerService extends ChangeNotifier {
     // Learn our own identity (nickname + uuid) from the daemon's config, for the
     // window header and the self-filter below. Best-effort; never fatal.
     await _loadOwnIdentity();
+
+    // Load per-user tuning + durable last-interaction (Phase 2, §3.3), from a
+    // small JSON file under the config root. Best-effort — defaults on any error.
+    _settings = await TieSettingsStore(
+            File('${_daemon.root}/etc/at/agora.settings.json'))
+        .load();
 
     // Resolve our in-process event sockets under the same config root as the
     // daemon (Dart cannot setenv its own process; the shim does it in C).
@@ -499,6 +612,10 @@ class PeerService extends ChangeNotifier {
     // If the operator opted in before the channel was ready, push it now.
     if (_ownGeohash != null) {
       _events!.setPosition(_daemon.queues.appToAt, _ownGeohash!);
+    }
+    if (_ownExactOptIn) {
+      _events!.setExactPosition(_daemon.queues.appToAt,
+          optIn: true, lat: _ownExactLat, lon: _ownExactLon);
     }
     if (_ownProfile != null) {
       _events!.setProfile(_daemon.queues.appToAt, jsonEncode(_ownProfile!));
@@ -541,7 +658,7 @@ class PeerService extends ChangeNotifier {
       // from before that fix, or any other producer, could still emit self —
       // drop it here so the UI never shows a self tile. Cheap defense-in-depth.
       if (_ownUuidHex.isNotEmpty && key == _ownUuidHex) continue;
-      final peer = _peers.putIfAbsent(key, () => AgoraPeer(uuid: e.uuid));
+      final peer = _peers.putIfAbsent(key, () => _newPeer(e.uuid));
       peer.applyEvent(e);
       // Resolve an optimistic connect (Increment 5 UX): the core echoes the real
       // edge state after handle_app_connect_request. pending_out/connected confirm
@@ -561,6 +678,9 @@ class PeerService extends ChangeNotifier {
   Future<void> shutdown() async {
     _timer?.cancel();
     _timer = null;
+    _saveTimer?.cancel();
+    _saveTimer = null;
+    await _settings?.save(); // flush any pending durable-recency writes
     _events?.close();
     _events = null;
     await _daemon.stop();
