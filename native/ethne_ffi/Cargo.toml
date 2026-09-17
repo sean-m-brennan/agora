@@ -1,0 +1,38 @@
+# Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors. Apache-2.0.
+#
+# ethne_agora — a thin C-ABI cdylib over Ethne's Rust, so the Agora Flutter app
+# can found and read an Ethne polity via dart:ffi (no Python). Lives in the Agora
+# package (Ethne stays clean); depends on the en-* crates by PATH only. Kept as
+# its OWN workspace (the empty [workspace] table) so cargo does not attach it to
+# the ethne workspace, whose resolver-3 feature unification we must not inherit.
+
+[package]
+name = "ethne_agora"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+name = "ethne_agora"
+crate-type = ["cdylib"]
+
+[dependencies]
+en-core = { path = "../../../../lib/ethne/src/rust/en-core" }
+en-charter = { path = "../../../../lib/ethne/src/rust/en-charter" }
+en-archive = { path = "../../../../lib/ethne/src/rust/en-archive" }
+# P3.1: envoy delegation + community-identity border artifacts, and the KC types
+# they carry (SpeakerDelegation, CommunityIdentity) for the business-page bundle.
+en-uplift = { path = "../../../../lib/ethne/src/rust/en-uplift" }
+kc-core = { path = "../../../../lib/kith-covenant/src/rust/kc-core" }
+kc-identity = { path = "../../../../lib/kith-covenant/src/rust/kc-identity" }
+# S3 detached signing moves canonical CBOR across the C ABI as hex.
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Own workspace root — do not walk up and attach to a parent workspace.
+[workspace]
+
+[profile.release]
+opt-level = 2

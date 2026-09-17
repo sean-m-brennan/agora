@@ -57,6 +57,31 @@ extern "C" {
 /* Post content-id length (blake2b-256 lowercase hex). MUST match
  * AT_APP_POST_ID_LEN (app_events.h) / AT_POST_ID_LEN (msg_types.h). */
 #define AGORA_POST_ID_MAX 64
+/* Max opaque Ethne page-bundle length on a business ad (Phase 3 P3.2). MUST
+ * match AT_APP_BUSINESS_BUNDLE_LEN (app_events.h) / AT_BUSINESS_BUNDLE_LEN
+ * (msg_types.h). */
+#define AGORA_BUSINESS_BUNDLE_MAX 3072
+/* Max polity DID length. MUST match AT_APP_BUSINESS_DID_LEN / AT_BUSINESS_DID_LEN. */
+#define AGORA_BUSINESS_DID_MAX 95
+/* Business-ad content-id length (blake2b-256 lowercase hex). MUST match
+ * AT_APP_BUSINESS_AD_ID_LEN / AT_BUSINESS_AD_ID_LEN. */
+#define AGORA_BUSINESS_AD_ID_MAX 64
+/* A business advertising its OWN page rather than a customer rating it. MUST
+ * match AT_APP_BUSINESS_SAT_SELF (app_events.h) / AT_BUSINESS_SAT_SELF. */
+#define AGORA_BUSINESS_SAT_SELF 0xFF
+/* Max hex characters of a detached exchange's exported canonical bytes (Phase 3
+ * P3.3). MUST match AT_APP_COSIGN_BYTES_LEN (app_events.h) /
+ * AT_COSIGN_BYTES_LEN (msg_types.h) / AT_COSIGN_BYTES_MAX (identity/cosign.h) /
+ * COSIGN_BYTES_HEX_MAX (ethne_ffi). */
+#define AGORA_COSIGN_BYTES_MAX 6144
+/* Max polity DID or signer did:key length. MUST match AT_APP_COSIGN_DID_LEN. */
+#define AGORA_COSIGN_DID_MAX 95
+/* Exchange content id ("b3:" + 64 hex). MUST match AT_APP_COSIGN_CID_LEN. */
+#define AGORA_COSIGN_CID_MAX 67
+/* Detached Ed25519 signature as lowercase hex. MUST match AT_APP_COSIGN_SIG_LEN. */
+#define AGORA_COSIGN_SIG_MAX 128
+/* Record-class or op token. MUST match AT_APP_COSIGN_TOKEN_LEN. */
+#define AGORA_COSIGN_TOKEN_MAX 15
 
 /* kind discriminator (a superset-safe subset of at_app_event_kind_t). */
 #define AGORA_EVENT_PEER               1
@@ -70,6 +95,9 @@ extern "C" {
 #define AGORA_EVENT_POST               9
 #define AGORA_EVENT_REACTION           10
 #define AGORA_EVENT_PROXIMITY          11
+#define AGORA_EVENT_BUSINESS_AD        12
+#define AGORA_EVENT_COSIGN_REQUEST     13
+#define AGORA_EVENT_COSIGN_SIGNATURE   14
 
 /**
  * One flattened app event. Field order is ABI-significant: the Dart
@@ -157,6 +185,55 @@ typedef struct {
      * (Phase 2); the Dart AgoraEvent and the cohort ctypes Ev mirror this order
      * and re-check the new sizeof. No coordinates cross this boundary. */
     int32_t proximity_band;                    /* AGORA_EVENT_PROXIMITY */
+    /* AGORA_EVENT_BUSINESS_AD (Phase 3 P3.2): a signed business ad — one opaque
+     * Ethne page bundle plus the advertiser's satisfaction. Appended LAST after
+     * proximity_band so every prior field offset is unchanged; the Dart
+     * AgoraEvent and the cohort ctypes Ev mirror this order and re-check the new
+     * sizeof. peer_uuid carries the SIGNATURE-BOUND advertiser — the business
+     * itself, or a CUSTOMER re-advertising in the first person (an ad is never
+     * relayed, so an advertiser always vouches with its own key).
+     *
+     * business_satisfaction is 0..4, or AGORA_BUSINESS_SAT_SELF for the
+     * business's own ad. business_bundle is OPAQUE and NOT verified by the core:
+     * the app must run the self-contained Ethne verifier (polity root -> envoy ->
+     * page) on it before trusting the page. What the core DID verify is the ad
+     * signature — that this advertiser vouched for these exact bytes. */
+    char    business_polity[AGORA_BUSINESS_DID_MAX + 1];
+    char    business_ad_id[AGORA_BUSINESS_AD_ID_MAX + 1];
+    int32_t business_satisfaction;
+    int64_t business_seq;
+    double  business_ts;
+    char    business_bundle[AGORA_BUSINESS_BUNDLE_MAX + 1];
+    /* AGORA_EVENT_COSIGN_REQUEST / AGORA_EVENT_COSIGN_SIGNATURE (Phase 3 P3.3):
+     * the detached co-signing exchange. Appended LAST after business_bundle so
+     * every prior field offset is unchanged; the Dart AgoraEvent and the cohort
+     * ctypes Ev mirror this order and re-check the new sizeof.
+     *
+     * peer_uuid carries the REQUESTER on a request and the SIGNER on a
+     * signature, crypto_box-authenticated either way. cosign_record is
+     * "membership" or "guardian" and cosign_op the act within it; cosign_polity
+     * the Ethne DID; cosign_cid the exchange's content address; cosign_bytes the
+     * exported canonical CBOR as lowercase hex, on a request only.
+     *
+     * cosign_bytes is OPAQUE and NOT verified by the core, exactly like
+     * business_bundle: derive what it commits to HERE (ethne_describe) and show
+     * the operator that. NO description crosses this boundary on purpose — if
+     * the asking node supplied the wording as well as the payload, it would
+     * choose both what you sign and what you are told you are signing.
+     *
+     * On a signature, cosign_signer_did is the signing did:key (it embeds the
+     * public key, so no registry is needed) and cosign_sig the detached Ed25519
+     * signature over those bytes. The core did not check it and could not: it
+     * does not hold the payload. The assembling node does. */
+    char    cosign_record[AGORA_COSIGN_TOKEN_MAX + 1];
+    char    cosign_op[AGORA_COSIGN_TOKEN_MAX + 1];
+    char    cosign_polity[AGORA_COSIGN_DID_MAX + 1];
+    char    cosign_cid[AGORA_COSIGN_CID_MAX + 1];
+    char    cosign_signer_did[AGORA_COSIGN_DID_MAX + 1];
+    char    cosign_sig[AGORA_COSIGN_SIG_MAX + 1];
+    int64_t cosign_seq;
+    double  cosign_ts;
+    char    cosign_bytes[AGORA_COSIGN_BYTES_MAX + 1];
 } agora_event_t;
 
 /** Set $AUTONOMOUS_TRUST_ROOT for THIS process, so the app-events client below
@@ -250,6 +327,28 @@ int agora_request_attend(void *handle, const char *send_queue,
  *  identity process exchanges pairwise-keyed grid tags; both sides learn a
  *  coarse distance BAND (an AGORA_EVENT_PROXIMITY), never coordinates. Returns 0
  *  on success, negative on error (AT_APP_NOT_READY == -2). */
+/** Publish THIS node's own business page (Phase 3 P3.2). `polity_did` is the
+ *  business's Ethne DID, `bundle` the OPAQUE self-verifying page artifact the
+ *  app built through Ethne, `seq` its version. Sends AT_APP_ADVERTISE_BUSINESS
+ *  on the app -> AT queue; identity signs and group-multicasts it. Reach comes
+ *  from customers re-advertising, not from this one call.
+ *  @return 0 on success, AGORA_NOT_READY if the queue is not bound, -1 otherwise. */
+int agora_advertise_business(void *handle, const char *send_queue,
+                             const char *polity_did, const char *bundle,
+                             int64_t seq);
+
+/** Declare, update or clear THIS node's CUSTOMER edge to a business (Phase 3
+ *  P3.2). The edge is what authorizes this node to CARRY the page: on set,
+ *  identity caches `bundle` and advertises it in the FIRST PERSON, with
+ *  `satisfaction` (0..4), and re-advertises whenever a fresh ad arrives. Pass a
+ *  NEGATIVE `satisfaction` to clear the edge — an unhappy customer goes quiet
+ *  rather than publishing anything negative. Pass NULL/"" for `bundle` to carry
+ *  the page this node already learned. Sends AT_APP_SET_CUSTOMER.
+ *  @return 0 on success, AGORA_NOT_READY if the queue is not bound, -1 otherwise. */
+int agora_set_customer(void *handle, const char *send_queue,
+                       const char *polity_did, int satisfaction,
+                       const char *bundle, int64_t seq);
+
 int agora_request_proximity(void *handle, const char *send_queue,
                             const uint8_t *peer_uuid);
 
@@ -259,6 +358,34 @@ int agora_request_proximity(void *handle, const char *send_queue,
  *  error (AT_APP_NOT_READY == -2). */
 int agora_set_exact_position(void *handle, const char *send_queue, int opt_in,
                              double lat, double lon);
+
+/** Ask named peers to co-sign one staff-roll or guardianship record (Phase 3
+ *  P3.3). `peer_uuids` is `n_peers` × 16 raw identity bytes, laid out
+ *  contiguously; `record`/`op` name the act; `cid` and `bytes` are the exchange
+ *  as Ethne exported it, the bytes being canonical CBOR in lowercase hex.
+ *
+ *  No private key travels — that is the whole point of sending the record
+ *  instead of gathering the keys. `bytes` must be reproduced EXACTLY: the
+ *  signatures are over these bytes, so anything that truncates or re-encodes
+ *  them yields signatures over nothing. An unknown op or a non-hex payload is
+ *  refused here rather than carried. Deliberately no description parameter.
+ *  @return 0 on success, AGORA_NOT_READY if the queue is not bound, -1 otherwise. */
+int agora_request_cosign(void *handle, const char *send_queue,
+                         const uint8_t *peer_uuids, int n_peers,
+                         const char *record, const char *op,
+                         const char *polity_did, const char *cid,
+                         const char *bytes);
+
+/** Return THIS node's detached signature to the peer authoring an exchange
+ *  (Phase 3 P3.3). `peer_uuid` is the requester's 16 raw identity bytes; `cid`
+ *  names the exchange; `signer_did` is this signer's did:key; `sig_hex` the
+ *  detached Ed25519 signature over the exported bytes.
+ *
+ *  Sign only after deriving, on this node, what those bytes actually commit to.
+ *  @return 0 on success, AGORA_NOT_READY if the queue is not bound, -1 otherwise. */
+int agora_return_cosign(void *handle, const char *send_queue,
+                        const uint8_t *peer_uuid, const char *cid,
+                        const char *signer_did, const char *sig_hex);
 
 /** Non-blocking poll. Writes up to @p max flattened events into @p out. Returns
  *  the count written (0 = nothing arrived), or a negative AT error code. */

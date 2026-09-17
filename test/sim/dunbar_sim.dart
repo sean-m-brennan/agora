@@ -42,6 +42,9 @@ class SimConfig {
     this.localFraction = 0.85, // share of new peers who are co-located
     this.distantRttMinMs = 40, // distant peers' RTT spread (drives p(d) via rtt)
     this.distantRttMaxMs = 240,
+    this.ratedFraction = 0.0,
+    this.ratedScoreMin = 0.50,
+    this.ratedScoreMax = 0.95,
     this.startEpoch = 1000000000.0,
     this.seed = 0x51E,
     this.params = AttentionBudgetParams.defaults,
@@ -63,6 +66,20 @@ class SimConfig {
   final int distantRttMinMs;
   final int distantRttMaxMs;
 
+  /// Share of newly-met peers who carry an EARNED reputation (AT tier 1..4).
+  /// Zero — the default — reproduces the original all-unrated population, in
+  /// which `tieStrength`'s tier term contributes nothing and S cannot exceed
+  /// `wRecency + wProximity` (0.6 with the defaults). A non-zero fraction is
+  /// what makes the kernel's `wTier` (0.4, the largest single weight) do work.
+  final double ratedFraction;
+
+  /// Uniform range for a rated peer's reputation score, mapped to a 0..4 tier
+  /// through the REAL [trustTierForScore] / [tierFloors], so the sim tracks the
+  /// shipping floors rather than a private copy of them. The default spans the
+  /// whole rated range: 0.50 is the tier-1 floor, 0.95 clears tier 4 (0.90).
+  final double ratedScoreMin;
+  final double ratedScoreMax;
+
   final double startEpoch;
   final int seed;
   final AttentionBudgetParams params;
@@ -73,6 +90,7 @@ class SimConfig {
     int? meetsPerDay,
     int? tendPerDay,
     double? localFraction,
+    double? ratedFraction,
     AttentionBudgetParams? params,
   }) =>
       SimConfig(
@@ -82,11 +100,38 @@ class SimConfig {
         localFraction: localFraction ?? this.localFraction,
         distantRttMinMs: distantRttMinMs,
         distantRttMaxMs: distantRttMaxMs,
+        ratedFraction: ratedFraction ?? this.ratedFraction,
+        ratedScoreMin: ratedScoreMin,
+        ratedScoreMax: ratedScoreMax,
         startEpoch: startEpoch,
         seed: seed,
         params: params ?? this.params,
         weights: weights,
       );
+
+  /// A population in which trust is real, unevenly distributed, and co-located
+  /// people are SCARCE — a mostly-remote agent (a diaspora member, a remote
+  /// worker) rather than the default's village.
+  ///
+  /// Both knobs are load-bearing, and the reason is the sharpest thing the sim
+  /// has to say about §3.3:
+  ///
+  ///   `edgeCost` reads ONLY proximity and recency — never the trust tier. So
+  ///   tier cannot change how many ties fit under B, only WHICH ones do. While
+  ///   at least B/baseCost co-located, freshly-tended ties exist, they are both
+  ///   the strongest and the cheapest, they win every budget slot, and the
+  ///   plateau is pinned to the bare `B/baseCost` identity no matter how the
+  ///   population is rated. Scarce locality is what forces the budget to buy
+  ///   expensive ties, and only THEN does trust decide which expensive ties get
+  ///   bought — which is the trust-versus-distance economics §3.3 describes.
+  ///
+  /// At these settings the plateau is genuinely emergent: it sits well below
+  /// `B/baseCost`, it moves when the population's trust changes, and it has a
+  /// real steady-state spread instead of being a pinned constant.
+  static const SimConfig mixedTrust = SimConfig(
+    ratedFraction: 0.45,
+    localFraction: 0.08,
+  );
 }
 
 /// One day's snapshot of the graph.
@@ -98,6 +143,13 @@ class SimSample {
     required this.affordable,
     required this.spent,
     required this.utilization,
+    required this.affordableMeanCost,
+    required this.affordableMaxStrength,
+    required this.affordableMeanTier,
+    required this.overBudgetMeanTier,
+    required this.affordableDistant,
+    required this.affordableLocalMeanCost,
+    required this.affordableDistantMeanCost,
   });
 
   /// Simulated day index (0-based).
@@ -119,6 +171,31 @@ class SimSample {
 
   /// spent / B.
   final double utilization;
+
+  /// Mean budget cost of the ties INSIDE the budget line. Exactly [baseCost] in
+  /// the all-local unrated population (which is why its plateau is the bare
+  /// `B/baseCost` identity); strictly greater once trust funds ties that
+  /// distance or neglect makes expensive.
+  final double affordableMeanCost;
+
+  /// Highest tie strength among affordable ties. Bounded by
+  /// `wRecency + wProximity` (0.6) when nobody is rated — exceeding it is proof
+  /// the tier term is live.
+  final double affordableMaxStrength;
+
+  /// Mean AT trust tier (0..4) inside the budget line, and beyond it. Budget is
+  /// allocated strongest-first, so trust should concentrate INSIDE.
+  final double affordableMeanTier;
+  final double overBudgetMeanTier;
+
+  /// Affordable ties that are not co-located — the ones trust bought in despite
+  /// paying `1/p(d)` rent.
+  final int affordableDistant;
+
+  /// Mean affordable cost split by locality: distance is the discount, so the
+  /// distant mean should sit well above the local one.
+  final double affordableLocalMeanCost;
+  final double affordableDistantMeanCost;
 }
 
 /// The result of a run: the full daily series plus convenience reducers.
@@ -131,7 +208,13 @@ class SimResult {
   /// Mean affordable-strong-tie count over the final [window] days — the
   /// steady-state plateau height.
   double plateauAffordable({int window = 120}) =>
-      _tailMean(samples.map((s) => s.affordable.toDouble()), window);
+      plateauOf((s) => s.affordable.toDouble(), window: window);
+
+  /// Steady-state mean of any per-day observable over the final [window] days.
+  /// [plateauAffordable] is the count; this reads the same tail for costs,
+  /// tiers and strengths.
+  double plateauOf(double Function(SimSample) selector, {int window = 120}) =>
+      _tailMean(samples.map(selector), window);
 
   /// Peak-to-peak spread of the affordable count over the final [window] days —
   /// small ⇒ the plateau is stable, not still drifting.
@@ -172,6 +255,28 @@ class SimResult {
     }
     return b.toString();
   }
+
+  /// The mixed-trust view: the same plateau, plus what the budget line is
+  /// actually BUYING — cost heterogeneity, the reach of the tier term, and how
+  /// trust and distance sort themselves either side of the line.
+  String renderTrustCurve({int every = 60}) {
+    final b = StringBuffer();
+    b.writeln('  day  connections  strong  affordable  meanCost  maxS  '
+        'tier(in/out)  distant');
+    for (final s in samples) {
+      if (s.day % every != 0 && s.day != samples.last.day) continue;
+      b.writeln('${s.day.toString().padLeft(5)}'
+          '${s.connections.toString().padLeft(13)}'
+          '${s.strongTies.toString().padLeft(8)}'
+          '${s.affordable.toString().padLeft(12)}'
+          '${s.affordableMeanCost.toStringAsFixed(2).padLeft(10)}'
+          '${s.affordableMaxStrength.toStringAsFixed(2).padLeft(6)}'
+          '${'${s.affordableMeanTier.toStringAsFixed(2)}/'
+              '${s.overBudgetMeanTier.toStringAsFixed(2)}'.padLeft(14)}'
+          '${s.affordableDistant.toString().padLeft(9)}');
+    }
+    return b.toString();
+  }
 }
 
 /// Run the simulation. Pure and deterministic given (`config`) — the RNG is
@@ -201,6 +306,14 @@ SimResult runDunbarSim(SimConfig config) {
       p.geohash = ''; // distant ⇒ RTT-derived proximity < 1
       p.rttMs = config.distantRttMinMs +
           rng.nextInt(config.distantRttMaxMs - config.distantRttMinMs + 1);
+    }
+    // Earned reputation, when the population has any. The `> 0` guard
+    // short-circuits so an all-unrated run consumes NO random values here and
+    // reproduces the original seeded stream exactly.
+    if (config.ratedFraction > 0 && rng.nextDouble() < config.ratedFraction) {
+      p.reputationRated = true;
+      p.reputationScore = config.ratedScoreMin +
+          rng.nextDouble() * (config.ratedScoreMax - config.ratedScoreMin);
     }
     return p;
   }
@@ -241,16 +354,43 @@ SimResult runDunbarSim(SimConfig config) {
       weights: config.weights,
       params: config.params,
     );
-    final affordable = ledger.ties.where((t) => !t.overBudget).length;
+    final affordableTies = ledger.ties.where((t) => !t.overBudget).toList();
+    final overTies = ledger.ties.where((t) => t.overBudget).toList();
+    bool isLocal(TieCost t) => t.peer.geohash == kHere;
+    final affLocal = affordableTies.where(isLocal).toList();
+    final affDistant = affordableTies.where((t) => !isLocal(t)).toList();
     samples.add(SimSample(
       day: day,
       connections: peers.length,
       strongTies: ledger.strongTieCount,
-      affordable: affordable,
+      affordable: affordableTies.length,
       spent: ledger.spent,
       utilization: ledger.utilization,
+      affordableMeanCost: _mean(affordableTies.map((t) => t.cost)),
+      affordableMaxStrength: affordableTies.isEmpty
+          ? 0.0
+          : affordableTies.map((t) => t.strength).reduce(math.max),
+      affordableMeanTier:
+          _mean(affordableTies.map((t) => trustTier(t.peer).toDouble())),
+      overBudgetMeanTier:
+          _mean(overTies.map((t) => trustTier(t.peer).toDouble())),
+      affordableDistant: affDistant.length,
+      affordableLocalMeanCost: _mean(affLocal.map((t) => t.cost)),
+      affordableDistantMeanCost: _mean(affDistant.map((t) => t.cost)),
     ));
   }
 
   return SimResult(config, samples);
+}
+
+/// Mean of [xs], or 0 for an empty set (an empty band is reported as 0 rather
+/// than NaN so a sample is always printable).
+double _mean(Iterable<double> xs) {
+  var n = 0;
+  var total = 0.0;
+  for (final x in xs) {
+    total += x;
+    n++;
+  }
+  return n == 0 ? 0.0 : total / n;
 }

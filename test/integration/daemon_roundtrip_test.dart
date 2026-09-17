@@ -124,6 +124,60 @@ void main() {
       // The outgoing message is echoed locally regardless of the wire rc.
       expect(svc.messagesFor(synthetic).where((m) => m.outgoing), isNotEmpty);
 
+      // Exercise the co-signing FFI wrappers (Phase 3 P3.3): agora_request_cosign
+      // / agora_return_cosign through dart:ffi. A single node has no real peer,
+      // so the core drops these as "unknown peer"; the point is that the app->AT
+      // verbs traverse the ffi + shim + dispatch path and return a defined rc.
+      // The payload is a minimal well-formed exchange: the shim refuses an
+      // unknown op or a non-hex payload before it reaches the queue, so passing
+      // junk here would test the refusal rather than the path.
+      int askRc = -2, retRc = -2;
+      for (var i = 0; i < 20 && !(askRc == 0 && retRc == 0); i++) {
+        askRc = svc.requestCosign(
+          [synthetic],
+          record: 'guardian',
+          op: 'designate',
+          polityDid: 'did:key:zTestPolity',
+          cid: 'b3:${'0' * 64}',
+          bytes: 'a1626f70',
+        );
+        retRc = svc.returnCosign(
+          synthetic,
+          cid: 'b3:${'0' * 64}',
+          signerDid: 'did:key:zTestSigner',
+          sigHex: '0' * 128,
+        );
+        if (askRc == 0 && retRc == 0) break;
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+      }
+      expect(askRc, anyOf(0, -2), reason: 'request-cosign must be a defined rc');
+      expect(retRc, anyOf(0, -2), reason: 'return-cosign must be a defined rc');
+
+      // And the shim's own refusals, which never reach the queue: an unknown op
+      // and a payload no exporter produced. These are worth pinning here because
+      // a malformed ask that got through would interrupt somebody to look at a
+      // record that cannot become one.
+      expect(
+        svc.requestCosign([synthetic],
+            record: 'guardian',
+            op: 'abolish',
+            polityDid: 'did:key:zTestPolity',
+            cid: 'b3:${'0' * 64}',
+            bytes: 'a1626f70'),
+        -1,
+        reason: 'an unknown op is refused by the shim, not carried',
+      );
+      expect(
+        svc.requestCosign([synthetic],
+            record: 'membership',
+            op: 'admit',
+            polityDid: 'did:key:zTestPolity',
+            cid: 'b3:${'0' * 64}',
+            bytes: 'not hex'),
+        -1,
+        reason: 'a payload that is not even hex is refused, not truncated',
+      );
+
       // Let a few poll ticks run (agora_events_poll over ffi). A single node has
       // no peers, so the roster stays empty.
       await Future<void>.delayed(const Duration(milliseconds: 600));

@@ -45,6 +45,24 @@ _Static_assert(AGORA_POST_BODY_MAX == AT_APP_POST_BODY_LEN,
                "AGORA_POST_BODY_MAX out of sync with AT_APP_POST_BODY_LEN");
 _Static_assert(AGORA_POST_ID_MAX == AT_APP_POST_ID_LEN,
                "AGORA_POST_ID_MAX out of sync with AT_APP_POST_ID_LEN");
+_Static_assert(AGORA_BUSINESS_BUNDLE_MAX == AT_APP_BUSINESS_BUNDLE_LEN,
+               "AGORA_BUSINESS_BUNDLE_MAX out of sync with AT_APP_BUSINESS_BUNDLE_LEN");
+_Static_assert(AGORA_BUSINESS_DID_MAX == AT_APP_BUSINESS_DID_LEN,
+               "AGORA_BUSINESS_DID_MAX out of sync with AT_APP_BUSINESS_DID_LEN");
+_Static_assert(AGORA_BUSINESS_AD_ID_MAX == AT_APP_BUSINESS_AD_ID_LEN,
+               "AGORA_BUSINESS_AD_ID_MAX out of sync with AT_APP_BUSINESS_AD_ID_LEN");
+_Static_assert(AGORA_BUSINESS_SAT_SELF == AT_APP_BUSINESS_SAT_SELF,
+               "AGORA_BUSINESS_SAT_SELF out of sync with AT_APP_BUSINESS_SAT_SELF");
+_Static_assert(AGORA_COSIGN_BYTES_MAX == AT_APP_COSIGN_BYTES_LEN,
+               "AGORA_COSIGN_BYTES_MAX out of sync with AT_APP_COSIGN_BYTES_LEN");
+_Static_assert(AGORA_COSIGN_DID_MAX == AT_APP_COSIGN_DID_LEN,
+               "AGORA_COSIGN_DID_MAX out of sync with AT_APP_COSIGN_DID_LEN");
+_Static_assert(AGORA_COSIGN_CID_MAX == AT_APP_COSIGN_CID_LEN,
+               "AGORA_COSIGN_CID_MAX out of sync with AT_APP_COSIGN_CID_LEN");
+_Static_assert(AGORA_COSIGN_SIG_MAX == AT_APP_COSIGN_SIG_LEN,
+               "AGORA_COSIGN_SIG_MAX out of sync with AT_APP_COSIGN_SIG_LEN");
+_Static_assert(AGORA_COSIGN_TOKEN_MAX == AT_APP_COSIGN_TOKEN_LEN,
+               "AGORA_COSIGN_TOKEN_MAX out of sync with AT_APP_COSIGN_TOKEN_LEN");
 /* ABI lockstep: the Dart AgoraEvent struct and the ctypes Ev in the cohort
  * tests (test/cohort/two_node_cohort.sh, two_node_gui.sh) all assert this exact
  * size. Growing agora_event_t REQUIRES bumping all three together. Grew from
@@ -56,7 +74,23 @@ _Static_assert(AGORA_POST_ID_MAX == AT_APP_POST_ID_LEN,
 /* Grew again from 8016 to 8024 with the in_group flag (a uint8 + tail padding
  * to the struct's 8-byte alignment) appended after reaction_ts; every prior
  * field offset is unchanged. */
-_Static_assert(sizeof(agora_event_t) == 8024,
+/* Grew again from 8024 to 11288 with the Phase 3 P3.2 business-ad tail
+ * (business_polity, business_ad_id, business_satisfaction, business_seq,
+ * business_ts, business_bundle) appended after proximity_band; every prior field
+ * offset is unchanged (in_group stays at 8016, proximity_band at 8020). The
+ * bundle dominates the growth: it is an opaque Ethne artifact (~2.4 KB at its
+ * Ethne-side bounds) that must cross whole, because only the APP can verify it. */
+/* Grew again from 11288 to 17872 with the Phase 3 P3.3 co-signing tail
+ * (cosign_record, cosign_op, cosign_polity, cosign_cid, cosign_signer_did,
+ * cosign_sig, cosign_seq, cosign_ts, cosign_bytes) appended after
+ * business_bundle; every prior field offset is unchanged (business_bundle stays
+ * at 8208). cosign_bytes dominates, for the same reason the bundle did: it is
+ * opaque Ethne canonical CBOR that must cross WHOLE. The signatures are over
+ * exactly those bytes, so a payload that arrives a byte short verifies against
+ * nothing at all — which is why the authoring side refuses an oversized exchange
+ * rather than letting anything truncate it. The bound is MEASURED; see
+ * AT_APP_COSIGN_BYTES_LEN in app_events.h. */
+_Static_assert(sizeof(agora_event_t) == 17872,
                "agora_event_t size changed — update the Dart struct and both "
                "cohort ctypes Ev asserts in lockstep");
 
@@ -134,6 +168,22 @@ int agora_request_proximity(void *handle, const char *send_queue,
                                            peer_uuid);
 }
 
+int agora_advertise_business(void *handle, const char *send_queue,
+                             const char *polity_did, const char *bundle,
+                             int64_t seq)
+{
+    return at_app_events_advertise_business((at_app_events_t *)handle,
+                                            send_queue, polity_did, bundle, seq);
+}
+
+int agora_set_customer(void *handle, const char *send_queue,
+                       const char *polity_did, int satisfaction,
+                       const char *bundle, int64_t seq)
+{
+    return at_app_events_set_customer((at_app_events_t *)handle, send_queue,
+                                      polity_did, satisfaction, bundle, seq);
+}
+
 int agora_set_exact_position(void *handle, const char *send_queue, int opt_in,
                              double lat, double lon)
 {
@@ -141,14 +191,40 @@ int agora_set_exact_position(void *handle, const char *send_queue, int opt_in,
                                             send_queue, opt_in != 0, lat, lon);
 }
 
+int agora_request_cosign(void *handle, const char *send_queue,
+                         const uint8_t *peer_uuids, int n_peers,
+                         const char *record, const char *op,
+                         const char *polity_did, const char *cid,
+                         const char *bytes)
+{
+    if (n_peers <= 0)
+        return -1;
+    return at_app_events_request_cosign((at_app_events_t *)handle, send_queue,
+                                        peer_uuids, (size_t)n_peers, record, op,
+                                        polity_did, cid, bytes);
+}
+
+int agora_return_cosign(void *handle, const char *send_queue,
+                        const uint8_t *peer_uuid, const char *cid,
+                        const char *signer_did, const char *sig_hex)
+{
+    return at_app_events_return_cosign((at_app_events_t *)handle, send_queue,
+                                       peer_uuid, cid, signer_did, sig_hex);
+}
+
 int agora_events_poll(void *handle, agora_event_t *out, int max)
 {
     if (handle == NULL || out == NULL || max <= 0)
         return 0;
 
-    /* Drain in fixed-size batches to keep the raw union buffer off the heap. */
-    at_app_event_t raw[64];
-    int want = max < 64 ? max : 64;
+    /* Drain in fixed-size batches to keep the raw union buffer off the heap.
+     * The batch SHRANK from 64 to 16 at P3.3: at_app_event_t's union now holds
+     * the co-signing request, whose opaque payload alone is 6 KB, so 64 slots
+     * would put ~420 KB on the stack of whatever thread Dart calls from. The
+     * buffer is what is bounded here, not the drain — a caller asking for more
+     * than one batch simply polls again. */
+    at_app_event_t raw[16];
+    int want = max < 16 ? max : 16;
 
     int n = at_app_events_poll((at_app_events_t *)handle, raw, (size_t)want);
     if (n <= 0)
@@ -263,6 +339,66 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             e->kind = AGORA_EVENT_PROXIMITY;
             memcpy(e->peer_uuid, raw[i].data.proximity.peer_uuid, AGORA_UUID_LEN);
             e->proximity_band = raw[i].data.proximity.band;
+            w++;
+            break;
+
+        case AT_APP_EVENT_COSIGN_REQUEST:
+            e->kind = AGORA_EVENT_COSIGN_REQUEST;
+            memcpy(e->peer_uuid, raw[i].data.cosign_request.requester_uuid,
+                   AGORA_UUID_LEN);
+            /* The core NUL-caps every string and the event was memset, so a
+             * short string stays terminated after the bounded copy. */
+            memcpy(e->cosign_record, raw[i].data.cosign_request.record,
+                   AGORA_COSIGN_TOKEN_MAX);
+            e->cosign_record[AGORA_COSIGN_TOKEN_MAX] = '\0';
+            memcpy(e->cosign_op, raw[i].data.cosign_request.op,
+                   AGORA_COSIGN_TOKEN_MAX);
+            e->cosign_op[AGORA_COSIGN_TOKEN_MAX] = '\0';
+            memcpy(e->cosign_polity, raw[i].data.cosign_request.polity,
+                   AGORA_COSIGN_DID_MAX);
+            e->cosign_polity[AGORA_COSIGN_DID_MAX] = '\0';
+            memcpy(e->cosign_cid, raw[i].data.cosign_request.cid,
+                   AGORA_COSIGN_CID_MAX);
+            e->cosign_cid[AGORA_COSIGN_CID_MAX] = '\0';
+            e->cosign_seq = raw[i].data.cosign_request.seq;
+            e->cosign_ts = raw[i].data.cosign_request.ts;
+            memcpy(e->cosign_bytes, raw[i].data.cosign_request.bytes,
+                   AGORA_COSIGN_BYTES_MAX);
+            e->cosign_bytes[AGORA_COSIGN_BYTES_MAX] = '\0';
+            break;
+        case AT_APP_EVENT_COSIGN_SIGNATURE:
+            e->kind = AGORA_EVENT_COSIGN_SIGNATURE;
+            memcpy(e->peer_uuid, raw[i].data.cosign_sig.signer_uuid,
+                   AGORA_UUID_LEN);
+            memcpy(e->cosign_cid, raw[i].data.cosign_sig.cid, AGORA_COSIGN_CID_MAX);
+            e->cosign_cid[AGORA_COSIGN_CID_MAX] = '\0';
+            memcpy(e->cosign_signer_did, raw[i].data.cosign_sig.signer_did,
+                   AGORA_COSIGN_DID_MAX);
+            e->cosign_signer_did[AGORA_COSIGN_DID_MAX] = '\0';
+            memcpy(e->cosign_sig, raw[i].data.cosign_sig.sig, AGORA_COSIGN_SIG_MAX);
+            e->cosign_sig[AGORA_COSIGN_SIG_MAX] = '\0';
+            e->cosign_seq = raw[i].data.cosign_sig.seq;
+            e->cosign_ts = raw[i].data.cosign_sig.ts;
+            break;
+        case AT_APP_EVENT_BUSINESS_AD:
+            e->kind = AGORA_EVENT_BUSINESS_AD;
+            memcpy(e->peer_uuid, raw[i].data.business_ad.advertiser_uuid,
+                   AGORA_UUID_LEN);
+            /* raw strings are already NUL-bounded by AT; copy and re-terminate.
+             * The bundle crosses UNVERIFIED by design — the core holds no Ethne,
+             * so the Dart side runs the self-contained verifier on it. */
+            memcpy(e->business_polity, raw[i].data.business_ad.polity,
+                   AGORA_BUSINESS_DID_MAX);
+            e->business_polity[AGORA_BUSINESS_DID_MAX] = '\0';
+            memcpy(e->business_ad_id, raw[i].data.business_ad.ad_id,
+                   AGORA_BUSINESS_AD_ID_MAX);
+            e->business_ad_id[AGORA_BUSINESS_AD_ID_MAX] = '\0';
+            e->business_satisfaction = raw[i].data.business_ad.satisfaction;
+            e->business_seq = raw[i].data.business_ad.seq;
+            e->business_ts = raw[i].data.business_ad.ts;
+            memcpy(e->business_bundle, raw[i].data.business_ad.bundle,
+                   AGORA_BUSINESS_BUNDLE_MAX);
+            e->business_bundle[AGORA_BUSINESS_BUNDLE_MAX] = '\0';
             w++;
             break;
 

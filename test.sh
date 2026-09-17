@@ -39,6 +39,15 @@ else
   echo "==> Native layer not built (run ./build.sh) — integration test will skip"
 fi
 
+# The Ethne polity cdylib (businesses = Ethne polities, Phase 3) is independent
+# of the AT native layer; wire it whenever it is built, else that test skips.
+if [ -f "$NATIVE/libethne_agora.so" ]; then
+  export AGORA_ETHNE_PATH="$NATIVE/libethne_agora.so"
+  echo "==> Ethne cdylib found — polity round-trip test ENABLED"
+else
+  echo "==> Ethne cdylib not built (run ./build.sh) — polity test will skip"
+fi
+
 # --- locate flutter ----------------------------------------------------------
 if ! command -v flutter >/dev/null 2>&1; then
   if [ -x /opt/flutter/bin/flutter ]; then

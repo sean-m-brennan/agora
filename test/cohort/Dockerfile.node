@@ -1,0 +1,14 @@
+# Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors. Apache-2.0.
+#
+# Runtime image for one agorad node in the docker backend of the cohort scripts.
+# It carries NO build of its own: the host's native/build is bind-mounted in, so
+# the binaries under test are exactly the ones ./build.sh produced. The base must
+# match the host's Ubuntu release, or the host-built agorad will not load.
+FROM ubuntu:26.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 \
+        libsodium23 libjansson4 libprotobuf-c1 libprotobuf32t64 libuuid1 \
+        zlib1g libstdc++6 \
+        iproute2 iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+CMD ["sleep", "infinity"]

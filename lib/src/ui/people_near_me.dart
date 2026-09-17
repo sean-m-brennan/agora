@@ -13,6 +13,7 @@ import '../node/peer_stream.dart';
 import '../ffi/at_peer.dart';
 import '../model/attention_budget.dart';
 import '../model/tie_strength.dart';
+import 'businesses_near_me.dart';
 import 'circles_view.dart';
 import 'dm_thread.dart';
 import 'feed_view.dart';
@@ -76,6 +77,16 @@ class _PeopleNearMePageState extends State<PeopleNearMePage> {
             onPressed: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
                 builder: (_) => FeedPage(service: service),
+              ),
+            ),
+          ),
+          IconButton(
+            key: const Key('open-businesses'),
+            icon: const Icon(Icons.storefront_outlined),
+            tooltip: 'Businesses near me',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => BusinessesNearMePage(service: service),
               ),
             ),
           ),

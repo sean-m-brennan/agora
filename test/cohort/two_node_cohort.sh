@@ -209,6 +209,9 @@ shim, root, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
 expect_pos = sys.argv[4] if len(sys.argv) > 4 else ""
 
 UUID, KEY, GEO, PROF, DM, PID, PBODY = 16, 32, 12, 2560, 1024, 64, 4096
+BDID, BADID, BBUN = 95, 64, 3072
+# Co-signing bounds (Phase 3 P3.3): AGORA_COSIGN_{BYTES,DID,CID,SIG,TOKEN}_MAX
+CBYT, CDID, CCID, CSIG, CTOK = 6144, 95, 67, 128, 15
 class Ev(ctypes.Structure):
     _fields_ = [
         ("kind", ctypes.c_int32),
@@ -237,14 +240,35 @@ class Ev(ctypes.Structure):
         ("reaction_ts", ctypes.c_double),
         ("in_group", ctypes.c_uint8),  # AGORA_EVENT_PEER
         ("proximity_band", ctypes.c_int32),  # AGORA_EVENT_PROXIMITY, appended LAST (reuses tail padding)
+        # AGORA_EVENT_BUSINESS_AD (Phase 3 P3.2), appended LAST. business_bundle
+        # is the OPAQUE Ethne page artifact — the core does not verify it.
+        ("business_polity", ctypes.c_char * (BDID + 1)),
+        ("business_ad_id", ctypes.c_char * (BADID + 1)),
+        ("business_satisfaction", ctypes.c_int32),
+        ("business_seq", ctypes.c_int64),
+        ("business_ts", ctypes.c_double),
+        ("business_bundle", ctypes.c_char * (BBUN + 1)),
+        # AGORA_EVENT_COSIGN_REQUEST / _SIGNATURE (Phase 3 P3.3), appended LAST.
+        # cosign_bytes is the OPAQUE exported Ethne payload — the core does not
+        # verify it, and no description crosses (the signer derives it).
+        ("cosign_record", ctypes.c_char * (CTOK + 1)),
+        ("cosign_op", ctypes.c_char * (CTOK + 1)),
+        ("cosign_polity", ctypes.c_char * (CDID + 1)),
+        ("cosign_cid", ctypes.c_char * (CCID + 1)),
+        ("cosign_signer_did", ctypes.c_char * (CDID + 1)),
+        ("cosign_sig", ctypes.c_char * (CSIG + 1)),
+        ("cosign_seq", ctypes.c_int64),
+        ("cosign_ts", ctypes.c_double),
+        ("cosign_bytes", ctypes.c_char * (CBYT + 1)),
     ]
-# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (8024 with
-# the geohash + profile_json + connection_state + DM + POST + REACTION + in_group tail;
-# rtt@116, geohash@120, profile_json@133, connection_state@2696, dm_seq@2704, post_id@3745,
-# post_seq@3752, reaction tail after post_body, in_group after reaction_ts + tail padding).
-# If the C struct grows and this is not updated in lockstep, poll() would misread every
-# field past the drift.
-assert ctypes.sizeof(Ev) == 8024, f"Ev size {ctypes.sizeof(Ev)} != 8024 (ABI drift)"
+# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (17872 with
+# the geohash + profile_json + connection_state + DM + POST + REACTION + in_group +
+# proximity_band + BUSINESS_AD tail; rtt@116, geohash@120, profile_json@133,
+# connection_state@2696, dm_seq@2704, post_id@3745, post_seq@3752, reaction tail after
+# post_body, in_group@8016 + proximity_band@8020 in the tail padding, business tail
+# from 8024, co-signing tail from 11288). If the C struct grows and this is not updated in lockstep, poll() would
+# misread every field past the drift.
+assert ctypes.sizeof(Ev) == 17872, f"Ev size {ctypes.sizeof(Ev)} != 17872 (ABI drift)"
 
 lib = ctypes.CDLL(shim)
 lib.agora_set_root.argtypes = [ctypes.c_char_p]; lib.agora_set_root.restype = None

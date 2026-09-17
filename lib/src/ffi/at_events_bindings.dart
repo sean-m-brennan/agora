@@ -25,6 +25,38 @@ const int agoraPostBodyMax = 4096;
 // must match AGORA_POST_ID_MAX (at_agora_shim.h)
 const int agoraPostIdMax = 64;
 
+/// Max opaque Ethne page-bundle length on a business ad (must match
+/// AGORA_BUSINESS_BUNDLE_MAX in at_agora_shim.h).
+const int agoraBusinessBundleMax = 3072;
+
+/// Max polity DID length (must match AGORA_BUSINESS_DID_MAX).
+const int agoraBusinessDidMax = 95;
+
+/// Business-ad content-id length (must match AGORA_BUSINESS_AD_ID_MAX).
+const int agoraBusinessAdIdMax = 64;
+
+/// Satisfaction marker for a business advertising its OWN page rather than a
+/// customer rating it (must match AGORA_BUSINESS_SAT_SELF).
+const int agoraBusinessSatSelf = 0xFF;
+
+/// Max hex characters of a detached exchange's exported canonical bytes, Phase 3
+/// P3.3 (must match AGORA_COSIGN_BYTES_MAX in at_agora_shim.h, and the same
+/// bound in app_events.h, msg_types.h, cosign.h and ethne_ffi). MEASURED against
+/// real exchanges: the evidence carried by a guardian change is what grows it.
+const int agoraCosignBytesMax = 6144;
+
+/// Max polity DID or signer did:key length (must match AGORA_COSIGN_DID_MAX).
+const int agoraCosignDidMax = 95;
+
+/// Exchange content id, `b3:` + 64 hex (must match AGORA_COSIGN_CID_MAX).
+const int agoraCosignCidMax = 67;
+
+/// Detached Ed25519 signature as lowercase hex (must match AGORA_COSIGN_SIG_MAX).
+const int agoraCosignSigMax = 128;
+
+/// Record-class or op token (must match AGORA_COSIGN_TOKEN_MAX).
+const int agoraCosignTokenMax = 15;
+
 const int agoraEventPeer = 1;
 const int agoraEventReputation = 2;
 const int agoraEventRtt = 3;
@@ -36,6 +68,21 @@ const int agoraEventDm = 8;
 const int agoraEventPost = 9;
 const int agoraEventReaction = 10;
 const int agoraEventProximity = 11;
+
+/// Phase 3 P3.2 — a signed business ad: one opaque, self-verifying Ethne page
+/// bundle plus the advertiser's satisfaction. The advertiser is the business
+/// itself or a CUSTOMER re-advertising in the first person.
+const int agoraEventBusinessAd = 12;
+
+/// Phase 3 P3.3 — a peer asks THIS node to co-sign one staff-roll or
+/// guardianship record. The keys never travel; the record's exported bytes do.
+/// What those bytes commit to, in words, is NOT carried — derive it here.
+const int agoraEventCosignRequest = 13;
+
+/// Phase 3 P3.3 — a signer returns their detached signature over an exchange
+/// THIS node is authoring. Verify it against the payload before appending; the
+/// core neither did nor could.
+const int agoraEventCosignSignature = 14;
 
 /// dart:ffi mirror of `agora_event_t` (native/at_agora_shim.h). Field order and
 /// element counts MUST match the C struct exactly — the layout is the ABI
@@ -146,17 +193,85 @@ final class AgoraEvent extends Struct {
 
   /// AGORA_EVENT_PEER: 1 iff this peer shares OUR group (its address is in our
   /// group's address_map). Appended LAST after reactionTs so every prior field
-  /// offset is unchanged; the C `agora_event_t` and the cohort ctypes Ev mirror
-  /// this order and total size (8024) exactly.
+  /// offset is unchanged (it sits at offset 8016); the C `agora_event_t` and the
+  /// cohort ctypes Ev mirror this order and the total size exactly.
   @Uint8()
   external int inGroup;
 
   /// AGORA_EVENT_PROXIMITY: coarse distance band to a CONNECTED peer (0 unknown,
-  /// 1 near, 2 mid, 3 far). Appended LAST after inGroup (Phase 2); it occupies
-  /// the struct's former tail padding, so the total size stays 8024 and every
-  /// prior offset is unchanged. No coordinates cross this boundary.
+  /// 1 near, 2 mid, 3 far). Appended after inGroup (Phase 2) at offset 8020; it
+  /// occupies the struct's former tail padding, so it cost no size at the time
+  /// and every prior offset is unchanged. No coordinates cross this boundary.
   @Int32()
   external int proximityBand;
+
+  /// A signed business ad (Phase 3 P3.2). Appended LAST after [proximityBand] to
+  /// mirror the C `agora_event_t`, which grew from 8024 to 11288 bytes; every
+  /// prior field offset is unchanged. Only meaningful when [kind] ==
+  /// [agoraEventBusinessAd]: [peerUuid] carries the SIGNATURE-BOUND advertiser —
+  /// the business itself, or a customer re-advertising in the first person.
+  ///
+  /// [businessBundle] is OPAQUE and NOT verified by the core (it holds no
+  /// Ethne): the Dart side must run the self-contained bundle verifier on it
+  /// before trusting the page. What the core DID verify is the ad signature.
+  @Array(agoraBusinessDidMax + 1)
+  external Array<Uint8> businessPolity;
+
+  @Array(agoraBusinessAdIdMax + 1)
+  external Array<Uint8> businessAdId;
+
+  @Int32()
+  external int businessSatisfaction;
+
+  @Int64()
+  external int businessSeq;
+
+  @Double()
+  external double businessTs;
+
+  @Array(agoraBusinessBundleMax + 1)
+  external Array<Uint8> businessBundle;
+
+  /// The detached co-signing exchange (Phase 3 P3.3). Appended LAST after
+  /// [businessBundle] to mirror the C `agora_event_t`, which grew from 11288 to
+  /// 17872 bytes; every prior field offset is unchanged (businessBundle stays at
+  /// 8208). Meaningful when [kind] is [agoraEventCosignRequest] (where
+  /// [peerUuid] is the REQUESTER) or [agoraEventCosignSignature] (where it is
+  /// the SIGNER); crypto_box authenticated either way.
+  ///
+  /// [cosignBytes] is OPAQUE and NOT verified by the core, exactly like
+  /// [businessBundle]. Derive what it commits to HERE, with `ethne_describe`
+  /// over these same bytes, and show the operator that. No description crosses
+  /// this boundary on purpose: if the asking node supplied the wording as well
+  /// as the payload, it would choose both what you sign and what you are told
+  /// you are signing. Recompute [cosignCid] from the bytes while you are there —
+  /// it is carried for reference, never as proof.
+  @Array(agoraCosignTokenMax + 1)
+  external Array<Uint8> cosignRecord;
+
+  @Array(agoraCosignTokenMax + 1)
+  external Array<Uint8> cosignOp;
+
+  @Array(agoraCosignDidMax + 1)
+  external Array<Uint8> cosignPolity;
+
+  @Array(agoraCosignCidMax + 1)
+  external Array<Uint8> cosignCid;
+
+  @Array(agoraCosignDidMax + 1)
+  external Array<Uint8> cosignSignerDid;
+
+  @Array(agoraCosignSigMax + 1)
+  external Array<Uint8> cosignSig;
+
+  @Int64()
+  external int cosignSeq;
+
+  @Double()
+  external double cosignTs;
+
+  @Array(agoraCosignBytesMax + 1)
+  external Array<Uint8> cosignBytes;
 }
 
 /// A pure-Dart copy of one decoded event. Decoupled from native memory so it
@@ -189,6 +304,21 @@ class AtRawEvent {
     this.reactionTs = 0,
     this.inGroup = false,
     this.proximityBand = 0,
+    this.businessPolity = '',
+    this.businessAdId = '',
+    this.businessSatisfaction = 0,
+    this.businessSeq = 0,
+    this.businessTs = 0,
+    this.businessBundle = '',
+    this.cosignRecord = '',
+    this.cosignOp = '',
+    this.cosignPolity = '',
+    this.cosignCid = '',
+    this.cosignSignerDid = '',
+    this.cosignSig = '',
+    this.cosignSeq = 0,
+    this.cosignTs = 0,
+    this.cosignBytes = '',
   });
 
   final int kind;
@@ -254,6 +384,56 @@ class AtRawEvent {
   /// 0 unknown, 1 near (~1km), 2 mid (~5km), 3 far. Set only for
   /// [agoraEventProximity] events; no coordinates are ever carried.
   final int proximityBand;
+
+  /// A signed business ad (Phase 3 P3.2). Set only for [agoraEventBusinessAd]
+  /// events: [uuid] is the SIGNATURE-BOUND advertiser — the business itself or a
+  /// CUSTOMER speaking for it in the first person, since an ad is never relayed.
+  /// [businessPolity] is the business's Ethne DID (the directory key),
+  /// [businessAdId] the blake2b content-address (dedup key),
+  /// [businessSatisfaction] the advertiser's 0..4 rating or
+  /// [agoraBusinessSatSelf] for the business's own ad, [businessSeq] the page
+  /// version, [businessTs] the advertiser's send time.
+  ///
+  /// [businessBundle] is the OPAQUE Ethne page artifact, UNVERIFIED at this
+  /// boundary — the core verified only that this advertiser signed these exact
+  /// bytes. Run the self-contained bundle verifier (polity root -> envoy -> page)
+  /// before showing or trusting the page.
+  final String businessPolity;
+  final String businessAdId;
+  final int businessSatisfaction;
+  final int businessSeq;
+  final double businessTs;
+  final String businessBundle;
+
+  /// A detached co-signing exchange (Phase 3 P3.3). Set for
+  /// [agoraEventCosignRequest], where [uuid] is the REQUESTER, and for
+  /// [agoraEventCosignSignature], where it is the SIGNER; crypto_box
+  /// authenticated either way, so neither can be put in somebody else's mouth.
+  ///
+  /// On a request: [cosignRecord] is `membership` or `guardian`, [cosignOp] the
+  /// act within it, [cosignPolity] the Ethne DID, [cosignCid] the exchange's
+  /// content address and [cosignBytes] the exported canonical CBOR as hex.
+  ///
+  /// [cosignBytes] is OPAQUE and UNVERIFIED at this boundary — the core holds no
+  /// Ethne. Derive what it commits to here (`ethne_describe` over these bytes)
+  /// and show the operator THAT, never a wording supplied by whoever is asking.
+  /// No description is carried, on purpose. Recompute [cosignCid] from the bytes
+  /// too: it is carried for reference, never as proof.
+  ///
+  /// On a signature: [cosignSignerDid] is the signing did:key, which embeds the
+  /// public key (so no registry is needed), and [cosignSig] the detached Ed25519
+  /// signature over the exported bytes. The core did not check it and could not —
+  /// it does not hold the payload. The assembling node does, and refuses a wrong
+  /// key or a tampered payload there.
+  final String cosignRecord;
+  final String cosignOp;
+  final String cosignPolity;
+  final String cosignCid;
+  final String cosignSignerDid;
+  final String cosignSig;
+  final int cosignSeq;
+  final double cosignTs;
+  final String cosignBytes;
 }
 
 typedef _SetRootC = Void Function(Pointer<Utf8>);
@@ -294,6 +474,18 @@ typedef _ReactC = Int32 Function(
 typedef _ReactDart = int Function(
     Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Pointer<Utf8>);
 
+typedef _RequestCosignC = Int32 Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Uint8>, Int32, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>,
+    Pointer<Utf8>, Pointer<Utf8>);
+typedef _RequestCosignDart = int Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Uint8>, int, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>,
+    Pointer<Utf8>, Pointer<Utf8>);
+
+typedef _ReturnCosignC = Int32 Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Uint8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _ReturnCosignDart = int Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Uint8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+
 typedef _BlockC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
 typedef _BlockDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
 
@@ -307,6 +499,16 @@ typedef _SetExactC = Int32 Function(
     Pointer<Void>, Pointer<Utf8>, Int32, Double, Double);
 typedef _SetExactDart = int Function(
     Pointer<Void>, Pointer<Utf8>, int, double, double);
+
+typedef _AdvertiseBusinessC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Int64);
+typedef _AdvertiseBusinessDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, int);
+
+typedef _SetCustomerC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Int32, Pointer<Utf8>, Int64);
+typedef _SetCustomerDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, int, Pointer<Utf8>, int);
 
 typedef _PollC = Int32 Function(Pointer<Void>, Pointer<AgoraEvent>, Int32);
 typedef _PollDart = int Function(Pointer<Void>, Pointer<AgoraEvent>, int);
@@ -400,6 +602,44 @@ String _postBodyString(Array<Uint8> src) {
   return utf8.decode(bytes, allowMalformed: true);
 }
 
+/// Decode a NUL-terminated polity DID from the fixed byte array.
+String _businessDidString(Array<Uint8> src) {
+  final bytes = <int>[];
+  for (var i = 0; i < agoraBusinessDidMax; i++) {
+    final b = src[i];
+    if (b == 0) break;
+    bytes.add(b);
+  }
+  if (bytes.isEmpty) return '';
+  return utf8.decode(bytes, allowMalformed: true);
+}
+
+/// Decode a NUL-terminated fixed byte array of at most [max] bytes. Used for the
+/// co-signing fields, which differ only in width.
+String _boundedString(Array<Uint8> src, int max) {
+  final bytes = <int>[];
+  for (var i = 0; i < max; i++) {
+    final b = src[i];
+    if (b == 0) break;
+    bytes.add(b);
+  }
+  if (bytes.isEmpty) return '';
+  return utf8.decode(bytes, allowMalformed: true);
+}
+
+/// Decode the NUL-terminated opaque Ethne page bundle from the fixed byte array.
+/// The bytes are UNVERIFIED here — see [AtRawEvent.businessBundle].
+String _businessBundleString(Array<Uint8> src) {
+  final bytes = <int>[];
+  for (var i = 0; i < agoraBusinessBundleMax; i++) {
+    final b = src[i];
+    if (b == 0) break;
+    bytes.add(b);
+  }
+  if (bytes.isEmpty) return '';
+  return utf8.decode(bytes, allowMalformed: true);
+}
+
 /// Thin, fork-free client over the AutonomousTrust app-events queue.
 class AtEvents {
   AtEvents._(this._handle);
@@ -429,12 +669,21 @@ class AtEvents {
       _lib.lookupFunction<_ReactC, _ReactDart>('agora_react_post');
   static final _BlockDart _block =
       _lib.lookupFunction<_BlockC, _BlockDart>('agora_block');
+  static final _RequestCosignDart _requestCosign = _lib
+      .lookupFunction<_RequestCosignC, _RequestCosignDart>('agora_request_cosign');
+  static final _ReturnCosignDart _returnCosign = _lib
+      .lookupFunction<_ReturnCosignC, _ReturnCosignDart>('agora_return_cosign');
   static final _AttendDart _requestAttend =
       _lib.lookupFunction<_AttendC, _AttendDart>('agora_request_attend');
   static final _ProxDart _requestProximity =
       _lib.lookupFunction<_ProxC, _ProxDart>('agora_request_proximity');
   static final _SetExactDart _setExactPosition = _lib
       .lookupFunction<_SetExactC, _SetExactDart>('agora_set_exact_position');
+  static final _AdvertiseBusinessDart _advertiseBusiness =
+      _lib.lookupFunction<_AdvertiseBusinessC, _AdvertiseBusinessDart>(
+          'agora_advertise_business');
+  static final _SetCustomerDart _setCustomer = _lib
+      .lookupFunction<_SetCustomerC, _SetCustomerDart>('agora_set_customer');
   static final _PollDart _poll =
       _lib.lookupFunction<_PollC, _PollDart>('agora_events_poll');
   static final _CloseDart _close =
@@ -564,6 +813,87 @@ class AtEvents {
     }
   }
 
+  /// Ask each peer in [peerUuids] (16 raw identity bytes apiece) to co-sign one
+  /// staff-roll or guardianship record (Phase 3 P3.3).
+  ///
+  /// [record] is `membership` or `guardian` and [op] the act within it;
+  /// [cid] and [bytes] are the exchange exactly as Ethne exported it. No private
+  /// key travels — that is the point of sending the record instead of gathering
+  /// the keys. [bytes] must be passed through UNCHANGED: the signatures are over
+  /// exactly these bytes, so anything that truncates or re-encodes them produces
+  /// signatures over nothing. An unknown op or non-hex payload is refused by the
+  /// core rather than carried.
+  ///
+  /// There is deliberately no description parameter. Each signer's own node
+  /// derives what the bytes commit to; a wording chosen by the asking node is
+  /// how somebody comes to sign something other than what they were shown.
+  ///
+  /// Returns 0 on success, negative on error (-2 == daemon not ready yet).
+  int requestCosign(
+    String sendQueue,
+    List<List<int>> peerUuids, {
+    required String record,
+    required String op,
+    required String polityDid,
+    required String cid,
+    required String bytes,
+  }) {
+    if (peerUuids.isEmpty) return -1;
+    final q = sendQueue.toNativeUtf8();
+    final r = record.toNativeUtf8();
+    final o = op.toNativeUtf8();
+    final p = polityDid.toNativeUtf8();
+    final c = cid.toNativeUtf8();
+    final b = bytes.toNativeUtf8();
+    final u = calloc<Uint8>(agoraUuidLen * peerUuids.length);
+    try {
+      for (var n = 0; n < peerUuids.length; n++) {
+        for (var i = 0; i < agoraUuidLen && i < peerUuids[n].length; i++) {
+          u[n * agoraUuidLen + i] = peerUuids[n][i];
+        }
+      }
+      return _requestCosign(_handle, q, u, peerUuids.length, r, o, p, c, b);
+    } finally {
+      calloc.free(q);
+      calloc.free(r);
+      calloc.free(o);
+      calloc.free(p);
+      calloc.free(c);
+      calloc.free(b);
+      calloc.free(u);
+    }
+  }
+
+  /// Return this node's detached signature to the peer authoring an exchange
+  /// (Phase 3 P3.3). [peerUuid] is the requester's 16 raw identity bytes, [cid]
+  /// names the exchange, [signerDid] is this signer's did:key and [sigHex] the
+  /// detached Ed25519 signature over the exported bytes.
+  ///
+  /// Sign only after deriving, on THIS node, what those bytes actually commit
+  /// to. Returns 0 on success, negative on error (-2 == daemon not ready yet).
+  int returnCosign(String sendQueue, List<int> peerUuid,
+      {required String cid,
+      required String signerDid,
+      required String sigHex}) {
+    final q = sendQueue.toNativeUtf8();
+    final c = cid.toNativeUtf8();
+    final d = signerDid.toNativeUtf8();
+    final g = sigHex.toNativeUtf8();
+    final u = calloc<Uint8>(agoraUuidLen);
+    try {
+      for (var i = 0; i < agoraUuidLen && i < peerUuid.length; i++) {
+        u[i] = peerUuid[i];
+      }
+      return _returnCosign(_handle, q, u, c, d, g);
+    } finally {
+      calloc.free(q);
+      calloc.free(c);
+      calloc.free(d);
+      calloc.free(g);
+      calloc.free(u);
+    }
+  }
+
   /// Publish a feed post to the local group (Increment 7). [requiredTier] is the
   /// audience floor (0..4). The core signs the post, group-encrypts it and
   /// multicasts it; it does NOT echo it back — the app echoes locally. Returns 0
@@ -670,6 +1000,54 @@ class AtEvents {
     }
   }
 
+  /// Publish THIS node's own business page (Phase 3 P3.2). [polityDid] is the
+  /// business's Ethne DID, [bundle] the opaque self-verifying page artifact
+  /// (built app-side through Ethne — the core never parses it), [seq] its
+  /// version. Returns 0 on success, negative on error (-2 == daemon not ready).
+  ///
+  /// This call reaches one group. The page travels further only as CUSTOMERS
+  /// re-advertise it ([setCustomer]) — a business cannot buy reach it has not
+  /// earned.
+  int advertiseBusiness(String sendQueue, String polityDid, String bundle,
+      {int seq = 0}) {
+    final q = sendQueue.toNativeUtf8();
+    final d = polityDid.toNativeUtf8();
+    final b = bundle.toNativeUtf8();
+    try {
+      return _advertiseBusiness(_handle, q, d, b, seq);
+    } finally {
+      calloc.free(q);
+      calloc.free(d);
+      calloc.free(b);
+    }
+  }
+
+  /// Declare, update or clear THIS node's CUSTOMER edge to a business (Phase 3
+  /// P3.2). The edge is what authorizes this node to CARRY the page: the core
+  /// caches [bundle] and advertises it in the FIRST PERSON with [satisfaction]
+  /// (0..4), and re-advertises whenever a fresh ad for that business arrives.
+  ///
+  /// Pass a NEGATIVE [satisfaction] to clear the edge. That is how an unhappy
+  /// customer withdraws: this node goes quiet about the business. Nothing
+  /// negative is ever published, so there is nothing to brigade with.
+  ///
+  /// Pass an empty [bundle] to carry the page this node already learned — so a
+  /// person can become a customer straight from a page that reached them through
+  /// someone else. Returns 0 on success, negative on error (-2 == not ready).
+  int setCustomer(String sendQueue, String polityDid,
+      {required int satisfaction, String bundle = '', int seq = 0}) {
+    final q = sendQueue.toNativeUtf8();
+    final d = polityDid.toNativeUtf8();
+    final b = bundle.toNativeUtf8();
+    try {
+      return _setCustomer(_handle, q, d, satisfaction, b, seq);
+    } finally {
+      calloc.free(q);
+      calloc.free(d);
+      calloc.free(b);
+    }
+  }
+
   /// Non-blocking drain. Returns decoded events (possibly empty). Copies out of
   /// native memory before freeing the buffer, so the results are safe to keep.
   List<AtRawEvent> poll({int max = 64}) {
@@ -706,6 +1084,22 @@ class AtEvents {
           reactionTs: e.reactionTs,
           inGroup: e.inGroup != 0,
           proximityBand: e.proximityBand,
+          businessPolity: _businessDidString(e.businessPolity),
+          businessAdId: _postIdString(e.businessAdId),
+          businessSatisfaction: e.businessSatisfaction,
+          businessSeq: e.businessSeq,
+          businessTs: e.businessTs,
+          businessBundle: _businessBundleString(e.businessBundle),
+          cosignRecord: _boundedString(e.cosignRecord, agoraCosignTokenMax),
+          cosignOp: _boundedString(e.cosignOp, agoraCosignTokenMax),
+          cosignPolity: _boundedString(e.cosignPolity, agoraCosignDidMax),
+          cosignCid: _boundedString(e.cosignCid, agoraCosignCidMax),
+          cosignSignerDid:
+              _boundedString(e.cosignSignerDid, agoraCosignDidMax),
+          cosignSig: _boundedString(e.cosignSig, agoraCosignSigMax),
+          cosignSeq: e.cosignSeq,
+          cosignTs: e.cosignTs,
+          cosignBytes: _boundedString(e.cosignBytes, agoraCosignBytesMax),
         );
       }, growable: false);
     } finally {

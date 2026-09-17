@@ -134,3 +134,36 @@ set_target_properties(agorad PROPERTIES
 set_target_properties(agora_shim agorad PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "$ORIGIN;${CMAKE_CURRENT_BINARY_DIR}/at_core")
+
+# --- Ethne C-FFI cdylib (Phase 3: businesses = Ethne polities) ---------------
+# ethne_ffi/ is a Rust cdylib exposing a C ABI over Ethne's Rust charter engine
+# (SOCIAL_APP_PLAN.md §2.2). Built by cargo, not the C toolchain, and dropped
+# next to agora_shim so the Flutter app dlopen's it the same way (it is
+# self-contained — Rust std is linked in, so no rpath is needed).
+#
+# The cargo TARGET dir is forced onto a non-virtiofs path: rustc/LLVM's archive
+# writes SIGBUS ("Bad address") on the shared fuse filesystem this tree lives on
+# (the same corruption AT's C build sidesteps). Override with -DETHNE_FFI_TARGET_DIR.
+find_program(CARGO_EXECUTABLE cargo
+    HINTS "$ENV{HOME}/.cargo/bin" "$ENV{CARGO_HOME}/bin")
+if(NOT CARGO_EXECUTABLE)
+    message(WARNING "cargo not found; the ethne_ffi (business/polity) library "
+                    "will NOT be built. Install Rust (rustup) and reconfigure.")
+else()
+    set(ETHNE_FFI_TARGET_DIR "/tmp/agora-ethne-ffi-target"
+        CACHE PATH "cargo target dir for ethne_ffi (keep off virtiofs)")
+    set(ETHNE_FFI_SO "${CMAKE_CURRENT_BINARY_DIR}/libethne_agora.so")
+    add_custom_command(
+        OUTPUT "${ETHNE_FFI_SO}"
+        COMMAND ${CMAKE_COMMAND} -E env
+                "CARGO_TARGET_DIR=${ETHNE_FFI_TARGET_DIR}"
+                ${CARGO_EXECUTABLE} build --release
+                --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/ethne_ffi/Cargo.toml"
+        COMMAND ${CMAKE_COMMAND} -E copy
+                "${ETHNE_FFI_TARGET_DIR}/release/libethne_agora.so" "${ETHNE_FFI_SO}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/ethne_ffi/src/lib.rs"
+                "${CMAKE_CURRENT_SOURCE_DIR}/ethne_ffi/Cargo.toml"
+        COMMENT "Building ethne_ffi cdylib (cargo, target on ${ETHNE_FFI_TARGET_DIR})"
+        VERBATIM)
+    add_custom_target(ethne_ffi ALL DEPENDS "${ETHNE_FFI_SO}")
+endif()

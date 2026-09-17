@@ -12,7 +12,10 @@ import 'package:flutter/foundation.dart';
 
 import '../ffi/at_events_bindings.dart';
 import '../ffi/at_peer.dart';
+import '../ffi/ethne_bindings.dart';
 import '../model/attention_budget.dart';
+import '../model/business.dart';
+import '../model/business_directory.dart';
 import '../model/dm.dart';
 import '../model/feed_store.dart';
 import '../model/post.dart';
@@ -24,7 +27,13 @@ class PeerService extends ChangeNotifier {
   PeerService({
     AgoraDaemon? daemon,
     this.pollInterval = const Duration(milliseconds: 300),
-  }) : _daemon = daemon ?? _defaultDaemon();
+    @visibleForTesting BundleVerifier? bundleVerifier,
+  })  : _daemon = daemon ?? _defaultDaemon(),
+        _bundleVerifierOverride = bundleVerifier;
+
+  /// Test-only stand-in for the Ethne bundle verifier. Null in the app, where
+  /// the real cdylib does the proving.
+  final BundleVerifier? _bundleVerifierOverride;
 
   /// Build the default daemon. When $AGORA_EXTERNAL_DAEMON is set (to a non-empty
   /// value other than "0"/"false"), attach to an already-running `agorad` under
@@ -105,6 +114,28 @@ class PeerService extends ChangeNotifier {
   /// them). Deduped by post content id, ranked by S × recency (the Inc-4 kernel).
   /// A live stream, not roster state.
   final FeedStore _feed = FeedStore();
+
+  /// The businesses this node has learned about (Phase 3 P3.2). Ads arrive via
+  /// ingestEvents (AT_APP_EVENT_BUSINESS_AD), already signature-verified and
+  /// content-id-deduped by the core — but the core does NOT verify the Ethne
+  /// page bundle it carried, so the directory does that here before storing
+  /// anything. Ranked distance → vouch → recency. A live stream, not roster
+  /// state.
+  late final BusinessDirectory _businesses =
+      BusinessDirectory(verifyBundle: _verifyBusinessBundle);
+
+  /// The Ethne cdylib, opened lazily on the first bundle we are asked to verify.
+  /// Absent when the library was not built or found — see
+  /// [businessesUnverified].
+  EthneFfi? _ethne;
+  bool _ethneTried = false;
+
+  /// THIS node's own customer edges: polity DID → declared satisfaction (0..4).
+  /// The core holds the authoritative edge (it is what authorizes us to carry a
+  /// page) and never echoes it back, so the operator's own rating is mirrored
+  /// here for display. Clearing an edge removes the entry — nothing negative is
+  /// ever recorded, here or on the wire.
+  final Map<String, int> _customerSatisfaction = {};
 
   /// Reaction tallies for OUR posts (Increment 8), keyed by post content id.
   /// A reaction is a peer engaging with one of our posts; the count is display
@@ -348,6 +379,56 @@ class PeerService extends ChangeNotifier {
     return rc;
   }
 
+  /// Ask [peers] to co-sign one staff-roll or guardianship record (Phase 3
+  /// P3.3). [bytes] is the exchange exactly as Ethne exported it — pass it
+  /// through UNCHANGED; the signatures are over these bytes, so re-encoding
+  /// them yields signatures over nothing.
+  ///
+  /// No private key travels and no description travels: each signer's own node
+  /// derives what the bytes commit to. Returns the shim rc (0 accepted, -2 the
+  /// daemon is not bound yet, -1 otherwise).
+  int requestCosign(
+    List<AgoraPeer> peers, {
+    required String record,
+    required String op,
+    required String polityDid,
+    required String cid,
+    required String bytes,
+  }) {
+    if (peers.isEmpty) return -1;
+    final ev = _events;
+    if (ev == null) return -1;
+    return ev.requestCosign(
+      _daemon.queues.appToAt,
+      peers.map((p) => p.uuid).toList(growable: false),
+      record: record,
+      op: op,
+      polityDid: polityDid,
+      cid: cid,
+      bytes: bytes,
+    );
+  }
+
+  /// Return this node's detached signature to the peer authoring an exchange
+  /// (Phase 3 P3.3). Sign only after deriving, on this node, what the bytes
+  /// actually commit to. Returns the shim rc.
+  int returnCosign(
+    AgoraPeer requester, {
+    required String cid,
+    required String signerDid,
+    required String sigHex,
+  }) {
+    final ev = _events;
+    if (ev == null) return -1;
+    return ev.returnCosign(
+      _daemon.queues.appToAt,
+      requester.uuid,
+      cid: cid,
+      signerDid: signerDid,
+      sigHex: sigHex,
+    );
+  }
+
   /// The feed ranked by S × recency (Increment 7), newest/strongest first. S is
   /// the tie strength to each post's author (the Inc-4 kernel); recency is post
   /// freshness. Empty until posts arrive or one is published locally.
@@ -509,6 +590,136 @@ class PeerService extends ChangeNotifier {
     return true;
   }
 
+  /// Route one decoded business-ad event into the directory (Phase 3 P3.2).
+  /// Returns true if the event was a business ad (consumed here rather than by
+  /// [AgoraPeer.applyEvent]).
+  ///
+  /// The advertiser is put on the roster first, because the vouch term is
+  /// weighted by the tie strength to whoever vouched — a recommendation is only
+  /// as good as your relationship with the person making it, so we have to be
+  /// able to place them.
+  bool _ingestBusinessAd(AtRawEvent e) {
+    if (e.kind != agoraEventBusinessAd) return false;
+    _peers.putIfAbsent(_hex(e.uuid), () => _newPeer(e.uuid));
+    _businesses.add(BusinessAd.fromEvent(e));
+    return true;
+  }
+
+  /// Verify an opaque Ethne page bundle through the cdylib: does it prove
+  /// polity-root → envoy → page? Opens the library on first use.
+  ///
+  /// When Ethne is unavailable this returns FALSE rather than waving the page
+  /// through. Nothing else in the system checks the bundle — the AT core carries
+  /// it as bytes — so an unverifiable page is one nobody has vouched for in the
+  /// only way that counts.
+  bool _verifyBusinessBundle(String bundleJson) {
+    final override = _bundleVerifierOverride;
+    if (override != null) return override(bundleJson);
+    if (!_ethneTried) {
+      _ethneTried = true;
+      try {
+        _ethne = EthneFfi.open();
+      } on Object {
+        _ethne = null;
+      }
+    }
+    final e = _ethne;
+    if (e == null) return false;
+    try {
+      return e.verifyBusinessPageBundle(bundleJson);
+    } on Object {
+      return false;
+    }
+  }
+
+  /// Businesses ranked for "near me" (Phase 3 P3.2): distance from this node's
+  /// own coarse bucket, then who you trust that vouched, then freshness.
+  List<Business> get businesses => _businesses.ranked(
+        strengthOfAdvertiser: _strengthOfAuthor,
+        ownGeohash: _ownGeohash,
+        nowEpochSeconds: DateTime.now().millisecondsSinceEpoch / 1000.0,
+      );
+
+  /// Total businesses held.
+  int get businessCount => _businesses.length;
+
+  /// How many ads were dropped because their page bundle could not be verified
+  /// — including every ad, when the Ethne library is missing. The UI shows this
+  /// so an empty directory is never read as "no businesses nearby".
+  int get businessesUnverified => _businesses.rejectedUnverified;
+
+  /// The ranking score for [business], for the UI to render alongside the entry.
+  double businessScore(Business business) => _businesses.score(
+        business,
+        strengthOfAdvertiser: _strengthOfAuthor,
+        ownGeohash: _ownGeohash,
+        nowEpochSeconds: DateTime.now().millisecondsSinceEpoch / 1000.0,
+      );
+
+  /// This node's own declared satisfaction with [polityDid] (0..4), or null when
+  /// it holds no customer edge — and so carries nothing for that business.
+  int? customerSatisfaction(String polityDid) => _customerSatisfaction[polityDid];
+
+  /// Publish THIS node's own business page (Phase 3 P3.2). [bundle] is the
+  /// opaque self-verifying Ethne artifact the app built through Ethne. Returns
+  /// the shim rc (0 ok, -2 daemon not ready), or -1 if no channel is open or the
+  /// arguments are empty.
+  ///
+  /// This reaches one group. The page travels further only as customers
+  /// re-advertise it — a business cannot buy reach it has not earned.
+  int advertiseBusiness(String polityDid, String bundle, {int seq = 0}) {
+    if (polityDid.isEmpty || bundle.isEmpty) return -1;
+    final ev = _events;
+    if (ev == null) return -1;
+    final rc =
+        ev.advertiseBusiness(_daemon.queues.appToAt, polityDid, bundle, seq: seq);
+    notifyListeners();
+    return rc;
+  }
+
+  /// Declare or update THIS node's CUSTOMER edge to [polityDid] at
+  /// [satisfaction] (0..4). The edge is what authorizes this node to carry the
+  /// page: the core caches the bundle and re-advertises it in the FIRST PERSON
+  /// with our own satisfaction. Passing an empty [bundle] carries the page we
+  /// already learned, so a person can vouch straight from a page that reached
+  /// them through someone else. Returns the shim rc, or -1 if no channel is open.
+  int markCustomer(String polityDid, int satisfaction,
+      {String bundle = '', int seq = 0}) {
+    if (polityDid.isEmpty) return -1;
+    final sat = satisfaction.clamp(0, 4);
+    final known = _businesses[polityDid];
+    final carry = bundle.isNotEmpty ? bundle : (known?.bundle ?? '');
+    final carrySeq = bundle.isNotEmpty ? seq : (known?.seq ?? seq);
+    _customerSatisfaction[polityDid] = sat;
+    final ev = _events;
+    if (ev == null) {
+      notifyListeners();
+      return -1;
+    }
+    final rc = ev.setCustomer(_daemon.queues.appToAt, polityDid,
+        satisfaction: sat, bundle: carry, seq: carrySeq);
+    notifyListeners();
+    return rc;
+  }
+
+  /// Withdraw this node's customer edge to [polityDid]. This node simply goes
+  /// QUIET about the business — it stops carrying the page. Nothing negative is
+  /// published, so there is nothing to brigade with; silence is the only
+  /// negative signal the design has.
+  int clearCustomer(String polityDid) {
+    if (polityDid.isEmpty) return -1;
+    _customerSatisfaction.remove(polityDid);
+    final ev = _events;
+    if (ev == null) {
+      notifyListeners();
+      return -1;
+    }
+    final rc =
+        ev.setCustomer(_daemon.queues.appToAt, polityDid, satisfaction: -1);
+    notifyListeners();
+    return rc;
+  }
+
   /// Route one decoded DM event into the per-peer thread. Appends an incoming
   /// message (deduped by (peer, seq)), stamps interaction recency on the peer
   /// (a received DM tends the tie), and flags it unread. Returns true if the
@@ -652,6 +863,8 @@ class PeerService extends ChangeNotifier {
       if (_ingestPost(e)) continue;
       // A reaction to one of our posts — tallied, not merged into a peer.
       if (_ingestReaction(e)) continue;
+      // A business ad — routed into the directory after Ethne verification.
+      if (_ingestBusinessAd(e)) continue;
       final key = _hex(e.uuid);
       // Never surface our own identity as a peer. The core already guards this
       // (a `peer_accepted` naming us no longer self-adds), but a stale roster

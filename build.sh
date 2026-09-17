@@ -137,7 +137,12 @@ if [ "${AGORA_STRICT:-0}" != "1" ]; then
 fi
 
 cmake -S native -B native/build "${NATIVE_CMAKE_ARGS[@]}"
-cmake --build native/build --target agorad agora_shim -j"$(nproc 2>/dev/null || echo 4)"
+# ethne_ffi (businesses = Ethne polities) is built too when cargo is available;
+# its CMake target is a no-op if Rust is not installed (a warning at configure).
+cmake --build native/build --target agorad agora_shim ethne_ffi \
+    -j"$(nproc 2>/dev/null || echo 4)" || \
+  cmake --build native/build --target agorad agora_shim \
+    -j"$(nproc 2>/dev/null || echo 4)"
 
 # --- 2. Flutter app ----------------------------------------------------------
 echo "==> Fetching Dart packages"
