@@ -16,9 +16,13 @@ import '../ffi/ethne_bindings.dart';
 import '../model/attention_budget.dart';
 import '../model/business.dart';
 import '../model/business_directory.dart';
+import '../model/cosign_exchanges.dart';
 import '../model/dm.dart';
+import '../model/member_roll.dart';
 import '../model/feed_store.dart';
 import '../model/post.dart';
+import '../model/staff_identity.dart';
+import '../model/staff_roster.dart';
 import '../model/tie_settings.dart';
 import '../model/tie_strength.dart';
 import 'agora_daemon.dart';
@@ -28,12 +32,35 @@ class PeerService extends ChangeNotifier {
     AgoraDaemon? daemon,
     this.pollInterval = const Duration(milliseconds: 300),
     @visibleForTesting BundleVerifier? bundleVerifier,
+    @visibleForTesting StaffIdentity? staffIdentity,
+    @visibleForTesting StaffRoster? staffRoster,
+    @visibleForTesting CosignDescriber? cosignDescriber,
+    @visibleForTesting RollPublisher? rollPublisher,
   })  : _daemon = daemon ?? _defaultDaemon(),
-        _bundleVerifierOverride = bundleVerifier;
+        _bundleVerifierOverride = bundleVerifier,
+        _staffOverride = staffIdentity,
+        _rosterOverride = staffRoster,
+        _cosignDescriberOverride = cosignDescriber,
+        _rollPublisherOverride = rollPublisher;
 
   /// Test-only stand-in for the Ethne bundle verifier. Null in the app, where
   /// the real cdylib does the proving.
   final BundleVerifier? _bundleVerifierOverride;
+
+  /// Test-only stand-ins for the staff surface (Phase 3 P3.3). Both are plain
+  /// data — a keypair is three strings and two maps, and a roster is a fold of
+  /// two JSON maps — so the whole surface, including every honest state, is
+  /// exercised with no charter log and no cdylib present.
+  final StaffIdentity? _staffOverride;
+  final StaffRoster? _rosterOverride;
+
+  /// Test-only stand-in for the local description derivation, which otherwise
+  /// needs the cdylib. Null in the app, where the bytes are read for real.
+  final CosignDescriber? _cosignDescriberOverride;
+
+  /// Test-only stand-in for minting and checking a member roll. Null in the app,
+  /// where the root key signs and the cdylib checks.
+  final RollPublisher? _rollPublisherOverride;
 
   /// Build the default daemon. When $AGORA_EXTERNAL_DAEMON is set (to a non-empty
   /// value other than "0"/"false"), attach to an already-running `agorad` under
@@ -129,6 +156,28 @@ class PeerService extends ChangeNotifier {
   /// [businessesUnverified].
   EthneFfi? _ethne;
   bool _ethneTried = false;
+
+  /// This node's staff membership (Phase 3 P3.3): the key it signs governance
+  /// acts with and the polity charter log it reads the roll out of. Loaded in
+  /// [start]; null when this node is staff of no polity, which is the ordinary
+  /// case and not an error.
+  StaffIdentityStore? _staff;
+
+  /// The live charter log, opened from the stored dump. Null when there is no
+  /// identity, or when the cdylib could not be loaded.
+  EthneArchive? _polityArchive;
+
+  /// The two Ethne state maps, read once per archive rather than once per frame
+  /// — folding them is cheap and pure, reading them crosses the FFI. Cleared
+  /// whenever the archive is replaced.
+  Map<String, dynamic>? _affirmationState;
+  Map<String, dynamic>? _guardianStateMap;
+  bool? _polityVerified;
+
+  /// Co-signature exchanges in flight (Phase 3 P3.3). The describer derives each
+  /// act's wording HERE, from its bytes, because none crosses the wire.
+  late final CosignExchanges _cosign =
+      CosignExchanges(describeBytes: _describeCosignBytes);
 
   /// THIS node's own customer edges: polity DID → declared satisfaction (0..4).
   /// The core holds the authoritative edge (it is what authorizes us to carry a
@@ -605,6 +654,28 @@ class PeerService extends ChangeNotifier {
     return true;
   }
 
+  /// An inbound ask to co-sign a governance act (Phase 3 P3.3). A live exchange
+  /// like a DM, not peer state, so it is routed here rather than merged by
+  /// applyEvent. Everything it carries is a CLAIM: the core is a courier that
+  /// holds no Ethne, so nothing upstream has read these bytes. The wording is
+  /// derived locally, on demand, before anyone is asked to sign.
+  bool _ingestCosignRequest(AtRawEvent e) {
+    if (e.kind != agoraEventCosignRequest) return false;
+    _peers.putIfAbsent(_hex(e.uuid), () => _newPeer(e.uuid));
+    _cosign.addRequest(CosignExchange.fromEvent(e));
+    return true;
+  }
+
+  /// A signature returned for an act this node asked about. The core cannot
+  /// check it — it does not hold the payload — so it is collected here and
+  /// proven only when Ethne assembles the record.
+  bool _ingestCosignSignature(AtRawEvent e) {
+    if (e.kind != agoraEventCosignSignature) return false;
+    _peers.putIfAbsent(_hex(e.uuid), () => _newPeer(e.uuid));
+    _cosign.addSignature(CosignSignature.fromEvent(e));
+    return true;
+  }
+
   /// Verify an opaque Ethne page bundle through the cdylib: does it prove
   /// polity-root → envoy → page? Opens the library on first use.
   ///
@@ -615,6 +686,19 @@ class PeerService extends ChangeNotifier {
   bool _verifyBusinessBundle(String bundleJson) {
     final override = _bundleVerifierOverride;
     if (override != null) return override(bundleJson);
+    final e = _ethneLib();
+    if (e == null) return false;
+    try {
+      return e.verifyBusinessPageBundle(bundleJson);
+    } on Object {
+      return false;
+    }
+  }
+
+  /// The Ethne cdylib, opened on first use and remembered, including the
+  /// failure: a library that was not built does not become built by asking
+  /// again. Null when it could not be loaded.
+  EthneFfi? _ethneLib() {
     if (!_ethneTried) {
       _ethneTried = true;
       try {
@@ -623,13 +707,7 @@ class PeerService extends ChangeNotifier {
         _ethne = null;
       }
     }
-    final e = _ethne;
-    if (e == null) return false;
-    try {
-      return e.verifyBusinessPageBundle(bundleJson);
-    } on Object {
-      return false;
-    }
+    return _ethne;
   }
 
   /// Businesses ranked for "near me" (Phase 3 P3.2): distance from this node's
@@ -789,6 +867,189 @@ class PeerService extends ChangeNotifier {
         params: budgetParams,
       );
 
+  // --- the staff surface (Phase 3 P3.3) -------------------------------------
+
+  /// Open the stored charter log through the cdylib. Best-effort: with no
+  /// identity, no cdylib, or an unreadable dump, this node simply reads no roll
+  /// — which the surface reports as having none, not as an error.
+  void _openPolityArchive() {
+    _polityArchive?.dispose();
+    _polityArchive = null;
+    _affirmationState = null;
+    _guardianStateMap = null;
+    _polityVerified = null;
+    final id = _staff?.identity;
+    final lib = _ethneLib();
+    if (id == null || lib == null) return;
+    try {
+      _polityArchive = lib.loadArchive(jsonEncode(id.archive));
+    } on Object {
+      _polityArchive = null;
+    }
+  }
+
+  /// The polity this node is staff of, or null when it is staff of none.
+  String? get ownPolityDid =>
+      _staffOverride?.polityDid ?? _staff?.identity?.polityDid;
+
+  /// The keypair this node signs governance acts with. Null when this node is
+  /// not staff anywhere — in which case it can read a roll but not co-sign.
+  EthneKeypair? get staffIdentity =>
+      _staffOverride?.self ?? _staff?.identity?.self;
+
+  /// The roll of [ownPolityDid], folded for display, or null when there is no
+  /// polity on this node or its log could not be read.
+  ///
+  /// The two state maps are read once per archive and re-folded on each call so
+  /// the attendance judgment tracks the clock. Twenty-four hours is this app's
+  /// threshold and nothing deeper: the stamp itself is carried through unreduced.
+  StaffRoster? get staffRoster {
+    final override = _rosterOverride;
+    if (override != null) return override;
+    if (!_readPolityState()) return null;
+    return StaffRoster.from(
+      affirmation: _affirmationState!,
+      guardian: _guardianStateMap!,
+      nowEpochSeconds: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      verified: _polityVerified,
+    );
+  }
+
+  /// Read the polity's state maps across the FFI, once. Returns whether they are
+  /// in hand.
+  bool _readPolityState() {
+    if (_affirmationState != null && _guardianStateMap != null) return true;
+    final arc = _polityArchive;
+    final polity = _staff?.identity?.polityDid;
+    if (arc == null || polity == null) return false;
+    try {
+      _affirmationState = arc.affirmationState(polity);
+      _guardianStateMap = arc.guardianState(polity);
+      // The fold reports what the log CLAIMS; this is the adjudication that sits
+      // beside it, and the UI shows both.
+      _polityVerified = arc.verify();
+    } on Object {
+      _affirmationState = null;
+      _guardianStateMap = null;
+      _polityVerified = null;
+      return false;
+    }
+    return true;
+  }
+
+  /// The POLITY's own keypair, held only by the node that publishes its roll.
+  /// Null nearly everywhere, which is the ordinary case.
+  EthneKeypair? get polityRootKey =>
+      _staffOverride?.root ?? _staff?.identity?.root;
+
+  /// Whether this node can publish the polity's roll at all. Publishing is
+  /// signing under the polity's ROOT key, so only its holder can — and nothing
+  /// compels a polity to publish in the first place.
+  bool get canPublishRoll =>
+      _rollPublisherOverride != null ||
+      (polityRootKey != null && _polityArchive != null);
+
+  /// The last roll minted on this node, with what could be established about it.
+  /// Held in memory only: publication is the polity's act, and this app is not a
+  /// place a roll is kept on anyone's behalf.
+  PublishedRoll? get publishedRoll => _publishedRoll;
+  PublishedRoll? _publishedRoll;
+
+  /// Mint the polity's roll under its root key, then check it BOTH ways and keep
+  /// the two answers apart. Returns whether an artifact was produced.
+  ///
+  /// Nothing is sent anywhere. No compact tier is wired up here, so publishing
+  /// means minting the artifact and checking it; handing it to a consumer is not
+  /// something this app does.
+  bool publishRoll() {
+    final override = _rollPublisherOverride;
+    if (override != null) {
+      final r = override();
+      if (r == null) return false;
+      _publishedRoll = r;
+      notifyListeners();
+      return true;
+    }
+    final arc = _polityArchive;
+    final polity = ownPolityDid;
+    final root = polityRootKey;
+    if (arc == null || polity == null || root == null) return false;
+    try {
+      final json = arc.signMemberRoll(polityDid: polity, root: root);
+      _publishedRoll = PublishedRoll(
+        rollJson: json,
+        // What a compact tier could establish on its own…
+        publisherProven: _ethneLib()?.verifyMemberRoll(json) ?? false,
+        // …and what only a holder of the log can.
+        auditedAgainstLog: arc.verifyMemberRollFull(json),
+      );
+    } on Object {
+      return false;
+    }
+    notifyListeners();
+    return true;
+  }
+
+  /// Co-signature asks waiting on this node, newest first.
+  List<CosignExchange> get pendingCosigns => _cosign.pending;
+
+  /// What [e] actually commits to, derived on THIS node from its bytes. Null
+  /// when they cannot be read as the record class they claim — a reason to
+  /// refuse, never a reason to fall back to what the asker said it was.
+  Map<String, dynamic>? describeCosign(CosignExchange e) => _cosign.describe(e);
+
+  /// Signatures returned for the act [cid].
+  List<CosignSignature> cosignSignatures(String cid) =>
+      _cosign.signaturesFor(cid);
+
+  Map<String, dynamic>? _describeCosignBytes(String record, String bytesHex) {
+    final override = _cosignDescriberOverride;
+    if (override != null) return override(record, bytesHex);
+    final e = _ethneLib();
+    if (e == null) return null;
+    try {
+      return e.describe(
+        record: record.isEmpty ? null : record,
+        bytesHex: bytesHex,
+      );
+    } on Object {
+      return null;
+    }
+  }
+
+  /// Sign [e] with this node's own key and return the signature to whoever
+  /// asked. Returns whether a signature went out.
+  ///
+  /// The key never leaves this process: signDetached takes the bytes and the
+  /// key and nothing else — no archive, no polity, no network.
+  bool signCosign(CosignExchange e) {
+    final id = staffIdentity;
+    final lib = _ethneLib();
+    if (id == null || lib == null) return false;
+    final peer = _peers[_hex(e.requesterUuid)];
+    if (peer == null) return false;
+    final String sig;
+    try {
+      sig = lib.signDetached(priv: id.priv, bytesHex: e.bytes);
+    } on Object {
+      return false;
+    }
+    if (returnCosign(peer, cid: e.cid, signerDid: id.did, sigHex: sig) < 0) {
+      return false;
+    }
+    _cosign.settle(e.cid);
+    notifyListeners();
+    return true;
+  }
+
+  /// Decline [e]. NOTHING is sent: a refusal is silence, the same posture the
+  /// unhappy customer takes. The ask is settled so a replay does not raise it
+  /// again.
+  void declineCosign(CosignExchange e) {
+    _cosign.settle(e.cid);
+    notifyListeners();
+  }
+
   Future<void> start() async {
     _setStatus('starting daemon…');
     await _daemon.start();
@@ -802,6 +1063,14 @@ class PeerService extends ChangeNotifier {
     _settings = await TieSettingsStore(
             File('${_daemon.root}/etc/at/agora.settings.json'))
         .load();
+
+    // This node's staff membership, if it has one (Phase 3 P3.3). Staff of no
+    // polity is the ordinary case and not an error — the roster surface says so
+    // plainly rather than failing.
+    _staff = await StaffIdentityStore(
+            File('${_daemon.root}/etc/at/agora.polity.json'))
+        .load();
+    _openPolityArchive();
 
     // Resolve our in-process event sockets under the same config root as the
     // daemon (Dart cannot setenv its own process; the shim does it in C).
@@ -865,6 +1134,9 @@ class PeerService extends ChangeNotifier {
       if (_ingestReaction(e)) continue;
       // A business ad — routed into the directory after Ethne verification.
       if (_ingestBusinessAd(e)) continue;
+      // A co-signature ask, and a signature coming back — a live exchange.
+      if (_ingestCosignRequest(e)) continue;
+      if (_ingestCosignSignature(e)) continue;
       final key = _hex(e.uuid);
       // Never surface our own identity as a peer. The core already guards this
       // (a `peer_accepted` naming us no longer self-adds), but a stale roster
@@ -894,6 +1166,11 @@ class PeerService extends ChangeNotifier {
     _saveTimer?.cancel();
     _saveTimer = null;
     await _settings?.save(); // flush any pending durable-recency writes
+    // The staff identity is NOT rewritten here. S8 only reads the log and signs
+    // with the key; nothing appends, so there is nothing to flush — and the file
+    // holds a private key, which is not worth rewriting for no reason.
+    _polityArchive?.dispose();
+    _polityArchive = null;
     _events?.close();
     _events = null;
     await _daemon.stop();

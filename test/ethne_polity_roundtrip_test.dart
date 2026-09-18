@@ -444,6 +444,9 @@ void main() {
       );
       expect(ex['record'], 'membership');
       expect(ex['cid'], startsWith('b3:'));
+      // The ask that goes on the wire has to name the polity: the signer's node
+      // resolves the act in its own log, and AT refuses an ask without it.
+      expect(ex['polity_did'], polity.did);
       // Admission needs the deciders AND the joiner's consent.
       expect((ex['signers_required'] as List).cast<String>(),
           containsAll([members[0].did, members[1].did, members[2].did, hire.did]));
@@ -840,6 +843,7 @@ void main() {
         rationale: 'the owner takes it on',
       );
       expect(ex['record'], 'guardian');
+      expect(ex['polity_did'], polity.did);
       // The guardian's consent is required BEYOND the majority, and the caller
       // is told so before anybody is asked to sign.
       expect(ex['signers_required'],

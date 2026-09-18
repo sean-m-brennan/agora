@@ -95,6 +95,10 @@ class EthneFfi {
             lib.lookupFunction<_SignC, _SignDart>('ethne_sign_detached'),
         _assemble = lib
             .lookupFunction<_HandleSpecC, _HandleSpecDart>('ethne_assemble'),
+        // P3.3 S5 — the signer's node derives the wording itself. No handle and
+        // no polity: what an act means is a property of its bytes.
+        _describe =
+            lib.lookupFunction<_SpecOutC, _SpecOutDart>('ethne_describe'),
         // P3.3 S2 — leaving the roll. Departure and expulsion are deliberately
         // not symmetric acts.
         _departMember = lib
@@ -143,7 +147,14 @@ class EthneFfi {
         _verifyBundle = lib.lookupFunction<_StrC, _StrDart>(
             'ethne_business_page_verify_bundle'),
         _verifyFull = lib.lookupFunction<_HandleSpecC, _HandleSpecDart>(
-            'ethne_business_page_verify_full');
+            'ethne_business_page_verify_full'),
+        // P3.3 S9 — the member-roll border artifact (D26).
+        _rollSign =
+            lib.lookupFunction<_StateC, _StateDart>('ethne_member_roll_sign'),
+        _rollVerify =
+            lib.lookupFunction<_StrC, _StrDart>('ethne_member_roll_verify'),
+        _rollVerifyFull = lib.lookupFunction<_HandleSpecC, _HandleSpecDart>(
+            'ethne_member_roll_verify_full');
 
   final _LastErrorC _lastError;
   final _StringFreeDart _stringFree;
@@ -155,6 +166,7 @@ class EthneFfi {
   final _StateDart _pending;
   final _SignDart _signDetached;
   final _HandleSpecDart _assemble;
+  final _SpecOutDart _describe;
   final _HandleSpecDart _departMember;
   final _HandleSpecDart _expelMember;
   final _StateDart _observe;
@@ -176,6 +188,9 @@ class EthneFfi {
   final _SpecOutDart _pageSign;
   final _StrDart _verifyBundle;
   final _HandleSpecDart _verifyFull;
+  final _StateDart _rollSign;
+  final _StrDart _rollVerify;
+  final _HandleSpecDart _rollVerifyFull;
 
   /// Resolve the library path, or null if not wired (caller then skips).
   static String? resolveLibraryPath() {
@@ -241,6 +256,55 @@ class EthneFfi {
     } finally {
       calloc.free(spec);
       calloc.free(out);
+    }
+  }
+
+  /// Say what the canonical [bytesHex] of a co-signature exchange actually
+  /// commits to: the act, the parties, the evidence grade, the recomputed cid
+  /// and the wording. [record] is `'membership'` (the default) or `'guardian'`;
+  /// bytes that do not deserialize as that class are refused.
+  ///
+  /// Returns `{record, op, polity_did, member_did, deciders, …, cid, description}`.
+  ///
+  /// Like [signDetached] this takes no archive and no polity, and that is the
+  /// point: the description is DERIVED HERE, on the node about to sign, from the
+  /// same bytes the signature will cover. No description crosses the wire (P3.3
+  /// S5), because a node that could choose both what you sign and what you are
+  /// told you are signing could put a friendly sentence over hostile bytes and
+  /// collect a real signature on the end of it. Recompute, never quote.
+  Map<String, dynamic> describe({
+    String? record,
+    required String bytesHex,
+  }) {
+    final spec = jsonEncode({
+      if (record != null) 'record': record,
+      'bytes': bytesHex,
+    }).toNativeUtf8();
+    final out = calloc<Pointer<Utf8>>();
+    try {
+      if (_describe(spec, out) != 0) throw EthneException(_err());
+      return jsonDecode(_takeString(out)) as Map<String, dynamic>;
+    } finally {
+      calloc.free(spec);
+      calloc.free(out);
+    }
+  }
+
+  /// Verify a self-contained member roll (a `Signed<MemberRoll>`): signed by the
+  /// polity it names, and well-formed. Needs no charter log — a roll's signer IS
+  /// the community, whose key resolves out of its own DID, so unlike a business
+  /// page there is no delegation to carry and nothing to bundle it with.
+  ///
+  /// THIS PROVES THE PUBLISHER, NOT THE ROLL. A roll is the polity speaking about
+  /// itself; this says the polity is the one saying it, and cannot say whether
+  /// what it says is true. It is exactly the reach a compact tier has. To audit
+  /// the claim you need the log — see [EthneArchive.verifyMemberRollFull].
+  bool verifyMemberRoll(String rollJson) {
+    final s = rollJson.toNativeUtf8();
+    try {
+      return _rollVerify(s) == 0;
+    } finally {
+      calloc.free(s);
     }
   }
 
@@ -402,7 +466,10 @@ class EthneArchive {
   /// on the guardian's own signature resolves the outgoing guardian from it
   /// rather than taking the caller's word.
   ///
-  /// Returns `{record, op, payload, bytes, cid, description, signers_required}`.
+  /// Returns `{record, op, polity_did, payload, bytes, cid, description,
+  /// signers_required}`. `polity_did` is echoed back because the ask that goes
+  /// on the wire must name the polity — the signer's node resolves the act in
+  /// its own log, and `requestCosign` refuses an ask without it.
   /// Hand `bytes` and `description` to each signer in `signers_required`, then
   /// give `payload` back to [assembleSigned] **unchanged**: the signatures are
   /// checked against its canonical bytes, `decided_at` included, so a re-built
@@ -790,6 +857,53 @@ class EthneArchive {
     final s = pageJson.toNativeUtf8();
     try {
       return _ffi._verifyFull(_handle, s) == 0;
+    } finally {
+      calloc.free(s);
+    }
+  }
+
+  /// Publish this polity's roll as KC's `MemberRoll`, signed under its ROOT key,
+  /// returning the `Signed<MemberRoll>` JSON.
+  ///
+  /// Border artifact #6 (D26): what gives a polity's members a real anonymous
+  /// channel in the compact tier, which models communities and speakers but has
+  /// no member roster of its own.
+  ///
+  /// Takes [root] — the POLITY's own keypair, not a member's. Only its holder can
+  /// publish a roll, which is a fact about who may act rather than an obstacle.
+  /// Lives on the archive because, unlike signing a business page, the roll is
+  /// READ FROM THIS LOG as of [asOf] (default now); [publishedAt] defaults to it.
+  ///
+  /// Publishing a shorter roll REMOVES NOBODY: the compact tier unions rolls
+  /// rather than superseding them, so a departure recorded here does not close
+  /// the channel of whoever left. [asOf] crosses as provenance, not authority.
+  String signMemberRoll({
+    required String polityDid,
+    required EthneKeypair root,
+    int? asOf,
+    int? publishedAt,
+  }) =>
+      _callSpecOut(_ffi._rollSign, {
+        'polity_did': polityDid,
+        'root_priv': root.priv,
+        'root_pub': root.pub,
+        if (asOf != null) 'as_of': asOf,
+        if (publishedAt != null) 'published_at': publishedAt,
+      });
+
+  /// Verify [rollJson] against THIS full charter log: everything
+  /// [EthneFfi.verifyMemberRoll] checks, plus charter validity and the roll
+  /// naming exactly the members this log says the polity had at the roll's
+  /// `as_of`.
+  ///
+  /// This is the check a compact tier CANNOT make — it has no dependency on this
+  /// tier's charter, so it can only establish the publisher. Keep the two answers
+  /// apart when reporting them: they are different questions.
+  bool verifyMemberRollFull(String rollJson) {
+    _check();
+    final s = rollJson.toNativeUtf8();
+    try {
+      return _ffi._rollVerifyFull(_handle, s) == 0;
     } finally {
       calloc.free(s);
     }

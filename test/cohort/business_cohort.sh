@@ -105,6 +105,58 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # --------------------------------------------------------------------------- #
 if ! have python3; then err "python3 not found."; exit 1; fi
 if ! have dart; then err "'dart' not found (needed to mint the Ethne bundle); add the Flutter SDK to PATH."; exit 1; fi
+# THE DART BINARY every tool below runs through — deliberately the Dart SDK's
+# OWN binary, not the `dart` wrapper in flutter/bin that PATH resolves to.
+#
+# The wrapper sources bin/internal/shared.sh, whose upgrade_flutter() runs on
+# EVERY invocation. It rewrites bin/cache/engine.stamp and engine.realm, and if
+# it judges the cache stale it goes much further: takes the SDK-wide lock,
+# downloads and unpacks a Dart SDK, re-runs pub, rebuilds
+# flutter_tools.snapshot. That is Flutter keeping its own install honest and has
+# nothing to do with running a project tool. This script runs under sudo because
+# netns needs root, so under the wrapper every bit of it happens AS ROOT inside
+# a developer-owned SDK. engine.stamp is replaced by `mv`, so it comes back
+# owned by root — that one self-heals, because the next ordinary flutter command
+# mv's over it again. A root-downloaded dart-sdk/ or a root-written snapshot
+# does not self-heal and needs a manual chown. (engine.realm is truncated in
+# place, so it keeps its owner; it is the stamp that turns over.) Each of the
+# dart calls below also prints the "you appear to be trying to run flutter as
+# root" clippy, which is how this was noticed.
+#
+# The SDK binary is the same dart with none of that install bookkeeping. A bare
+# Dart SDK on PATH has no bin/cache/dart-sdk, in which case what PATH found
+# stands.
+DART="$(command -v dart)"
+_dart_real="$(readlink -f "$DART" 2>/dev/null || printf '%s' "$DART")"
+_sdk_dart="$(dirname "$_dart_real")/cache/dart-sdk/bin/dart"
+[ -x "$_sdk_dart" ] && DART="$_sdk_dart"
+
+# Run a command as whoever invoked sudo, when there is such a person. Used for
+# `flutter pub get` alone: it writes .dart_tool/ and the pub cache, both of
+# which belong to that user, and doing it as root leaves root-owned files that
+# their next ordinary build cannot rewrite. PATH is passed explicitly for the
+# same reason the header tells you to invoke this script with it — sudoers
+# secure_path would otherwise drop the Flutter SDK on the way back down.
+as_user() {
+  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    sudo -u "$SUDO_USER" -E env "PATH=$PATH" "$@"
+  else
+    "$@"
+  fi
+}
+
+# `.dart_tool/package_config.json` holds ABSOLUTE paths into $HOME/.pub-cache,
+# so it goes stale whenever the checkout moves between machines or $HOME
+# changes underneath it. `package:ffi` then stops resolving and Phase 0 dies in
+# a wall of "'Utf8' isn't a type" / "calloc isn't defined" that reads like a
+# broken binding and is nothing of the kind. Fetching first is the cure and
+# costs a second when it is already correct. --offline because the cache
+# already holds these packages; this harness has no business reaching pub.dev.
+if have flutter; then
+  (cd "$AGORA_DIR" && as_user flutter pub get --offline) >/dev/null 2>&1 \
+    || err "'flutter pub get' failed — package:ffi may not resolve below."
+fi
+
 for f in "$AGORAD" "$SHIM" "$ATCORE/libautonomous_trust.so" "$ETHNE"; do
   if [ ! -e "$f" ]; then err "missing artifact: $f"; err "build first: (cd '$AGORA_DIR' && ./build.sh)"; exit 1; fi
 done
@@ -260,7 +312,7 @@ trap cleanup EXIT INT TERM
 # --------------------------------------------------------------------------- #
 log "Minting a real Ethne business page (polity → envoy → page)"
 PAGE_JSON="$RUN/page.json"
-if ! (cd "$AGORA_DIR" && AGORA_ETHNE_PATH="$ETHNE" dart run tool/make_business_bundle.dart \
+if ! (cd "$AGORA_DIR" && AGORA_ETHNE_PATH="$ETHNE" "$DART" run tool/make_business_bundle.dart \
         --name "Corner Cafe" --locality "$GEO" >"$PAGE_JSON" 2>"$RUN/mint.log"); then
   err "could not mint a business page:"; cat "$RUN/mint.log" >&2; exit 1
 fi
@@ -649,7 +701,7 @@ void main(List<String> a) {
 }
 DART
 cp "$RUN/verify.dart" "$AGORA_DIR/tool/_cohort_verify.dart"
-if (cd "$AGORA_DIR" && AGORA_ETHNE_PATH="$ETHNE" dart run tool/_cohort_verify.dart "$BOB_SAW"); then
+if (cd "$AGORA_DIR" && AGORA_ETHNE_PATH="$ETHNE" "$DART" run tool/_cohort_verify.dart "$BOB_SAW"); then
   ok "phase 4 — the page still verifies (polity root → envoy → page) with the business gone"
   rm -f "$AGORA_DIR/tool/_cohort_verify.dart"
 else

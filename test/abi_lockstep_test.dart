@@ -14,6 +14,7 @@
 // from the annotations alone, which is exactly the thing being checked.
 
 import 'dart:ffi';
+import 'dart:io';
 
 import 'package:ffi/ffi.dart';
 
@@ -22,6 +23,53 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:agora/src/ffi/at_events_bindings.dart';
 
 void main() {
+  // The struct can be byte-perfect and the events still never arrive. In
+  // agora_events_poll, `w` is the RETURN VALUE, and a case that fills its event
+  // but forgets `w++` does not fail loudly: it converts the event correctly and
+  // then throws it away — the next event overwrites the slot, and a batch made
+  // only of such events polls as 0, which every caller reads as "queue empty".
+  //
+  // Both co-signing cases shipped exactly that way and it cost FIVE live cohort
+  // runs to find: the signer's daemon logged "co-signing ask ... from peer" and
+  // its app saw nothing, so every hop looked healthy from both ends. Nothing in
+  // the ABI could catch it, because nothing about the ABI was wrong.
+  //
+  // Source-level on purpose: it needs no native build, so it runs in the same
+  // suite as the layout checks above rather than only where a daemon exists.
+  test('every agora_events_poll case counts its event (w++)', () {
+    final src = File('native/at_agora_shim.c').readAsStringSync();
+    final start = src.indexOf('int agora_events_poll(');
+    expect(start, isNot(-1), reason: 'agora_events_poll not found in the shim');
+    final end = src.indexOf('\n}', start);
+    expect(end, isNot(-1), reason: 'could not find the end of agora_events_poll');
+    final body = src.substring(start, end);
+
+    // Each `case AT_APP_EVENT_x:` runs to its own `break;`.
+    final cases = RegExp(r'case\s+(AT_APP_EVENT_\w+)\s*:')
+        .allMatches(body)
+        .toList();
+    expect(cases.length, greaterThan(10),
+        reason: 'the switch was not parsed — this guard would pass vacuously');
+
+    final dropped = <String>[];
+    for (var i = 0; i < cases.length; i++) {
+      final from = cases[i].end;
+      final to = i + 1 < cases.length ? cases[i + 1].start : body.length;
+      final block = body.substring(from, to);
+      final brk = block.indexOf('break;');
+      // A case that falls through to the next one has no break of its own; the
+      // block that DOES break is the one that must count.
+      if (brk == -1) continue;
+      if (!block.substring(0, brk).contains('w++')) {
+        dropped.add(cases[i].group(1)!);
+      }
+    }
+    expect(dropped, isEmpty,
+        reason: 'these agora_events_poll cases convert an event and then drop '
+            'it by never advancing w: ${dropped.join(", ")} — the app polls '
+            'them as an empty queue');
+  });
+
   test('AgoraEvent matches sizeof(agora_event_t)', () {
     // Grew 8024 -> 11288 with the P3.2 business tail, and 11288 -> 17872 with
     // the P3.3 co-signing tail. When this fails, the C struct moved: update

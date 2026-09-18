@@ -230,6 +230,13 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
     if (n <= 0)
         return n; /* 0 = none, -1 = error, AT_APP_NOT_READY (-2) = daemon not up */
 
+    /* w IS THE RETURN VALUE, and a case that fills `e` but forgets to advance it
+     * does not fail — it CONVERTS the event correctly and then discards it: the
+     * next event overwrites the slot, and a batch holding only such events polls
+     * as 0, which every caller reads as "the queue is empty". Both co-signing
+     * cases shipped that way (P3.3), and it cost five live cohort runs: the
+     * signer's daemon logged the ask arriving and its app saw nothing. EVERY
+     * case below must end `w++; break;`. */
     int w = 0;
     for (int i = 0; i < n; i++) {
         agora_event_t *e = &out[w];
@@ -365,6 +372,7 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             memcpy(e->cosign_bytes, raw[i].data.cosign_request.bytes,
                    AGORA_COSIGN_BYTES_MAX);
             e->cosign_bytes[AGORA_COSIGN_BYTES_MAX] = '\0';
+            w++;
             break;
         case AT_APP_EVENT_COSIGN_SIGNATURE:
             e->kind = AGORA_EVENT_COSIGN_SIGNATURE;
@@ -379,6 +387,7 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             e->cosign_sig[AGORA_COSIGN_SIG_MAX] = '\0';
             e->cosign_seq = raw[i].data.cosign_sig.seq;
             e->cosign_ts = raw[i].data.cosign_sig.ts;
+            w++;
             break;
         case AT_APP_EVENT_BUSINESS_AD:
             e->kind = AGORA_EVENT_BUSINESS_AD;

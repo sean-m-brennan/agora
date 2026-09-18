@@ -30,3 +30,4 @@ native/**/target/
 
 # live-cohort scratch (test/cohort/*.sh run dirs)
 .cohort/
+.coh/

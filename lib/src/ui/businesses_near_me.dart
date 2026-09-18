@@ -18,6 +18,7 @@ import 'package:flutter/material.dart' hide ConnectionState;
 
 import '../model/business.dart';
 import '../node/peer_stream.dart';
+import 'staff_roster.dart';
 
 class BusinessesNearMePage extends StatelessWidget {
   const BusinessesNearMePage({super.key, required this.service});
@@ -27,7 +28,21 @@ class BusinessesNearMePage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Businesses near me')),
+      appBar: AppBar(
+        title: const Text('Businesses near me'),
+        actions: [
+          IconButton(
+            key: const Key('open-staff-roster'),
+            icon: const Icon(Icons.badge_outlined),
+            tooltip: 'Staff roll',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => StaffRosterPage(service: service),
+              ),
+            ),
+          ),
+        ],
+      ),
       body: ListenableBuilder(
         listenable: service,
         builder: (context, _) {

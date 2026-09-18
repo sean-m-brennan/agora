@@ -21,6 +21,7 @@
 // archive. This file replicates that composition behind a flat C surface.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::str::FromStr;
@@ -38,9 +39,9 @@ use en_charter::{
     RiteMovement, Substrate,
 };
 use en_core::{keys, time, Alg, Cid, DidKey, PrivKey, PubKey, Signed, Timestamp};
-use en_uplift::{community_identity, envoy_delegation};
+use en_uplift::{community_identity, envoy_delegation, member_roll};
 use kc_core::canonical;
-use kc_identity::SpeakerDelegation;
+use kc_identity::{MemberRoll, SpeakerDelegation};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -488,8 +489,14 @@ fn pending_membership(s: &PendingSpec) -> Result<String, String> {
         required.push(s.member_did.clone());
     }
 
+    let polity = DidKey::from_str(&s.polity_did).map_err(|e| e.to_string())?;
+    // The ask on the wire names the polity the bytes commit to: a signer's node
+    // resolves the act against ITS OWN log, and cannot without knowing which
+    // polity to resolve it in. Carry the parsed key's own spelling, not the
+    // caller's, so the wire and the payload agree character for character.
+    let polity_did = polity.as_str().to_string();
     let record = MembershipChange {
-        polity: DidKey::from_str(&s.polity_did).map_err(|e| e.to_string())?,
+        polity,
         kind,
         member,
         rationale: s.rationale.clone(),
@@ -504,6 +511,7 @@ fn pending_membership(s: &PendingSpec) -> Result<String, String> {
     serde_json::to_string(&serde_json::json!({
         "record": "membership",
         "op": s.op,
+        "polity_did": polity_did,
         "payload": p.payload,
         "bytes": bytes,
         "cid": p.cid.to_string(),
@@ -519,6 +527,7 @@ fn pending_membership(s: &PendingSpec) -> Result<String, String> {
 /// guardian looked up rather than taken on the caller's word.
 fn pending_guardian(a: &EthneArchive, s: &PendingSpec) -> Result<String, String> {
     let polity = DidKey::from_str(&s.polity_did).map_err(|e| e.to_string())?;
+    let polity_did = polity.as_str().to_string();
     let member = DidKey::from_str(&s.member_did).map_err(|e| e.to_string())?;
     let kind = match s.op.as_str() {
         "designate" => GuardianKind::Designate,
@@ -607,6 +616,7 @@ fn pending_guardian(a: &EthneArchive, s: &PendingSpec) -> Result<String, String>
     serde_json::to_string(&serde_json::json!({
         "record": "guardian",
         "op": s.op,
+        "polity_did": polity_did,
         "payload": p.payload,
         "bytes": bytes,
         "cid": p.cid.to_string(),
@@ -623,8 +633,10 @@ fn pending_guardian(a: &EthneArchive, s: &PendingSpec) -> Result<String, String>
 /// "guardian" (`op` is "designate", "rotate" or "release", with `guardian_did`
 /// and either `evidence_cid` or `unbacked_reason` as that op requires).
 ///
-/// Writes `{"record","op","payload","bytes","cid","description",
-/// "signers_required"}` to `*out`. Hand `bytes` and `description` to each
+/// Writes `{"record","op","polity_did","payload","bytes","cid","description",
+/// "signers_required"}` to `*out`. `polity_did` is echoed back because the ask
+/// that goes on the wire must name the polity; the signer resolves the act in
+/// its own log. Hand `bytes` and `description` to each
 /// required signer, and give `payload` back to `ethne_assemble` UNCHANGED —
 /// along with the same `record`, which says what it is.
 ///
@@ -2325,6 +2337,243 @@ pub unsafe extern "C" fn ethne_guardian_state(
 }
 
 // ---------------------------------------------------------------------------
+// P3.3 S9 — The member-roll border artifact (D26)
+// ---------------------------------------------------------------------------
+//
+// Border artifact #6: the polity's roll, published under its ROOT key, so its
+// members have a real anonymous channel in the compact tier. KC models
+// communities and speakers and has no member roster, so an insider holding no
+// delegation was in no ring at all; this is the feed that fixes that.
+//
+// A ROLL NEEDS NO BUNDLE. The business page needed one because the ENVOY's
+// authority had to travel beside it, hence {page, delegation}. A roll is signed
+// by the polity itself, and every ethne member is a did:key, so the verifying
+// key comes out of `community_did` and nothing else has to travel. The artifact
+// IS the bundle.
+//
+// TWO VERIFICATION MODELS, as P3.1 shipped for the page, and here the difference
+// is the whole point:
+//   * self-contained — signature and well-formedness, no log. This is exactly
+//     what KC can do, and it establishes that the PUBLISHER is who it claims to
+//     be and nothing more. A roll is the polity speaking about itself.
+//   * full-log — additionally folds the charter and checks the roll against what
+//     the log actually says its membership was at `as_of`. THIS IS THE THING KC
+//     CANNOT DO: it cannot audit a charter it has no dependency on. A polity's
+//     own node can, and a reader should be told which of the two they have.
+//
+// `as_of` IS PROVENANCE, NOT AUTHORITY (D26). Nothing gates on it. The full
+// verifier uses it only to pick which snapshot of the log to compare against.
+
+#[derive(Deserialize)]
+struct MemberRollSpec {
+    polity_did: String,
+    /// The polity's OWN keypair. Only its holder can publish a roll, which is a
+    /// fact about who may act rather than a limitation to work around.
+    root_priv: PrivKey,
+    root_pub: PubKey,
+    /// The instant the roll is read from the log. Defaults to now.
+    as_of: Option<i64>,
+    /// Defaults to `as_of`, matching en-pyo3's wrapper.
+    published_at: Option<i64>,
+}
+
+fn member_roll_sign_impl(a: &EthneArchive, spec: &str) -> Result<String, String> {
+    let s: MemberRollSpec =
+        serde_json::from_str(spec).map_err(|e| format!("bad member roll spec: {e}"))?;
+    let polity = DidKey::from_str(&s.polity_did).map_err(|e| e.to_string())?;
+    let as_of = match s.as_of {
+        Some(v) => ts(v)?,
+        None => time::now(),
+    };
+    let published_at = match s.published_at {
+        Some(v) => ts(v)?,
+        None => as_of,
+    };
+    let guard = a.0.lock().unwrap();
+    let charter = find_charter(&guard, &polity).ok_or("polity is not chartered")?;
+    // Same shape as en-pyo3's wrapper: the read model supplies the roll, and
+    // en_uplift decides what may be said about it.
+    let state = charter_state(&guard, &polity, as_of);
+    let signed = member_roll(charter, &state.members, &s.root_priv, s.root_pub, as_of, published_at)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_string(&signed).map_err(|e| e.to_string())
+}
+
+/// Publish this polity's roll as KC's `MemberRoll`, signed under its root key.
+/// `spec` = `{"polity_did","root_priv","root_pub","as_of"?,"published_at"?}`.
+/// Writes the `Signed<MemberRoll>` JSON to `*out`.
+///
+/// # Safety
+/// `a`/`spec`/`out` valid.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_member_roll_sign(
+    a: *mut EthneArchive,
+    spec: *const c_char,
+    out: *mut *mut c_char,
+) -> i32 {
+    let run = || -> Result<(), String> {
+        let a = a.as_ref().ok_or("null archive handle")?;
+        let json = member_roll_sign_impl(a, arg_str(spec)?)?;
+        set_out(out, json)
+    };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+/// The checks a roll must pass with no log in hand.
+///
+/// THE LAST FOUR RESTATE KC'S OWN RULE (`authorize_member_roll`,
+/// kc-archive/src/authority.rs). They are restated rather than called because
+/// that function is private and ethne must not depend on `kc-archive`
+/// (en-uplift/src/lib.rs:60-61). That makes this a place where two statements of
+/// one rule can drift apart, so each is pinned by its own test below.
+///
+/// Three of the four hold automatically for a roll minted by `en_uplift`, which
+/// filters the polity out of its own roll and derives every `member_pubkey` from
+/// its DID. This verifier exists for rolls arriving from STRANGERS, who did not
+/// use that function — and a duplicate member DID is not checked at mint at all.
+fn member_roll_checks(roll: &Signed<MemberRoll>) -> Result<(), String> {
+    roll.verify(didkey_resolver)
+        .map_err(|e| format!("roll signature invalid: {e}"))?;
+    // A roll is signed by the polity and by nobody else. There is no delegation
+    // hop here: the signer IS the community, and its key comes out of its DID.
+    if roll.signatures.len() != 1 {
+        return Err(format!(
+            "a member roll carries exactly one signature, its polity's; this has {}",
+            roll.signatures.len()
+        ));
+    }
+    if signer_of(roll)? != roll.payload.community_did.as_str() {
+        return Err("member roll is not signed by the community it names".into());
+    }
+    if roll.payload.members.is_empty() {
+        return Err("a member roll must name at least one member".into());
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for m in &roll.payload.members {
+        if !seen.insert(m.member_did.as_str()) {
+            return Err(format!("member roll names {} twice", m.member_did));
+        }
+        // The carried key must be the one the DID resolves to. Otherwise a roll
+        // names a real member against a foreign key, putting an outsider in the
+        // ring under that member's name — and the ring is what bounds a reveal.
+        match m.member_did.to_pubkey() {
+            Ok(pk) if pk.bytes == m.member_pubkey.bytes => {}
+            Ok(_) => {
+                return Err(format!(
+                    "member roll gives {} a key its DID does not resolve to",
+                    m.member_did
+                ))
+            }
+            Err(_) => {
+                return Err(format!(
+                    "member roll names {}, whose key cannot be resolved from its DID",
+                    m.member_did
+                ))
+            }
+        }
+        if m.member_did == roll.payload.community_did {
+            return Err("a member roll may not name the community itself as a member: its \
+                        root key is already an insider, and a second entry would be a \
+                        repeated ring position"
+                .into());
+        }
+    }
+    Ok(())
+}
+
+fn member_roll_verify_impl(roll_json: &str) -> Result<(), String> {
+    let roll: Signed<MemberRoll> =
+        serde_json::from_str(roll_json).map_err(|e| format!("bad member roll: {e}"))?;
+    member_roll_checks(&roll)
+}
+
+/// Verify a SELF-CONTAINED member roll: signed by the polity it names, and
+/// well-formed by KC's own rule. Needs no charter log. 0 if authentic, negative
+/// otherwise (reason in `ethne_last_error`).
+///
+/// This proves the PUBLISHER, not the roll. A roll is the polity speaking about
+/// itself, and this check cannot say whether what it says is true — only that
+/// the polity is the one saying it. That is exactly the reach KC has.
+///
+/// # Safety
+/// `roll_json` valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_member_roll_verify(roll_json: *const c_char) -> i32 {
+    let run = || -> Result<(), String> { member_roll_verify_impl(arg_str(roll_json)?) };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+fn member_roll_verify_full_impl(a: &EthneArchive, roll_json: &str) -> Result<(), String> {
+    let roll: Signed<MemberRoll> =
+        serde_json::from_str(roll_json).map_err(|e| format!("bad member roll: {e}"))?;
+    member_roll_checks(&roll)?;
+    let guard = a.0.lock().unwrap();
+    verify_all(&guard).map_err(|e| format!("charter signatures: {e}"))?;
+    check_authority(&guard).map_err(|e| format!("charter authority: {e}"))?;
+    // `as_of` picks the snapshot. It is provenance, so it is not checked against
+    // anything — it only says which reading of the log this roll claims to be.
+    let state = charter_state(&guard, &roll.payload.community_did, roll.payload.as_of);
+    let expected: BTreeSet<&str> = state
+        .members
+        .iter()
+        .filter(|m| *m != &roll.payload.community_did)
+        .map(|m| m.as_str())
+        .collect();
+    let got: BTreeSet<&str> =
+        roll.payload.members.iter().map(|m| m.member_did.as_str()).collect();
+    if expected != got {
+        return Err(format!(
+            "roll does not match the log at its as_of: it names {} member(s), the log has {}",
+            got.len(),
+            expected.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Verify a member roll against the FULL charter log `a`: everything
+/// `ethne_member_roll_verify` checks, plus charter validity (verify_all +
+/// check_authority) and the roll naming exactly the members the log says the
+/// polity had at the roll's `as_of`. 0 / negative.
+///
+/// This is the check the compact tier CANNOT make — it holds no dependency on
+/// this tier's charter, so it can only establish the publisher. A polity's own
+/// node holds the log and can audit the claim itself. Callers should keep the
+/// two answers apart rather than reporting one as the other.
+///
+/// # Safety
+/// `a` valid handle, `roll_json` valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_member_roll_verify_full(
+    a: *mut EthneArchive,
+    roll_json: *const c_char,
+) -> i32 {
+    let run = || -> Result<(), String> {
+        let a = a.as_ref().ok_or("null archive handle")?;
+        member_roll_verify_full_impl(a, arg_str(roll_json)?)
+    };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Rust-side round-trip tests (cargo test) — no FFI, exercise the composition.
 // ---------------------------------------------------------------------------
 
@@ -2910,6 +3159,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p["record"], serde_json::json!("guardian"));
+        // The wire ask names the polity — without it AT refuses to send it at all.
+        assert_eq!(p["polity_did"], serde_json::json!(polity));
         // The guardian's consent is required BEYOND the majority, and the caller
         // is told so before anyone is asked to sign.
         let required: Vec<&str> =
@@ -3341,5 +3592,178 @@ mod tests {
             .is_err(),
             "membership bytes must not describe as a guardian change"
         );
+    }
+
+    // --- P3.3 S9: the member-roll border artifact --------------------------
+    //
+    // The self-contained verifier is what KC can do: it establishes the
+    // PUBLISHER. The full verifier is what only a node holding the log can do:
+    // it audits the CLAIM. Several tests below turn on the two disagreeing,
+    // which is the point of shipping both.
+
+    fn roll_member(did: &str) -> kc_identity::RollMember {
+        let d = DidKey::from_str(did).unwrap();
+        let pk = d.to_pubkey().unwrap();
+        kc_identity::RollMember { member_did: d, member_pubkey: pk }
+    }
+
+    /// Hand-build a roll and sign it with whoever we like — the shape a stranger
+    /// can put on the wire, and the reason the verifier restates KC's rules
+    /// rather than trusting the minter.
+    fn roll_signed_by(
+        polity: &str,
+        members: Vec<kc_identity::RollMember>,
+        signer_did: &str,
+        signer_priv: &PrivKey,
+    ) -> String {
+        let now = time::now();
+        let payload = MemberRoll {
+            community_did: DidKey::from_str(polity).unwrap(),
+            members,
+            as_of: now,
+            published_at: now,
+        };
+        let signed = Signed::build(payload, &[(signer_did, signer_priv)]).unwrap();
+        serde_json::to_string(&signed).unwrap()
+    }
+
+    fn minted_roll(a: &EthneArchive, polity: &str, rp: &PrivKey, rpub: &PubKey) -> String {
+        member_roll_sign_impl(
+            a,
+            &serde_json::json!({
+                "polity_did": polity,
+                "root_priv": serde_json::to_value(rp).unwrap(),
+                "root_pub": serde_json::to_value(rpub).unwrap(),
+            })
+            .to_string(),
+        )
+        .expect("mint the roll")
+    }
+
+    #[test]
+    fn a_published_roll_verifies_both_ways() {
+        let (a, polity, rp, rpub, founders) = founded_with_envoy();
+        let roll = minted_roll(&a, &polity, &rp, &rpub);
+
+        member_roll_verify_impl(&roll).expect("self-contained roll verifies");
+        member_roll_verify_full_impl(&a, &roll).expect("and it matches the log");
+
+        let parsed: Signed<MemberRoll> = serde_json::from_str(&roll).unwrap();
+        assert_eq!(parsed.payload.members.len(), founders.len());
+        assert_eq!(parsed.payload.community_did.as_str(), polity);
+    }
+
+    #[test]
+    fn the_polity_is_not_named_on_its_own_roll() {
+        let (a, polity, rp, rpub, _f) = founded_with_envoy();
+        let roll = minted_roll(&a, &polity, &rp, &rpub);
+        let parsed: Signed<MemberRoll> = serde_json::from_str(&roll).unwrap();
+        // Its root key is already an insider; a second entry would be a repeated
+        // ring position. A true reading, not a gap.
+        assert!(
+            !parsed.payload.members.iter().any(|m| m.member_did.as_str() == polity),
+            "the polity must not appear on its own roll"
+        );
+    }
+
+    #[test]
+    fn a_tampered_roll_is_rejected() {
+        let (a, polity, rp, rpub, _f) = founded_with_envoy();
+        let roll = minted_roll(&a, &polity, &rp, &rpub);
+        let mut v: serde_json::Value = serde_json::from_str(&roll).unwrap();
+        // Drop a member after signing.
+        v["payload"]["members"].as_array_mut().unwrap().pop();
+        let tampered = v.to_string();
+
+        assert!(member_roll_verify_impl(&tampered).is_err(), "tampered roll must not verify");
+        assert!(member_roll_verify_full_impl(&a, &tampered).is_err());
+    }
+
+    #[test]
+    fn a_roll_signed_by_a_member_rather_than_the_root_is_rejected() {
+        let (a, polity, _rp, _rpub, founders) = founded_with_envoy();
+        // Perfectly good signature; simply not the community's.
+        let roll = roll_signed_by(
+            &polity,
+            founders.iter().map(|f| roll_member(&f.did)).collect(),
+            &founders[0].did,
+            &founders[0].priv_key,
+        );
+        let e = member_roll_verify_impl(&roll).expect_err("a member cannot publish the roll");
+        assert!(e.contains("not signed by the community"), "{e}");
+    }
+
+    #[test]
+    fn a_roll_naming_a_member_twice_is_rejected() {
+        let (a, polity, rp, _rpub, founders) = founded_with_envoy();
+        // NOT checked at mint — en_uplift passes the read model straight through
+        // — so this rule exists only here, on the receiving side.
+        let roll = roll_signed_by(
+            &polity,
+            vec![roll_member(&founders[0].did), roll_member(&founders[0].did)],
+            &polity,
+            &rp,
+        );
+        let e = member_roll_verify_impl(&roll).expect_err("a duplicate is a repeated ring position");
+        assert!(e.contains("twice"), "{e}");
+        let _ = a;
+    }
+
+    #[test]
+    fn a_roll_giving_a_member_a_key_its_did_does_not_resolve_to_is_rejected() {
+        let (_a, polity, rp, _rpub, founders) = founded_with_envoy();
+        let (_stray_did, _stray_priv, stray_pub) = keypair();
+        let mut m = roll_member(&founders[0].did);
+        // A real member named against a foreign key: an outsider in the ring
+        // under that member's name, and the ring is what bounds a reveal.
+        m.member_pubkey = stray_pub;
+        let roll = roll_signed_by(&polity, vec![m], &polity, &rp);
+        let e = member_roll_verify_impl(&roll).expect_err("foreign key must be refused");
+        assert!(e.contains("does not resolve to"), "{e}");
+    }
+
+    #[test]
+    fn a_roll_naming_the_community_itself_is_rejected() {
+        let (_a, polity, rp, _rpub, founders) = founded_with_envoy();
+        let roll = roll_signed_by(
+            &polity,
+            vec![roll_member(&founders[0].did), roll_member(&polity)],
+            &polity,
+            &rp,
+        );
+        let e = member_roll_verify_impl(&roll).expect_err("the community is not its own member");
+        assert!(e.contains("may not name the community itself"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_roll_is_not_a_roll() {
+        let (_a, polity, rp, _rpub, _f) = founded_with_envoy();
+        let roll = roll_signed_by(&polity, vec![], &polity, &rp);
+        assert!(member_roll_verify_impl(&roll).is_err());
+    }
+
+    #[test]
+    fn the_full_verifier_rejects_a_roll_the_log_does_not_agree_with() {
+        let (a, polity, rp, _rpub, founders) = founded_with_envoy();
+        // Root-signed, well-formed, and a lie: it names a stranger who was never
+        // admitted. THE SELF-CONTAINED CHECK PASSES — a roll is the polity
+        // speaking about itself, and KC could not catch this. The node holding
+        // the log can.
+        let stranger = ident();
+        let roll = roll_signed_by(
+            &polity,
+            founders
+                .iter()
+                .map(|f| roll_member(&f.did))
+                .chain(std::iter::once(roll_member(&stranger.did)))
+                .collect(),
+            &polity,
+            &rp,
+        );
+
+        member_roll_verify_impl(&roll).expect("the publisher is exactly who it claims to be");
+        let e = member_roll_verify_full_impl(&a, &roll)
+            .expect_err("the log does not agree with the claim");
+        assert!(e.contains("does not match the log"), "{e}");
     }
 }
