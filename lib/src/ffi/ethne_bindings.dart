@@ -148,6 +148,13 @@ class EthneFfi {
             'ethne_business_page_verify_bundle'),
         _verifyFull = lib.lookupFunction<_HandleSpecC, _HandleSpecDart>(
             'ethne_business_page_verify_full'),
+        // P3.4 — the business-post artifact (box 5).
+        _postSign = lib
+            .lookupFunction<_SpecOutC, _SpecOutDart>('ethne_business_post_sign'),
+        _verifyPostBundle = lib.lookupFunction<_StrC, _StrDart>(
+            'ethne_business_post_verify_bundle'),
+        _verifyPostFull = lib.lookupFunction<_HandleSpecC, _HandleSpecDart>(
+            'ethne_business_post_verify_full'),
         // P3.3 S9 — the member-roll border artifact (D26).
         _rollSign =
             lib.lookupFunction<_StateC, _StateDart>('ethne_member_roll_sign'),
@@ -188,6 +195,9 @@ class EthneFfi {
   final _SpecOutDart _pageSign;
   final _StrDart _verifyBundle;
   final _HandleSpecDart _verifyFull;
+  final _SpecOutDart _postSign;
+  final _StrDart _verifyPostBundle;
+  final _HandleSpecDart _verifyPostFull;
   final _StateDart _rollSign;
   final _StrDart _rollVerify;
   final _HandleSpecDart _rollVerifyFull;
@@ -371,6 +381,54 @@ class EthneFfi {
     final s = bundleJson.toNativeUtf8();
     try {
       return _verifyBundle(s) == 0;
+    } finally {
+      calloc.free(s);
+    }
+  }
+
+  /// Sign a business POST as [envoy], returning the `Signed<BusinessPost>` JSON
+  /// (the `post` half of a self-contained bundle). Needs no charter log — only
+  /// the envoy's key — so it lives on [EthneFfi], not [EthneArchive].
+  ///
+  /// A page is what the business IS; a post is what it SAYS. [seq] ORDERS a
+  /// business's posts, it does not version them: a post is never superseded,
+  /// which is why it is a payload of its own rather than a field on the page.
+  ///
+  /// [body] is clamped native-side to 512 chars, a bound chosen so the worst
+  /// case bundle still fits the wire cap the C core enforces. An empty body, or
+  /// one carrying control characters other than newline and tab, is REFUSED —
+  /// the first would put the envoy's authority behind nothing, the second would
+  /// make the wire size a function of the input.
+  String signBusinessPost({
+    required String polityDid,
+    required EthneKeypair envoy,
+    required String body,
+    int seq = 0,
+  }) {
+    final spec = jsonEncode({
+      'post': {'polity_did': polityDid, 'body': body, 'seq': seq},
+      'envoy_did': envoy.did,
+      'envoy_priv': envoy.priv,
+    }).toNativeUtf8();
+    final out = calloc<Pointer<Utf8>>();
+    try {
+      if (_postSign(spec, out) != 0) throw EthneException(_err());
+      return _takeString(out);
+    } finally {
+      calloc.free(spec);
+      calloc.free(out);
+    }
+  }
+
+  /// Verify a SELF-CONTAINED business-post bundle `{"post","delegation"}` with
+  /// no charter log: proves polity-root → envoy → post. THIS IS THE READER'S
+  /// VERIFIER — someone who holds the business's page holds no charter archive
+  /// — and nothing may be rendered as the business's words until it returns
+  /// true. On false, the reason is in [lastError]/`ethne_last_error`.
+  bool verifyBusinessPostBundle(String bundleJson) {
+    final s = bundleJson.toNativeUtf8();
+    try {
+      return _verifyPostBundle(s) == 0;
     } finally {
       calloc.free(s);
     }
@@ -857,6 +915,21 @@ class EthneArchive {
     final s = pageJson.toNativeUtf8();
     try {
       return _ffi._verifyFull(_handle, s) == 0;
+    } finally {
+      calloc.free(s);
+    }
+  }
+
+  /// Verify a business POST against the FULL charter log: post signature +
+  /// charter validity (verify_all + check_authority) + the signer being a
+  /// CURRENT authorized envoy. The strongest check, and it needs the polity's
+  /// log — so it is what the BUSINESS's own nodes use, where a reader uses
+  /// [EthneFfi.verifyBusinessPostBundle].
+  bool verifyBusinessPostFull(String postJson) {
+    _check();
+    final s = postJson.toNativeUtf8();
+    try {
+      return _ffi._verifyPostFull(_handle, s) == 0;
     } finally {
       calloc.free(s);
     }

@@ -1,14 +1,32 @@
 // Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors. Apache-2.0.
 //
-// FeedPage: the basic feed (Increment 7). Posts are listed ranked by S × recency
-// (the tie-strength kernel × post freshness), so local, tended, trusted authors
-// posting recently surface first. A compose box publishes a new post with a
-// PostAudience selector (the Inc-4 audience bands → the required trust tier the
-// core enforces). Incoming posts are already verified, tier-gated and deduped by
-// the core; outgoing posts are echoed locally at publish time.
+// FeedPage: the basic feed (Increment 7, extended by Phase 3 P3.4). Posts are
+// listed ranked by S × recency (the tie-strength kernel × post freshness), so
+// local, tended, trusted authors posting recently surface first. A compose box
+// publishes a new post with a PostAudience selector (the Inc-4 audience bands →
+// the required trust tier the core enforces). Incoming posts are already
+// verified, tier-gated and deduped by the core; outgoing posts are echoed
+// locally at publish time.
+//
+// BUSINESSES APPEAR IN THE SAME SCROLL, RENDERED DIFFERENTLY (P3.4 box 5). The
+// shop down the road and the friend down the road are both things happening
+// near you, so they share one feed; what separates them is the tile, not a
+// segregated section. A business tile says three things a person's does not:
+// that the words are the POLITY's (a storefront mark, the business's name off
+// its verified page — never a node's uuid), that the envoy chain CHECKED OUT
+// against the charter, and, when it travelled, that it reached you through a
+// relay rather than straight from the business.
+//
+// AND IT SAYS WHAT IT REFUSED. A post whose envoy signature does not verify is
+// never rendered under a business's name — it is counted in a banner instead.
+// A reader told nothing cannot tell "the cafe has been quiet" from "something
+// claiming to be the cafe was refused", and those are different facts about a
+// neighbourhood.
 
 import 'package:flutter/material.dart';
 
+import '../model/business_post.dart';
+import '../model/feed_entry.dart';
 import '../model/post.dart';
 import '../model/tie_strength.dart';
 import '../node/peer_stream.dart';
@@ -49,18 +67,48 @@ class _FeedPageState extends State<FeedPage> {
             child: AnimatedBuilder(
               animation: widget.service,
               builder: (context, _) {
-                final posts = widget.service.feed;
-                if (posts.isEmpty) {
+                final entries = widget.service.feed;
+                final refused = widget.service.businessPostsUnverified;
+                if (entries.isEmpty && refused == 0) {
                   return const Center(
                     child: Text('No posts yet — share something.'),
                   );
                 }
+                // The banner counts business posts that failed envoy
+                // verification. It sits ABOVE the list and shows even when the
+                // list is empty, because "nothing here" and "nothing here that
+                // proved itself" are different things to be told.
+                final banner = refused > 0
+                    ? _UnverifiedBanner(count: refused)
+                    : null;
+                if (entries.isEmpty) {
+                  return ListView(
+                    padding: const EdgeInsets.all(8),
+                    children: [
+                      banner!,
+                      const SizedBox(height: 12),
+                      const Center(
+                        child: Text('No posts yet — share something.'),
+                      ),
+                    ],
+                  );
+                }
                 return ListView.separated(
                   padding: const EdgeInsets.all(8),
-                  itemCount: posts.length,
+                  itemCount: entries.length + (banner == null ? 0 : 1),
                   separatorBuilder: (_, __) => const Divider(height: 1),
-                  itemBuilder: (context, i) =>
-                      _PostTile(post: posts[i], service: widget.service),
+                  itemBuilder: (context, i) {
+                    if (banner != null) {
+                      if (i == 0) return banner;
+                      i -= 1;
+                    }
+                    final entry = entries[i];
+                    return switch (entry) {
+                      PersonEntry(:final post) =>
+                        _PostTile(post: post, service: widget.service),
+                      BusinessEntry() => _BusinessPostTile(entry: entry),
+                    };
+                  },
                 );
               },
             ),
@@ -119,6 +167,86 @@ class _FeedPageState extends State<FeedPage> {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// How many business posts were refused, and why that is worth saying.
+class _UnverifiedBanner extends StatelessWidget {
+  const _UnverifiedBanner({required this.count});
+
+  final int count;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Card(
+      color: scheme.errorContainer,
+      margin: EdgeInsets.zero,
+      child: ListTile(
+        dense: true,
+        leading: Icon(Icons.gpp_maybe, color: scheme.onErrorContainer),
+        title: Text(
+          count == 1
+              ? '1 business post could not be verified'
+              : '$count business posts could not be verified',
+          style: TextStyle(color: scheme.onErrorContainer),
+        ),
+        subtitle: Text(
+          'Their envoy signature did not check out against the charter, so '
+          'they are not shown as any business\'s words.',
+          style: TextStyle(color: scheme.onErrorContainer),
+        ),
+      ),
+    );
+  }
+}
+
+/// A business post: the polity speaking, and visibly not a person.
+class _BusinessPostTile extends StatelessWidget {
+  const _BusinessPostTile({required this.entry});
+
+  final BusinessEntry entry;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final BusinessPost post = entry.post;
+    // The name comes off the VERIFIED page. With no page held there is no name
+    // to show, and we show the DID rather than invent one — a business that
+    // has not proved who it is does not get to be called anything.
+    final who = entry.displayName.isNotEmpty
+        ? entry.displayName
+        : (post.polity.length <= 20
+            ? post.polity
+            : '${post.polity.substring(0, 20)}…');
+    final provenance = entry.outgoing
+        ? 'posted as this business'
+        : (post.hops == 0 ? 'direct from the business' : 'relayed');
+    return ListTile(
+      leading: CircleAvatar(
+        backgroundColor: scheme.tertiaryContainer,
+        child: Icon(Icons.storefront,
+            size: 18, color: scheme.onTertiaryContainer),
+      ),
+      title: Text(post.body),
+      subtitle: Row(
+        children: [
+          Flexible(
+            child: Text('$who · $provenance',
+                overflow: TextOverflow.ellipsis),
+          ),
+          const SizedBox(width: 6),
+          // Not decoration: this is the claim the reader is being asked to
+          // rely on, so it is stated rather than implied by the post's mere
+          // presence.
+          Icon(Icons.verified, size: 14, color: scheme.primary),
+          const SizedBox(width: 2),
+          Text('envoy-signed',
+              style: TextStyle(fontSize: 11, color: scheme.primary)),
+        ],
+      ),
+      dense: true,
     );
   }
 }

@@ -338,6 +338,9 @@ import ctypes, json, sys, time
 
 UUID, KEY, GEO, PROF, DM, PID, PBODY = 16, 32, 12, 2560, 1024, 64, 4096
 BDID, BADID, BBUN = 95, 64, 3072
+# Business POST bounds (Phase 3 P3.4): its bundle carries the body, so it is
+# larger than the page bundle's 3072. Measured worst case 3550 of 4096.
+BPID, BPBUN = 64, 4096
 # Co-signing bounds (Phase 3 P3.3): AGORA_COSIGN_{BYTES,DID,CID,SIG,TOKEN}_MAX
 CBYT, CDID, CCID, CSIG, CTOK = 6144, 95, 67, 128, 15
 
@@ -387,11 +390,22 @@ class Ev(ctypes.Structure):
         ("cosign_seq", ctypes.c_int64),
         ("cosign_ts", ctypes.c_double),
         ("cosign_bytes", ctypes.c_char * (CBYT + 1)),
+        # AGORA_EVENT_BUSINESS_POST (Phase 3 P3.4), appended LAST.
+        # business_post_bundle is the OPAQUE Ethne {post,delegation} artifact —
+        # the core verified only that these bytes arrived unaltered from
+        # whoever sent them; the ENVOY signature inside is what makes them the
+        # business's words, and only the app checks that.
+        ("business_post_polity", ctypes.c_char * (BDID + 1)),
+        ("business_post_id", ctypes.c_char * (BPID + 1)),
+        ("business_post_seq", ctypes.c_int64),
+        ("business_post_ts", ctypes.c_double),
+        ("business_post_hops", ctypes.c_int32),
+        ("business_post_bundle", ctypes.c_char * (BPBUN + 1)),
     ]
 
 # ABI guard: MUST equal sizeof(agora_event_t) in at_agora_shim.h. A silent drift
 # here would decode every field past the drift point as garbage.
-assert ctypes.sizeof(Ev) == 17872, f"Ev size {ctypes.sizeof(Ev)} != 17872 (ABI drift)"
+assert ctypes.sizeof(Ev) == 22152, f"Ev size {ctypes.sizeof(Ev)} != 22152 (ABI drift)"
 
 EV_BUSINESS_AD = 12
 SAT_SELF = 0xFF

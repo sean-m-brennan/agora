@@ -12,6 +12,7 @@ import 'package:agora/src/ffi/at_events_bindings.dart';
 import 'package:agora/src/model/feed_store.dart';
 import 'package:agora/src/model/post.dart';
 import 'package:agora/src/model/tie_strength.dart';
+import 'package:agora/src/model/feed_entry.dart';
 import 'package:agora/src/node/peer_stream.dart';
 
 AtRawEvent _postEvent(
@@ -49,7 +50,9 @@ void main() {
       final svc = PeerService();
       svc.ingestEvents([_postEvent(u1, 'id1', 'hello feed', seq: 3, tier: 1)]);
       expect(svc.feedCount, 1);
-      final p = svc.feed.single;
+      // The feed is mixed since P3.4, so a test asserting PERSON-post fields
+      // says which kind it holds rather than assuming the only kind.
+      final p = (svc.feed.single as PersonEntry).post;
       expect(p.body, 'hello feed');
       expect(p.seq, 3);
       expect(p.requiredTier, 1);
@@ -84,7 +87,7 @@ void main() {
       svc.addListener(() => notified++);
       final rc = svc.publishPost('my post', PostAudience.friend);
       expect(rc, -1); // no event channel open yet
-      final p = svc.feed.single;
+      final p = (svc.feed.single as PersonEntry).post;
       expect(p.body, 'my post');
       expect(p.outgoing, isTrue);
       expect(p.requiredTier, minTierForAudience(PostAudience.friend));

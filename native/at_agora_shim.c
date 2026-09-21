@@ -63,6 +63,12 @@ _Static_assert(AGORA_COSIGN_SIG_MAX == AT_APP_COSIGN_SIG_LEN,
                "AGORA_COSIGN_SIG_MAX out of sync with AT_APP_COSIGN_SIG_LEN");
 _Static_assert(AGORA_COSIGN_TOKEN_MAX == AT_APP_COSIGN_TOKEN_LEN,
                "AGORA_COSIGN_TOKEN_MAX out of sync with AT_APP_COSIGN_TOKEN_LEN");
+_Static_assert(AGORA_BUSINESS_POST_BUNDLE_MAX == AT_APP_BUSINESS_POST_BUNDLE_LEN,
+               "AGORA_BUSINESS_POST_BUNDLE_MAX out of sync with "
+               "AT_APP_BUSINESS_POST_BUNDLE_LEN");
+_Static_assert(AGORA_BUSINESS_POST_ID_MAX == AT_APP_BUSINESS_POST_ID_LEN,
+               "AGORA_BUSINESS_POST_ID_MAX out of sync with "
+               "AT_APP_BUSINESS_POST_ID_LEN");
 /* ABI lockstep: the Dart AgoraEvent struct and the ctypes Ev in the cohort
  * tests (test/cohort/two_node_cohort.sh, two_node_gui.sh) all assert this exact
  * size. Growing agora_event_t REQUIRES bumping all three together. Grew from
@@ -90,7 +96,22 @@ _Static_assert(AGORA_COSIGN_TOKEN_MAX == AT_APP_COSIGN_TOKEN_LEN,
  * nothing at all — which is why the authoring side refuses an oversized exchange
  * rather than letting anything truncate it. The bound is MEASURED; see
  * AT_APP_COSIGN_BYTES_LEN in app_events.h. */
-_Static_assert(sizeof(agora_event_t) == 17872,
+/* Grew again from 17872 to 22152 with the Phase 3 P3.4 business-post tail
+ * (business_post_polity, business_post_id, business_post_seq, business_post_ts,
+ * business_post_hops, business_post_bundle) appended after cosign_bytes; every
+ * prior field offset is unchanged (business_bundle stays at 8208,
+ * cosign_bytes at 11720). The bundle
+ * dominates, for the third time and the same reason: it is an opaque Ethne
+ * artifact that must cross WHOLE, because only the app can verify it and a
+ * signature over bytes that arrive short verifies against nothing. Its bound is
+ * MEASURED — worst case 3550 of 4096, printed by
+ * the_worst_case_post_bundle_fits_the_wire_bound in ethne_ffi.
+ *
+ * NOTE WHAT DID NOT GROW: at_app_event_t is a UNION and at_app_business_post_t
+ * (~4.3 KB) stays under at_app_cosign_request_t's 6145, so agora_events_poll's
+ * 16-event batch budget is exactly what it was. This flat struct is the only
+ * thing that widened. */
+_Static_assert(sizeof(agora_event_t) == 22152,
                "agora_event_t size changed — update the Dart struct and both "
                "cohort ctypes Ev asserts in lockstep");
 
@@ -182,6 +203,15 @@ int agora_set_customer(void *handle, const char *send_queue,
 {
     return at_app_events_set_customer((at_app_events_t *)handle, send_queue,
                                       polity_did, satisfaction, bundle, seq);
+}
+
+int agora_publish_business_post(void *handle, const char *send_queue,
+                                const char *polity_did, const char *bundle,
+                                int64_t seq)
+{
+    return at_app_events_publish_business_post((at_app_events_t *)handle,
+                                               send_queue, polity_did, bundle,
+                                               seq);
 }
 
 int agora_set_exact_position(void *handle, const char *send_queue, int opt_in,
@@ -387,6 +417,26 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             e->cosign_sig[AGORA_COSIGN_SIG_MAX] = '\0';
             e->cosign_seq = raw[i].data.cosign_sig.seq;
             e->cosign_ts = raw[i].data.cosign_sig.ts;
+            w++;
+            break;
+        case AT_APP_EVENT_BUSINESS_POST:
+            e->kind = AGORA_EVENT_BUSINESS_POST;
+            memcpy(e->peer_uuid, raw[i].data.business_post.publisher_uuid,
+                   AGORA_UUID_LEN);
+            /* The core NUL-caps every string and the event was memset, so a
+             * short string stays terminated after the bounded copy. */
+            memcpy(e->business_post_polity, raw[i].data.business_post.polity,
+                   AGORA_BUSINESS_DID_MAX);
+            e->business_post_polity[AGORA_BUSINESS_DID_MAX] = '\0';
+            memcpy(e->business_post_id, raw[i].data.business_post.post_id,
+                   AGORA_BUSINESS_POST_ID_MAX);
+            e->business_post_id[AGORA_BUSINESS_POST_ID_MAX] = '\0';
+            e->business_post_seq = raw[i].data.business_post.seq;
+            e->business_post_ts = raw[i].data.business_post.ts;
+            e->business_post_hops = raw[i].data.business_post.hops;
+            memcpy(e->business_post_bundle, raw[i].data.business_post.bundle,
+                   AGORA_BUSINESS_POST_BUNDLE_MAX);
+            e->business_post_bundle[AGORA_BUSINESS_POST_BUNDLE_MAX] = '\0';
             w++;
             break;
         case AT_APP_EVENT_BUSINESS_AD:

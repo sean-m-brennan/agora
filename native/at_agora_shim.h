@@ -69,6 +69,15 @@ extern "C" {
 /* A business advertising its OWN page rather than a customer rating it. MUST
  * match AT_APP_BUSINESS_SAT_SELF (app_events.h) / AT_BUSINESS_SAT_SELF. */
 #define AGORA_BUSINESS_SAT_SELF 0xFF
+/* Max opaque Ethne {post,delegation} bundle length on a business post (Phase 3
+ * P3.4). Larger than the page bundle because the body rides inside it; the
+ * measured worst case is 3550. MUST match AT_APP_BUSINESS_POST_BUNDLE_LEN
+ * (app_events.h) / AT_BUSINESS_POST_BUNDLE_LEN (msg_types.h) /
+ * AT_BUSINESS_POST_BUNDLE_MAX (identity/business_post.h). */
+#define AGORA_BUSINESS_POST_BUNDLE_MAX 4096
+/* Business-post content-id length (blake2b-256 lowercase hex). MUST match
+ * AT_APP_BUSINESS_POST_ID_LEN / AT_BUSINESS_POST_ID_LEN. */
+#define AGORA_BUSINESS_POST_ID_MAX 64
 /* Max hex characters of a detached exchange's exported canonical bytes (Phase 3
  * P3.3). MUST match AT_APP_COSIGN_BYTES_LEN (app_events.h) /
  * AT_COSIGN_BYTES_LEN (msg_types.h) / AT_COSIGN_BYTES_MAX (identity/cosign.h) /
@@ -98,6 +107,7 @@ extern "C" {
 #define AGORA_EVENT_BUSINESS_AD        12
 #define AGORA_EVENT_COSIGN_REQUEST     13
 #define AGORA_EVENT_COSIGN_SIGNATURE   14
+#define AGORA_EVENT_BUSINESS_POST      15
 
 /**
  * One flattened app event. Field order is ABI-significant: the Dart
@@ -234,6 +244,32 @@ typedef struct {
     int64_t cosign_seq;
     double  cosign_ts;
     char    cosign_bytes[AGORA_COSIGN_BYTES_MAX + 1];
+    /* AGORA_EVENT_BUSINESS_POST (Phase 3 P3.4): the business speaking, in the
+     * feed. Appended LAST after cosign_bytes so every prior field offset is
+     * unchanged; the Dart AgoraEvent and the cohort ctypes Ev mirror this order
+     * and re-check the new sizeof.
+     *
+     * peer_uuid is the node that PUBLISHED the post — always the original,
+     * never a relay, since a relay forwards the envelope untouched and changes
+     * only business_post_hops. It is NOT the authority. business_post_polity
+     * names the business, business_post_seq is its own post counter,
+     * business_post_hops how far THIS COPY travelled, business_post_id the
+     * blake2b content address (the dedup key, one per post however many paths
+     * it took).
+     *
+     * business_post_bundle is OPAQUE and NOT verified by the core, exactly like
+     * business_bundle: it is the Ethne {post,delegation} artifact, and the
+     * ENVOY signature inside it is the only thing that makes these the
+     * business's words. Run ethne_business_post_verify_bundle before rendering
+     * anything under the business's name — being on the roll, or having
+     * published it, confers nothing. What the core DID verify is the sender's
+     * signature: that these exact bytes arrived unaltered. */
+    char    business_post_polity[AGORA_BUSINESS_DID_MAX + 1];
+    char    business_post_id[AGORA_BUSINESS_POST_ID_MAX + 1];
+    int64_t business_post_seq;
+    double  business_post_ts;
+    int32_t business_post_hops;
+    char    business_post_bundle[AGORA_BUSINESS_POST_BUNDLE_MAX + 1];
 } agora_event_t;
 
 /** Set $AUTONOMOUS_TRUST_ROOT for THIS process, so the app-events client below
@@ -348,6 +384,24 @@ int agora_advertise_business(void *handle, const char *send_queue,
 int agora_set_customer(void *handle, const char *send_queue,
                        const char *polity_did, int satisfaction,
                        const char *bundle, int64_t seq);
+
+/** Publish a business POST — the polity speaking (Phase 3 P3.4). `polity_did`
+ *  is the business's Ethne DID, `bundle` the OPAQUE self-verifying
+ *  {post,delegation} artifact the app built through Ethne
+ *  (ethne_business_post_sign paired with ethne_envoy_delegation), `seq` the
+ *  business's own post counter. Sends AT_APP_PUBLISH_BUSINESS_POST; identity
+ *  signs the canonical post with this node's key and group-multicasts it, and
+ *  readers relay it one bounded hop.
+ *
+ *  THIS CALL CONFERS NO AUTHORITY. The core cannot tell an envoy from anyone
+ *  else; a node that signs a bundle it holds no delegation for will put a post
+ *  on the wire that every receiver refuses. Readers also drop a post from a
+ *  polity they hold no page for, so an audience is reached through P3.2's ads
+ *  first.
+ *  @return 0 on success, AGORA_NOT_READY if the queue is not bound, -1 otherwise. */
+int agora_publish_business_post(void *handle, const char *send_queue,
+                                const char *polity_did, const char *bundle,
+                                int64_t seq);
 
 int agora_request_proximity(void *handle, const char *send_queue,
                             const uint8_t *peer_uuid);

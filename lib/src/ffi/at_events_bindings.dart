@@ -46,6 +46,14 @@ const int agoraBusinessSatSelf = 0xFF;
 const int agoraCosignBytesMax = 6144;
 
 /// Max polity DID or signer did:key length (must match AGORA_COSIGN_DID_MAX).
+/// Max opaque Ethne {post,delegation} bundle on a business post (Phase 3 P3.4).
+/// Larger than the page bundle because the body rides inside it; the measured
+/// worst case is 3550. Mirrors AGORA_BUSINESS_POST_BUNDLE_MAX in the shim.
+const int agoraBusinessPostBundleMax = 4096;
+
+/// Business-post content-id length (blake2b-256 lowercase hex).
+const int agoraBusinessPostIdMax = 64;
+
 const int agoraCosignDidMax = 95;
 
 /// Exchange content id, `b3:` + 64 hex (must match AGORA_COSIGN_CID_MAX).
@@ -83,6 +91,13 @@ const int agoraEventCosignRequest = 13;
 /// THIS node is authoring. Verify it against the payload before appending; the
 /// core neither did nor could.
 const int agoraEventCosignSignature = 14;
+
+/// A signed business POST — the polity speaking, in the feed (Phase 3 P3.4).
+/// [AgoraEvent.peerUuid] is the node that PUBLISHED it — always the original,
+/// since a relay forwards the envelope untouched and changes only the hop
+/// count — and is NOT the authority: the envoy signature inside
+/// [AtRawEvent.businessPostBundle] is, and only this side can check it.
+const int agoraEventBusinessPost = 15;
 
 /// dart:ffi mirror of `agora_event_t` (native/at_agora_shim.h). Field order and
 /// element counts MUST match the C struct exactly — the layout is the ABI
@@ -272,6 +287,35 @@ final class AgoraEvent extends Struct {
 
   @Array(agoraCosignBytesMax + 1)
   external Array<Uint8> cosignBytes;
+
+  /// [agoraEventBusinessPost] (Phase 3 P3.4). Appended after [cosignBytes] to
+  /// mirror the C `agora_event_t`, which grew from 17872 to 22152 bytes; every
+  /// prior field offset is unchanged (businessBundle stays at 8208,
+  /// cosignBytes at 11720).
+  ///
+  /// [peerUuid] carries the PUBLISHER, signature-bound and never a relay;
+  /// [businessPostHops] says how far this copy travelled. It is not the
+  /// authority.
+  /// [businessPostBundle] is OPAQUE and UNVERIFIED here, exactly like
+  /// [businessBundle]: run `ethne_business_post_verify_bundle` (no charter log
+  /// needed) before rendering a word of it under the business's name.
+  @Array(agoraBusinessDidMax + 1)
+  external Array<Uint8> businessPostPolity;
+
+  @Array(agoraBusinessPostIdMax + 1)
+  external Array<Uint8> businessPostId;
+
+  @Int64()
+  external int businessPostSeq;
+
+  @Double()
+  external double businessPostTs;
+
+  @Int32()
+  external int businessPostHops;
+
+  @Array(agoraBusinessPostBundleMax + 1)
+  external Array<Uint8> businessPostBundle;
 }
 
 /// A pure-Dart copy of one decoded event. Decoupled from native memory so it
@@ -319,6 +363,12 @@ class AtRawEvent {
     this.cosignSeq = 0,
     this.cosignTs = 0,
     this.cosignBytes = '',
+    this.businessPostPolity = '',
+    this.businessPostId = '',
+    this.businessPostSeq = 0,
+    this.businessPostTs = 0,
+    this.businessPostHops = 0,
+    this.businessPostBundle = '',
   });
 
   final int kind;
@@ -434,6 +484,24 @@ class AtRawEvent {
   final int cosignSeq;
   final double cosignTs;
   final String cosignBytes;
+
+  /// [agoraEventBusinessPost] (Phase 3 P3.4): the business speaking.
+  /// [businessPostPolity] names it, [businessPostId] is the blake2b content
+  /// address (the dedup key), [businessPostSeq] the business's own post
+  /// counter, [businessPostHops] how far this copy travelled.
+  ///
+  /// [businessPostBundle] is the OPAQUE Ethne {post,delegation} artifact and is
+  /// UNVERIFIED at this boundary. The core checked only that these bytes are
+  /// exactly what the publisher signed; that the BUSINESS said them is the
+  /// envoy signature's job, and checking it is this side's. A post that
+  /// does not verify is not the business's word and must never be rendered as
+  /// one.
+  final String businessPostPolity;
+  final String businessPostId;
+  final int businessPostSeq;
+  final double businessPostTs;
+  final int businessPostHops;
+  final String businessPostBundle;
 }
 
 typedef _SetRootC = Void Function(Pointer<Utf8>);
@@ -503,6 +571,11 @@ typedef _SetExactDart = int Function(
 typedef _AdvertiseBusinessC = Int32 Function(
     Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Int64);
 typedef _AdvertiseBusinessDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, int);
+
+typedef _PublishBusinessPostC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Int64);
+typedef _PublishBusinessPostDart = int Function(
     Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, int);
 
 typedef _SetCustomerC = Int32 Function(
@@ -640,6 +713,19 @@ String _businessBundleString(Array<Uint8> src) {
   return utf8.decode(bytes, allowMalformed: true);
 }
 
+/// Decode the NUL-terminated opaque Ethne post bundle from the fixed byte
+/// array. The bytes are UNVERIFIED here — see [AtRawEvent.businessPostBundle].
+String _businessPostBundleString(Array<Uint8> src) {
+  final bytes = <int>[];
+  for (var i = 0; i < agoraBusinessPostBundleMax; i++) {
+    final b = src[i];
+    if (b == 0) break;
+    bytes.add(b);
+  }
+  if (bytes.isEmpty) return '';
+  return utf8.decode(bytes, allowMalformed: true);
+}
+
 /// Thin, fork-free client over the AutonomousTrust app-events queue.
 class AtEvents {
   AtEvents._(this._handle);
@@ -684,6 +770,9 @@ class AtEvents {
           'agora_advertise_business');
   static final _SetCustomerDart _setCustomer = _lib
       .lookupFunction<_SetCustomerC, _SetCustomerDart>('agora_set_customer');
+  static final _PublishBusinessPostDart _publishBusinessPost =
+      _lib.lookupFunction<_PublishBusinessPostC, _PublishBusinessPostDart>(
+          'agora_publish_business_post');
   static final _PollDart _poll =
       _lib.lookupFunction<_PollC, _PollDart>('agora_events_poll');
   static final _CloseDart _close =
@@ -1022,6 +1111,30 @@ class AtEvents {
     }
   }
 
+  /// Publish a business POST — the polity speaking (Phase 3 P3.4). [bundle] is
+  /// the OPAQUE Ethne {post,delegation} artifact, already ENVOY-signed by the
+  /// app; [seq] is the business's own post counter. Returns 0 on success,
+  /// negative on error (-2 == daemon not ready).
+  ///
+  /// THIS CONFERS NO AUTHORITY. The core cannot tell an envoy from anyone else:
+  /// sign a bundle this node holds no delegation for and every receiver will
+  /// refuse the post. Readers also drop a post from a business they hold no
+  /// page for, so reach begins with an ad ([advertiseBusiness]) and grows one
+  /// relayed hop at a time.
+  int publishBusinessPost(String sendQueue, String polityDid, String bundle,
+      {int seq = 0}) {
+    final q = sendQueue.toNativeUtf8();
+    final d = polityDid.toNativeUtf8();
+    final b = bundle.toNativeUtf8();
+    try {
+      return _publishBusinessPost(_handle, q, d, b, seq);
+    } finally {
+      calloc.free(q);
+      calloc.free(d);
+      calloc.free(b);
+    }
+  }
+
   /// Declare, update or clear THIS node's CUSTOMER edge to a business (Phase 3
   /// P3.2). The edge is what authorizes this node to CARRY the page: the core
   /// caches [bundle] and advertises it in the FIRST PERSON with [satisfaction]
@@ -1100,6 +1213,12 @@ class AtEvents {
           cosignSeq: e.cosignSeq,
           cosignTs: e.cosignTs,
           cosignBytes: _boundedString(e.cosignBytes, agoraCosignBytesMax),
+          businessPostPolity: _businessDidString(e.businessPostPolity),
+          businessPostId: _postIdString(e.businessPostId),
+          businessPostSeq: e.businessPostSeq,
+          businessPostTs: e.businessPostTs,
+          businessPostHops: e.businessPostHops,
+          businessPostBundle: _businessPostBundleString(e.businessPostBundle),
         );
       }, growable: false);
     } finally {

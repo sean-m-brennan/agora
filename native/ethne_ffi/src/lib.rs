@@ -1789,6 +1789,223 @@ pub unsafe extern "C" fn ethne_business_page_verify_full(
 }
 
 // ===========================================================================
+// P3.4 — the business-post artifact (SOCIAL_APP_PLAN.md box 5)
+// ===========================================================================
+//
+// A page is what the business IS; a post is what it SAYS. Same authority, same
+// two verification models, a different payload: bounded body text wrapped in
+// Signed<BusinessPost> under the ENVOY's key and, over the wire, paired with the
+// polity-root-signed delegation so a reader holding no charter log can still
+// chain polity root -> envoy -> post.
+//
+// WHY A SEPARATE PAYLOAD TYPE rather than a page with a body field: a page is
+// the business's CURRENT identity and its successor REPLACES it (seq versions
+// it), while a post is a dated utterance that stands on its own and is never
+// superseded. One type for both would let a page revision silently retract a
+// post, and would make every post re-carry the whole page.
+//
+// AN EMPTY BODY IS REFUSED AT SIGNING. A page may legitimately leave fields
+// blank; a post with nothing in it is not an utterance, and signing one would
+// put the envoy's authority behind nothing at all.
+//
+// BODY BOUND, AND WHY A POST DOES NOT REUSE THE PAGE'S 3072-BYTE CAP.
+// MEASURED, not guessed. The bundle's fixed cost — the polity-root delegation,
+// two signature blocks and the JSON frame — is ~1514 bytes, and `clamp` counts
+// CHARS while the wire counts BYTES, so the worst case a caller can hand us is
+// four bytes per char. At 1024 chars that measures 5610 bytes, well over the
+// page's 3072. Rather than silently shrink a business's voice to ~370 chars,
+// the post carries its OWN wire cap, AT_BUSINESS_POST_BUNDLE_LEN = 4096:
+//     1514 + 4 * 512 = 3562 bytes worst case, 534 bytes of headroom.
+// That keeps at_app_business_post_t (~4.3 KB) under at_app_cosign_request_t's
+// 6145, so at_app_event_t's union — and with it agora_events_poll's 16-event
+// batch budget — does not grow at all. `the_worst_case_post_bundle_fits_the_
+// wire_bound` re-measures on every run and fails the moment either number moves.
+//
+// Control characters are refused at signing rather than escaped: a body of raw
+// control bytes expands six-fold in JSON (\u00XX), which would make the worst
+// case a function of the caller's input rather than of the bound. Newline and
+// tab are kept — they are what a post is written with — and escape to two bytes.
+
+/// Char budget for a post body. See the note above: chosen against the measured
+/// worst-case bundle, not picked for roundness.
+const BUSINESS_POST_BODY_MAX: usize = 512;
+
+/// The post bundle's wire cap, mirrored by AT_BUSINESS_POST_BUNDLE_LEN in the C
+/// core (msg_types.h / business_post.h) and by the shim. Changing it here means
+/// changing it in all four ABI mirrors.
+const BUSINESS_POST_BUNDLE_MAX: usize = 4096;
+
+/// The body bound and the wire cap are ONE decision, so tie them together where
+/// the compiler can see it: the worst case is four bytes per char (the clamp
+/// counts chars, the wire counts bytes) plus the bundle's fixed cost — the
+/// polity-root delegation, two signature blocks and the JSON frame, measured at
+/// ~1514 bytes and rounded up here. Widen the body without raising the cap and
+/// this fails the BUILD, rather than waiting for a post to be truncated on the
+/// wire and verify against nothing. `the_worst_case_post_bundle_fits_the_wire_
+/// bound` still measures the real thing; this is the arithmetic behind it.
+const _: () = assert!(
+    BUSINESS_POST_BODY_MAX * 4 + 1600 <= BUSINESS_POST_BUNDLE_MAX,
+    "BUSINESS_POST_BODY_MAX no longer fits BUSINESS_POST_BUNDLE_MAX at four \
+     bytes per char plus the bundle's fixed cost"
+);
+
+/// The post payload the envoy signs. `seq` orders a business's own posts; it
+/// does NOT version them (a post is never superseded).
+#[derive(Serialize, Deserialize)]
+struct BusinessPost {
+    polity: DidKey,
+    body: String,
+    seq: u64,
+}
+
+#[derive(Deserialize)]
+struct PostContent {
+    polity_did: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    seq: u64,
+}
+
+#[derive(Deserialize)]
+struct PostSignSpec {
+    post: PostContent,
+    envoy_did: String,
+    envoy_priv: PrivKey,
+}
+
+/// The portable, self-contained business-post bundle.
+#[derive(Deserialize)]
+struct PostBundle {
+    post: Signed<BusinessPost>,
+    delegation: Signed<SpeakerDelegation>,
+}
+
+fn post_sign_impl(spec: &str) -> Result<String, String> {
+    let s: PostSignSpec = serde_json::from_str(spec).map_err(|e| format!("bad post spec: {e}"))?;
+    let polity = DidKey::from_str(&s.post.polity_did).map_err(|e| e.to_string())?;
+    let body = clamp(s.post.body, BUSINESS_POST_BODY_MAX);
+    if body.trim().is_empty() {
+        return Err("a post with an empty body is not an utterance".into());
+    }
+    // See the note above the body bound: control characters would make the
+    // worst-case wire size a function of the input, so they are refused rather
+    // than escaped. Newline and tab are what a post is written with.
+    if let Some(c) = body.chars().find(|c| c.is_control() && *c != '\n' && *c != '\t') {
+        return Err(format!("a post body may not carry control character U+{:04X}", c as u32));
+    }
+    let post = BusinessPost { polity, body, seq: s.post.seq };
+    let signed =
+        Signed::build(post, &[(s.envoy_did.as_str(), &s.envoy_priv)]).map_err(|e| e.to_string())?;
+    serde_json::to_string(&signed).map_err(|e| e.to_string())
+}
+
+/// Sign a business post as the envoy. `spec` = `{"post":{"polity_did","body",
+/// "seq"},"envoy_did","envoy_priv"}`. Writes the `Signed<BusinessPost>` JSON to
+/// `*out`. Refuses an empty body and any control character other than newline
+/// or tab; the body is clamped to `BUSINESS_POST_BODY_MAX` chars.
+///
+/// # Safety
+/// `spec`/`out` valid.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_business_post_sign(spec: *const c_char, out: *mut *mut c_char) -> i32 {
+    let run = || -> Result<(), String> { set_out(out, post_sign_impl(arg_str(spec)?)?) };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+fn verify_post_bundle_impl(bundle: &str) -> Result<(), String> {
+    let b: PostBundle = serde_json::from_str(bundle).map_err(|e| format!("bad bundle: {e}"))?;
+    // The same five steps the page bundle answers, against the post payload.
+    // 1. The delegation is signed by the polity root (signer == community_did,
+    //    resolvable straight from its did:key — no log needed).
+    b.delegation
+        .verify(didkey_resolver)
+        .map_err(|e| format!("delegation signature invalid: {e}"))?;
+    // 2. The post is signed by the envoy.
+    b.post
+        .verify(didkey_resolver)
+        .map_err(|e| format!("post signature invalid: {e}"))?;
+    // 3. The post's signer is exactly the delegated speaker (envoy).
+    if signer_of(&b.post)? != b.delegation.payload.speaker_did.as_str() {
+        return Err("post signer is not the delegated envoy".into());
+    }
+    // 4. The delegation is for the post's polity.
+    if b.delegation.payload.community_did != b.post.payload.polity {
+        return Err("delegation is for a different polity than the post".into());
+    }
+    // 5. The delegation is currently in force (not expired / revoked).
+    if !b.delegation.payload.active_at(time::now()) {
+        return Err("envoy delegation is not currently active".into());
+    }
+    Ok(())
+}
+
+/// Verify a SELF-CONTAINED business-post bundle `{"post","delegation"}`: proves
+/// polity-root -> envoy -> post with no charter log. This is the verifier a
+/// READER uses — it holds the business's page, not the polity's archive. 0 if
+/// authentic, negative otherwise (reason in `ethne_last_error`).
+///
+/// # Safety
+/// `bundle` valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_business_post_verify_bundle(bundle: *const c_char) -> i32 {
+    let run = || -> Result<(), String> { verify_post_bundle_impl(arg_str(bundle)?) };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+fn verify_post_full_impl(a: &EthneArchive, post_json: &str) -> Result<(), String> {
+    let post: Signed<BusinessPost> =
+        serde_json::from_str(post_json).map_err(|e| format!("bad post: {e}"))?;
+    post.verify(didkey_resolver)
+        .map_err(|e| format!("post signature invalid: {e}"))?;
+    let envoy_did = DidKey::from_str(signer_of(&post)?).map_err(|e| e.to_string())?;
+    let guard = a.0.lock().unwrap();
+    verify_all(&guard).map_err(|e| format!("charter signatures: {e}"))?;
+    check_authority(&guard).map_err(|e| format!("charter authority: {e}"))?;
+    if !envoy_state(&guard, &post.payload.polity, time::now()).is_active(&envoy_did) {
+        return Err("post signer is not a current envoy of the polity".into());
+    }
+    Ok(())
+}
+
+/// Verify a business post against the FULL charter log `a`: post signature +
+/// charter validity (verify_all + check_authority) + the signer being a current
+/// authorized envoy. The strongest check; needs the polity's log, so it is what
+/// the BUSINESS's own nodes use. 0 / negative.
+///
+/// # Safety
+/// `a` valid handle, `post_json` valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_business_post_verify_full(
+    a: *mut EthneArchive,
+    post_json: *const c_char,
+) -> i32 {
+    let run = || -> Result<(), String> {
+        let a = a.as_ref().ok_or("null archive handle")?;
+        verify_post_full_impl(a, arg_str(post_json)?)
+    };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+// ===========================================================================
 // P3.3 — Guardianship: who a machine answers to (SOCIAL_APP_PLAN.md box 4)
 // ===========================================================================
 //
@@ -2807,6 +3024,162 @@ mod tests {
         assert!(
             verify_full_impl(&a, &tampered).is_err(),
             "a tampered page must fail full-log verification too"
+        );
+    }
+
+    // --- P3.4: business posts ----------------------------------------------
+
+    fn post_json(polity: &str, envoy_did: &str, envoy_priv: &PrivKey, body: &str, seq: u64) -> String {
+        post_sign_impl(
+            &serde_json::json!({
+                "post": {"polity_did": polity, "body": body, "seq": seq},
+                "envoy_did": envoy_did,
+                "envoy_priv": serde_json::to_value(envoy_priv).unwrap(),
+            })
+            .to_string(),
+        )
+        .expect("post sign")
+    }
+
+    fn post_bundle_json(post: &str, deleg: &str) -> String {
+        serde_json::json!({
+            "post": serde_json::from_str::<serde_json::Value>(post).unwrap(),
+            "delegation": serde_json::from_str::<serde_json::Value>(deleg).unwrap(),
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn an_envoy_post_verifies_both_ways() {
+        let (a, polity, rp, rpub, founders) = founded_with_envoy();
+        let envoy = &founders[2];
+        let deleg = delegation_json(&a, &polity, &envoy.did, &rp, &rpub);
+        let post = post_json(&polity, &envoy.did, &envoy.priv_key, "Fresh croissants at seven.", 1);
+
+        verify_post_bundle_impl(&post_bundle_json(&post, &deleg))
+            .expect("self-contained bundle verifies with no log");
+        verify_post_full_impl(&a, &post).expect("full-log verifies");
+    }
+
+    #[test]
+    fn a_post_signed_by_a_member_who_is_not_the_envoy_is_rejected() {
+        // The whole point of box 5: being ON the roll does not let you speak AS
+        // the business. founders[0] is a member and not an envoy.
+        let (a, polity, rp, rpub, founders) = founded_with_envoy();
+        let envoy = &founders[2];
+        let rogue = post_json(&polity, &founders[0].did, &founders[0].priv_key, "We are closing.", 1);
+
+        assert!(
+            verify_post_full_impl(&a, &rogue).is_err(),
+            "full-log must reject a non-envoy signer"
+        );
+        let deleg = delegation_json(&a, &polity, &envoy.did, &rp, &rpub);
+        assert!(
+            verify_post_bundle_impl(&post_bundle_json(&rogue, &deleg)).is_err(),
+            "bundle must reject a post whose signer is not the delegated envoy"
+        );
+    }
+
+    #[test]
+    fn a_tampered_post_body_is_rejected() {
+        let (a, polity, rp, rpub, founders) = founded_with_envoy();
+        let envoy = &founders[2];
+        let deleg = delegation_json(&a, &polity, &envoy.did, &rp, &rpub);
+        let post = post_json(&polity, &envoy.did, &envoy.priv_key, "Open until six.", 1);
+
+        let mut v: serde_json::Value = serde_json::from_str(&post).unwrap();
+        v["payload"]["body"] = serde_json::json!("Closed forever. Do not come.");
+        let tampered = v.to_string();
+
+        assert!(
+            verify_post_bundle_impl(&post_bundle_json(&tampered, &deleg)).is_err(),
+            "a tampered body must fail signature verification"
+        );
+        assert!(
+            verify_post_full_impl(&a, &tampered).is_err(),
+            "a tampered body must fail full-log verification too"
+        );
+    }
+
+    #[test]
+    fn a_delegation_for_another_polity_does_not_carry_a_post() {
+        // Step 4 of the bundle check, which is the one a naive reader skips: both
+        // signatures are real, and they belong to two different businesses.
+        let (_a, polity, _rp, _rpub, founders) = founded_with_envoy();
+        let envoy = &founders[2];
+        let (b, _other_polity, other_rp, other_rpub, other_founders) = founded_with_envoy();
+        let other_deleg = delegation_json(
+            &b, &_other_polity, &other_founders[2].did, &other_rp, &other_rpub,
+        );
+        let post = post_json(&polity, &envoy.did, &envoy.priv_key, "A real post.", 1);
+
+        let err = verify_post_bundle_impl(&post_bundle_json(&post, &other_deleg))
+            .expect_err("a delegation from another polity must not carry this post");
+        assert!(
+            err.contains("different polity") || err.contains("not the delegated envoy"),
+            "the refusal must name the mismatch, got {err}"
+        );
+        // NB no expired-delegation test: there is no revoke/expire route over the
+        // FFI today (ethne_authorize_envoy only ever Authorizes), and tampering
+        // with the delegation's window breaks its signature instead, which is a
+        // different refusal. active_at() is exercised by en-uplift's own tests.
+    }
+
+    #[test]
+    fn an_empty_post_body_is_refused_at_signing() {
+        // A page may leave fields blank; a post with nothing in it would put the
+        // envoy's authority behind nothing at all.
+        let (_a, polity, _rp, _rpub, founders) = founded_with_envoy();
+        let envoy = &founders[2];
+        for body in ["", "   ", "\n\t "] {
+            let err = post_sign_impl(
+                &serde_json::json!({
+                    "post": {"polity_did": polity, "body": body, "seq": 1},
+                    "envoy_did": envoy.did,
+                    "envoy_priv": serde_json::to_value(&envoy.priv_key).unwrap(),
+                })
+                .to_string(),
+            )
+            .expect_err("an empty body must be refused");
+            assert!(err.contains("empty body"), "got {err}");
+        }
+    }
+
+    #[test]
+    fn the_worst_case_post_bundle_fits_the_wire_bound() {
+        // THE BODY BOUND IS MEASURED, NOT GUESSED, and this is where it is
+        // measured. BUSINESS_POST_BUNDLE_MAX is mirrored by
+        // AT_BUSINESS_POST_BUNDLE_LEN in the C core and by the shim; widen the
+        // body, or let the delegation grow, and this says so before the wire does.
+        let (a, polity, rp, rpub, founders) = founded_with_envoy();
+        let envoy = &founders[2];
+        let deleg = delegation_json(&a, &polity, &envoy.did, &rp, &rpub);
+
+        // A body AT the bound, in multi-byte characters: clamp() counts CHARS, so
+        // the byte-worst case is the widest character we can be handed.
+        let wide: String = "\u{1F9C1}".repeat(BUSINESS_POST_BODY_MAX + 64); // 4 bytes each
+        let post = post_json(&polity, &envoy.did, &envoy.priv_key, &wide, u64::MAX);
+        let bundle = post_bundle_json(&post, &deleg);
+
+        verify_post_bundle_impl(&bundle).expect("a body at the bound still verifies");
+        assert!(
+            bundle.len() <= BUSINESS_POST_BUNDLE_MAX,
+            "worst-case post bundle is {} bytes, over the {BUSINESS_POST_BUNDLE_MAX}-byte wire cap \
+             — lower BUSINESS_POST_BODY_MAX, or raise the cap in ALL FOUR ABI mirrors",
+            bundle.len()
+        );
+        // Say the measured number out loud (cargo test -- --nocapture), so the
+        // headroom is a fact in the log rather than a claim in a comment.
+        println!(
+            "worst-case post bundle: {} bytes of {BUSINESS_POST_BUNDLE_MAX} ({} spare)",
+            bundle.len(),
+            BUSINESS_POST_BUNDLE_MAX - bundle.len()
+        );
+        // The clamp really did bite, so the bound is the body's and not the test's.
+        let v: serde_json::Value = serde_json::from_str(&post).unwrap();
+        assert_eq!(
+            v["payload"]["body"].as_str().unwrap().chars().count(),
+            BUSINESS_POST_BODY_MAX
         );
     }
 

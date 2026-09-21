@@ -16,8 +16,10 @@ import '../ffi/ethne_bindings.dart';
 import '../model/attention_budget.dart';
 import '../model/business.dart';
 import '../model/business_directory.dart';
+import '../model/business_post.dart';
 import '../model/cosign_exchanges.dart';
 import '../model/dm.dart';
+import '../model/feed_entry.dart';
 import '../model/member_roll.dart';
 import '../model/feed_store.dart';
 import '../model/post.dart';
@@ -150,6 +152,10 @@ class PeerService extends ChangeNotifier {
   /// state.
   late final BusinessDirectory _businesses =
       BusinessDirectory(verifyBundle: _verifyBusinessBundle);
+
+  /// Business posts, verified against the envoy chain before they are kept
+  /// (Phase 3 P3.4). An unverified post is counted here and shown to nobody.
+  final BusinessPostStore _businessPosts = BusinessPostStore();
 
   /// The Ethne cdylib, opened lazily on the first bundle we are asked to verify.
   /// Absent when the library was not built or found — see
@@ -478,16 +484,55 @@ class PeerService extends ChangeNotifier {
     );
   }
 
-  /// The feed ranked by S × recency (Increment 7), newest/strongest first. S is
-  /// the tie strength to each post's author (the Inc-4 kernel); recency is post
-  /// freshness. Empty until posts arrive or one is published locally.
-  List<Post> get feed => _feed.ranked(
-        strengthOfAuthor: _strengthOfAuthor,
-        nowEpochSeconds: DateTime.now().millisecondsSinceEpoch / 1000.0,
-      );
+  /// The merged feed, newest/strongest first (Increment 7, extended by Phase 3
+  /// P3.4). ONE feed, two kinds of item: a person's post weighted by TIE
+  /// STRENGTH (the Inc-4 Dunbar kernel) and a business's weighted by its
+  /// DIRECTORY STANDING (distance, then customers you trust who vouched, then
+  /// how current our knowledge of it is), each multiplied by that post's own
+  /// freshness.
+  ///
+  /// The two ledgers stay separate, which is P3.2's locked decision surviving
+  /// into the feed: a business cannot crowd out your friends by posting, and
+  /// cannot buy its way up at all — only people you already trust having been
+  /// there lifts it.
+  List<FeedEntry> get feed {
+    final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
+    return rankFeed(
+      posts: _feed.posts,
+      businessPosts: _businessPosts.posts,
+      strengthOfAuthor: _strengthOfAuthor,
+      standingOfBusiness: _standingOfBusiness,
+      nameOfBusiness: _nameOfBusiness,
+      recency: (ts) => _feed.recency(ts, now),
+    );
+  }
 
-  /// Total posts held in the feed store.
-  int get feedCount => _feed.length;
+  /// Total items held across both feed stores.
+  int get feedCount => _feed.length + _businessPosts.length;
+
+  /// How many business posts were refused by envoy verification — including
+  /// every one of them when the Ethne library is missing. The feed shows this
+  /// so silence is never mistaken for nothing having arrived.
+  int get businessPostsUnverified => _businessPosts.unverifiedCount;
+
+  /// The directory standing of the business behind a post, in [0,1]; 0 for a
+  /// polity we hold no page for (which the core should have dropped anyway, so
+  /// this is the second of two independent refusals rather than the only one).
+  double _standingOfBusiness(String polity) {
+    final b = _businesses[polity];
+    if (b == null) return 0.0;
+    return _businesses.score(
+      b,
+      strengthOfAdvertiser: _strengthOfAuthor,
+      ownGeohash: _ownGeohash,
+      nowEpochSeconds: DateTime.now().millisecondsSinceEpoch / 1000.0,
+    );
+  }
+
+  /// The business's name off its VERIFIED page, or '' when we hold no page —
+  /// in which case the UI shows the DID rather than inventing a name.
+  String _nameOfBusiness(String polity) =>
+      _businesses[polity]?.page?.name ?? '';
 
   /// Tie strength to a post's author by uuid: the roster peer's S if we know
   /// them, else 0 (an author we cannot place is not "near"). Reuses the same
@@ -523,6 +568,44 @@ class PeerService extends ChangeNotifier {
       return -1;
     }
     final rc = ev.publishPost(_daemon.queues.appToAt, trimmed, tier);
+    notifyListeners();
+    return rc;
+  }
+
+  /// Publish a business post — the polity speaking (Phase 3 P3.4). [bundle] is
+  /// the OPAQUE Ethne {post,delegation} artifact the caller built and
+  /// ENVOY-signed; this node signs the wire copy and the core multicasts it.
+  ///
+  /// The post is echoed locally IMMEDIATELY, like a person's, but only after
+  /// it verifies: an operator who has just signed something unverifiable
+  /// should see that at once, on their own screen, rather than learn it from
+  /// the silence of everyone else's. Returns the shim rc (0 ok, -2 daemon not
+  /// ready), or -1 if no channel is open, the arguments are empty, or the
+  /// bundle does not verify.
+  int publishBusinessPost(String polityDid, String bundle, {int seq = 0}) {
+    if (polityDid.isEmpty || bundle.isEmpty) return -1;
+    if (!_verifyBusinessPostBundle(bundle)) {
+      _businessPosts.recordUnverified();
+      notifyListeners();
+      return -1;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
+    _businessPosts.add(BusinessPost(
+      polity: polityDid,
+      postId: '', // the core computes the real content id; not returned here
+      seq: seq,
+      ts: now,
+      hops: 0,
+      bundle: bundle,
+      outgoing: true,
+    ));
+    final ev = _events;
+    if (ev == null) {
+      notifyListeners();
+      return -1;
+    }
+    final rc = ev.publishBusinessPost(_daemon.queues.appToAt, polityDid, bundle,
+        seq: seq);
     notifyListeners();
     return rc;
   }
@@ -654,6 +737,27 @@ class PeerService extends ChangeNotifier {
     return true;
   }
 
+  /// A business post (Phase 3 P3.4). The core verified that these bytes arrived
+  /// unaltered from the peer that sent them — no more than that. The peer is a
+  /// CARRIER: a post relays, so it is routinely handed on by someone with no
+  /// standing to speak for the business at all, and even a member of its staff
+  /// has none. The envoy signature inside the bundle is the authority, and it
+  /// is checked HERE, before a word of the post can reach the feed.
+  ///
+  /// A post that fails is counted, not shown. Silence with a number beside it
+  /// is honest; unauthenticated text under a business's name is not.
+  bool _ingestBusinessPost(AtRawEvent e) {
+    if (e.kind != agoraEventBusinessPost) return false;
+    _peers.putIfAbsent(_hex(e.uuid), () => _newPeer(e.uuid));
+    final post = BusinessPost.fromEvent(e);
+    if (!_verifyBusinessPostBundle(post.bundle)) {
+      _businessPosts.recordUnverified();
+      return true;
+    }
+    _businessPosts.add(post);
+    return true;
+  }
+
   /// An inbound ask to co-sign a governance act (Phase 3 P3.3). A live exchange
   /// like a DM, not peer state, so it is routed here rather than merged by
   /// applyEvent. Everything it carries is a CLAIM: the core is a courier that
@@ -690,6 +794,23 @@ class PeerService extends ChangeNotifier {
     if (e == null) return false;
     try {
       return e.verifyBusinessPageBundle(bundleJson);
+    } on Object {
+      return false;
+    }
+  }
+
+  /// Verify a business POST's bundle: polity root -> envoy -> post, with no
+  /// charter log, which is what a reader holds. Same shape as
+  /// [_verifyBusinessBundle] and same honesty about failure — no library, no
+  /// verification, and therefore no post. The test override applies to both,
+  /// so a suite that fakes one is not silently trusting the other.
+  bool _verifyBusinessPostBundle(String bundleJson) {
+    final override = _bundleVerifierOverride;
+    if (override != null) return override(bundleJson);
+    final e = _ethneLib();
+    if (e == null) return false;
+    try {
+      return e.verifyBusinessPostBundle(bundleJson);
     } on Object {
       return false;
     }
@@ -1134,6 +1255,7 @@ class PeerService extends ChangeNotifier {
       if (_ingestReaction(e)) continue;
       // A business ad — routed into the directory after Ethne verification.
       if (_ingestBusinessAd(e)) continue;
+      if (_ingestBusinessPost(e)) continue;
       // A co-signature ask, and a signature coming back — a live exchange.
       if (_ingestCosignRequest(e)) continue;
       if (_ingestCosignSignature(e)) continue;

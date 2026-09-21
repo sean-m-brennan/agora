@@ -210,6 +210,9 @@ expect_pos = sys.argv[4] if len(sys.argv) > 4 else ""
 
 UUID, KEY, GEO, PROF, DM, PID, PBODY = 16, 32, 12, 2560, 1024, 64, 4096
 BDID, BADID, BBUN = 95, 64, 3072
+# Business POST bounds (Phase 3 P3.4): its bundle carries the body, so it is
+# larger than the page bundle's 3072. Measured worst case 3550 of 4096.
+BPID, BPBUN = 64, 4096
 # Co-signing bounds (Phase 3 P3.3): AGORA_COSIGN_{BYTES,DID,CID,SIG,TOKEN}_MAX
 CBYT, CDID, CCID, CSIG, CTOK = 6144, 95, 67, 128, 15
 class Ev(ctypes.Structure):
@@ -260,15 +263,26 @@ class Ev(ctypes.Structure):
         ("cosign_seq", ctypes.c_int64),
         ("cosign_ts", ctypes.c_double),
         ("cosign_bytes", ctypes.c_char * (CBYT + 1)),
+        # AGORA_EVENT_BUSINESS_POST (Phase 3 P3.4), appended LAST.
+        # business_post_bundle is the OPAQUE Ethne {post,delegation} artifact —
+        # the core verified only that these bytes arrived unaltered from
+        # whoever sent them; the ENVOY signature inside is what makes them the
+        # business's words, and only the app checks that.
+        ("business_post_polity", ctypes.c_char * (BDID + 1)),
+        ("business_post_id", ctypes.c_char * (BPID + 1)),
+        ("business_post_seq", ctypes.c_int64),
+        ("business_post_ts", ctypes.c_double),
+        ("business_post_hops", ctypes.c_int32),
+        ("business_post_bundle", ctypes.c_char * (BPBUN + 1)),
     ]
-# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (17872 with
+# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (22152 with
 # the geohash + profile_json + connection_state + DM + POST + REACTION + in_group +
 # proximity_band + BUSINESS_AD tail; rtt@116, geohash@120, profile_json@133,
 # connection_state@2696, dm_seq@2704, post_id@3745, post_seq@3752, reaction tail after
 # post_body, in_group@8016 + proximity_band@8020 in the tail padding, business tail
-# from 8024, co-signing tail from 11288). If the C struct grows and this is not updated in lockstep, poll() would
+# from 8024, co-signing tail from 11288, business-post tail from 17864). If the C struct grows and this is not updated in lockstep, poll() would
 # misread every field past the drift.
-assert ctypes.sizeof(Ev) == 17872, f"Ev size {ctypes.sizeof(Ev)} != 17872 (ABI drift)"
+assert ctypes.sizeof(Ev) == 22152, f"Ev size {ctypes.sizeof(Ev)} != 22152 (ABI drift)"
 
 lib = ctypes.CDLL(shim)
 lib.agora_set_root.argtypes = [ctypes.c_char_p]; lib.agora_set_root.restype = None
