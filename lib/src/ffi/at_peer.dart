@@ -64,6 +64,29 @@ class AgoraPeer {
   double reputationScore = 0;
   bool reputationRated = false;
 
+  /// The tier the core's reputation process actually used for this peer, after
+  /// any standing ceiling (Phase 4 P4.1), or null until a reputation event has
+  /// arrived. Preferred over deriving a tier from [reputationScore]: a ceiling
+  /// is not a function of the score, so the app cannot recompute it.
+  int? reputationTier;
+
+  /// The standing ceiling bounding this peer — an authority finding such as a
+  /// community's expulsion — or negative when none is in force (Phase 4 P4.1).
+  double standingCeiling = agoraNoCeiling;
+
+  /// True iff THIS node has locally blocked the peer (Phase 4 P4.1), as the
+  /// core reports it. A block is local: nothing crossed the wire.
+  bool blocked = false;
+
+  /// True when an authority has bounded this peer's standing.
+  bool get isStandingBounded => standingCeiling >= 0;
+
+  /// The tier to use for this peer, composed exactly as the core composes it:
+  /// a blocked peer is tier 0 whatever they have earned. Null when the core
+  /// has sent no tier yet and there is no block — callers then fall back to
+  /// the score (see trustTier).
+  int? get effectiveTier => blocked ? 0 : reputationTier;
+
   /// Latest round-trip time to the peer in milliseconds, as AT measures it;
   /// 0 == unknown / not yet measured (a fast-LAN default, not "0 ms"). A
   /// network-latency proximity proxy — do NOT present it as geographic distance.
@@ -200,10 +223,13 @@ class AgoraPeer {
         operatorAttestedAt = e.operatorAttestedAt;
         operatorPubkey = e.operatorPubkey;
         inGroup = e.inGroup;
+        blocked = e.blocked;
         return true;
       case agoraEventReputation:
         reputationScore = e.repScore;
         reputationRated = e.repRated;
+        reputationTier = e.repTier >= 0 ? e.repTier : null;
+        standingCeiling = e.repCeiling;
         return true;
       case agoraEventRtt:
         rttMs = e.rttMs;

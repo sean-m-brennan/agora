@@ -13,10 +13,12 @@ import '../node/peer_stream.dart';
 import '../ffi/at_peer.dart';
 import '../model/attention_budget.dart';
 import '../model/tie_strength.dart';
+import 'blocked_list.dart';
 import 'businesses_near_me.dart';
 import 'circles_view.dart';
 import 'dm_thread.dart';
 import 'feed_view.dart';
+import 'moderation_sheets.dart';
 
 class PeopleNearMePage extends StatefulWidget {
   const PeopleNearMePage({super.key, required this.service});
@@ -77,6 +79,16 @@ class _PeopleNearMePageState extends State<PeopleNearMePage> {
             onPressed: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
                 builder: (_) => FeedPage(service: service),
+              ),
+            ),
+          ),
+          IconButton(
+            key: const Key('open-blocked'),
+            icon: const Icon(Icons.block),
+            tooltip: 'Blocked and limited',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => BlockedListPage(service: service),
               ),
             ),
           ),
@@ -157,8 +169,13 @@ class _PeopleNearMePageState extends State<PeopleNearMePage> {
                     : ListView.separated(
                         itemCount: peers.length,
                         separatorBuilder: (_, __) => const Divider(height: 1),
+                        // A blocked peer is dimmed further still: kept in the
+                        // list (it is the way back to unblocking them) but
+                        // plainly not a tie you are attending to.
                         itemBuilder: (context, i) => Opacity(
-                          opacity: overBudget.contains(peers[i]) ? 0.55 : 1.0,
+                          opacity: peers[i].blocked
+                              ? 0.45
+                              : (overBudget.contains(peers[i]) ? 0.55 : 1.0),
                           child: _PeerTile(
                               peer: peers[i], ownGeohash: own, service: service),
                         ),
@@ -413,9 +430,25 @@ class _PeerTile extends StatelessWidget {
     // Group co-membership indicator (distinct from a connection edge): shown
     // once the cohort converges and this peer's address is in our group. A quiet
     // badge next to the name, not a peer you "connect" to.
+    // A block or a community's bound is said in words on the tile itself —
+    // otherwise it reads only as a low tier, which is a different thing.
+    final flag = peer.blocked
+        ? 'blocked'
+        : (peer.isStandingBounded ? 'limited by community' : null);
+    final flagged = flag == null
+        ? nameText
+        : Row(mainAxisSize: MainAxisSize.min, children: [
+            Flexible(child: nameText),
+            const SizedBox(width: 6),
+            Text(flag,
+                key: Key('flag-${peer.shortId}'),
+                style: TextStyle(
+                    fontSize: 11,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant)),
+          ]);
     final title = peer.inGroup
         ? Row(mainAxisSize: MainAxisSize.min, children: [
-            Flexible(child: nameText),
+            Flexible(child: flagged),
             const SizedBox(width: 6),
             Tooltip(
               message: 'In your group',
@@ -430,7 +463,7 @@ class _PeerTile extends StatelessWidget {
               ]),
             ),
           ])
-        : nameText;
+        : flagged;
     // Keep the subtitle to at most two lines so it fits a three-line ListTile.
     // Line 1 is presence, plus — when a display name is the title — the @handle
     // and short id, so identity stays verifiable (the profile is signed, but a
@@ -474,8 +507,10 @@ class _PeerTile extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           _PeerOverflowMenu(peer: peer, service: service),
-          _MessageButton(peer: peer, service: service),
-          _ConnectControl(peer: peer, service: service),
+          // The core refuses a DM or a connection to someone we blocked, so
+          // offering them would be offering something that cannot happen.
+          if (!peer.blocked) _MessageButton(peer: peer, service: service),
+          if (!peer.blocked) _ConnectControl(peer: peer, service: service),
           const SizedBox(width: 4),
           Builder(builder: (context) {
             // Compact line style: three signals must fit the trailing box of a
@@ -508,10 +543,11 @@ class _PeerTile extends StatelessWidget {
   }
 }
 
-/// The per-peer overflow menu. Holds the local BLOCK action (Increment 8): a
-/// block clamps this peer's effective trust tier to 0 for THIS node only — purely
-/// local, no wire traffic and no reputation transaction, so it is a self-protection
-/// affordance distinct from a decline (which is a shared, accruing signal).
+/// The per-peer overflow menu. Holds the moderation actions (Phase 4 P4.1):
+/// BLOCK (confirmed first) or UNBLOCK — purely local, no wire traffic, a
+/// self-protection affordance distinct from a decline — and REPORT, the
+/// operator's first-person account, which is a different thing entirely and
+/// does not block.
 class _PeerOverflowMenu extends StatelessWidget {
   const _PeerOverflowMenu({required this.peer, required this.service});
 
@@ -524,14 +560,24 @@ class _PeerOverflowMenu extends StatelessWidget {
       icon: const Icon(Icons.more_vert, size: 18),
       tooltip: 'More',
       padding: EdgeInsets.zero,
-      onSelected: (value) {
+      onSelected: (value) async {
         if (value == 'block') {
+          if (!await confirmBlock(context, peer) || !context.mounted) return;
           final rc = service.blockPeer(peer);
           final msg = rc == 0
               ? 'Peer blocked (local)'
               : (rc == -2 ? 'Not connected yet' : 'Could not block');
           ScaffoldMessenger.of(context)
               .showSnackBar(SnackBar(content: Text(msg)));
+        } else if (value == 'unblock') {
+          final rc = service.unblockPeer(peer);
+          final msg = rc == 0
+              ? 'Unblocked'
+              : (rc == -2 ? 'Not connected yet' : 'Could not unblock');
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text(msg)));
+        } else if (value == 'report') {
+          await reportFlow(context, service, peer);
         } else if (value == 'presence') {
           final rc = service.pingPresence(peer);
           final msg = rc == 0
@@ -570,15 +616,38 @@ class _PeerOverflowMenu extends StatelessWidget {
               title: Text('Check how near (private)'),
             ),
           ),
-        const PopupMenuItem<String>(
-          value: 'block',
+        // One report a day per person; the item says so rather than
+        // vanishing, so the operator knows it went.
+        PopupMenuItem<String>(
+          value: 'report',
+          enabled: service.canReport(peer),
           child: ListTile(
             dense: true,
             contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.block, size: 18),
-            title: Text('Block'),
+            leading: const Icon(Icons.flag_outlined, size: 18),
+            title: Text(service.canReport(peer) ? 'Report…' : 'Reported today'),
           ),
         ),
+        if (peer.blocked)
+          const PopupMenuItem<String>(
+            value: 'unblock',
+            child: ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.check_circle_outline, size: 18),
+              title: Text('Unblock'),
+            ),
+          )
+        else
+          const PopupMenuItem<String>(
+            value: 'block',
+            child: ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.block, size: 18),
+              title: Text('Block…'),
+            ),
+          ),
       ],
     );
   }

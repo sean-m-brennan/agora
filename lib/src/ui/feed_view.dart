@@ -69,7 +69,8 @@ class _FeedPageState extends State<FeedPage> {
               builder: (context, _) {
                 final entries = widget.service.feed;
                 final refused = widget.service.businessPostsUnverified;
-                if (entries.isEmpty && refused == 0) {
+                final hidden = widget.service.feedHiddenByBlock;
+                if (entries.isEmpty && refused == 0 && hidden == 0) {
                   return const Center(
                     child: Text('No posts yet — share something.'),
                   );
@@ -78,14 +79,18 @@ class _FeedPageState extends State<FeedPage> {
                 // verification. It sits ABOVE the list and shows even when the
                 // list is empty, because "nothing here" and "nothing here that
                 // proved itself" are different things to be told.
-                final banner = refused > 0
-                    ? _UnverifiedBanner(count: refused)
-                    : null;
+                //
+                // The same holds for posts hidden by a block (Phase 4 P4.1): a
+                // block must never read as "nobody posted".
+                final banners = <Widget>[
+                  if (refused > 0) _UnverifiedBanner(count: refused),
+                  if (hidden > 0) _HiddenByBlockBanner(count: hidden),
+                ];
                 if (entries.isEmpty) {
                   return ListView(
                     padding: const EdgeInsets.all(8),
                     children: [
-                      banner!,
+                      ...banners,
                       const SizedBox(height: 12),
                       const Center(
                         child: Text('No posts yet — share something.'),
@@ -95,13 +100,11 @@ class _FeedPageState extends State<FeedPage> {
                 }
                 return ListView.separated(
                   padding: const EdgeInsets.all(8),
-                  itemCount: entries.length + (banner == null ? 0 : 1),
+                  itemCount: entries.length + banners.length,
                   separatorBuilder: (_, __) => const Divider(height: 1),
                   itemBuilder: (context, i) {
-                    if (banner != null) {
-                      if (i == 0) return banner;
-                      i -= 1;
-                    }
+                    if (i < banners.length) return banners[i];
+                    i -= banners.length;
                     final entry = entries[i];
                     return switch (entry) {
                       PersonEntry(:final post) =>
@@ -197,6 +200,34 @@ class _UnverifiedBanner extends StatelessWidget {
           'they are not shown as any business\'s words.',
           style: TextStyle(color: scheme.onErrorContainer),
         ),
+      ),
+    );
+  }
+}
+
+/// How many held posts a block is hiding (Phase 4 P4.1). On the neutral
+/// surface, not an error colour: a block is the operator's choice, not a
+/// failure.
+class _HiddenByBlockBanner extends StatelessWidget {
+  const _HiddenByBlockBanner({required this.count});
+
+  final int count;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Card(
+      key: const Key('hidden-by-block'),
+      color: scheme.surfaceContainerHighest,
+      margin: EdgeInsets.zero,
+      child: ListTile(
+        dense: true,
+        leading: Icon(Icons.visibility_off_outlined,
+            color: scheme.onSurfaceVariant),
+        title: Text(count == 1
+            ? '1 post hidden from someone you blocked'
+            : '$count posts hidden from people you blocked'),
+        subtitle: const Text('Unblock them to see these again.'),
       ),
     );
   }

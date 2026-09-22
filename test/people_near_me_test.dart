@@ -112,11 +112,14 @@ void main() {
     svc.ingestEvents([_peerEvent(u1, rank: 1)]);
     await _pump(tester, svc);
 
-    // Open the per-peer overflow menu and choose Block.
+    // Open the per-peer overflow menu and choose Block. Since Phase 4 P4.1 a
+    // block is confirmed first.
     await tester.tap(find.byIcon(Icons.more_vert).first);
     await tester.pumpAndSettle();
-    expect(find.text('Block'), findsOneWidget);
-    await tester.tap(find.text('Block'));
+    expect(find.text('Block…'), findsOneWidget);
+    await tester.tap(find.text('Block…'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('confirm-block')));
     await tester.pumpAndSettle();
     // No channel in a pure-Dart test -> a SnackBar reports the outcome, no throw.
     expect(find.byType(SnackBar), findsOneWidget);

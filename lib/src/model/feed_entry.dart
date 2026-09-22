@@ -103,6 +103,13 @@ final class BusinessEntry extends FeedEntry {
 ///
 /// Ties break by post time (newest first) then by id, so the order is
 /// deterministic — the same discipline FeedStore.ranked keeps.
+///
+/// [isHiddenAuthor] leaves out a PERSON's posts when the operator has blocked
+/// them (Phase 4 P4.1). This is the seam that matters: rankFeed is the live
+/// feed, so a filter anywhere else would pass its tests while the app showed
+/// blocked posts. Hidden, not deleted — the stores keep them, so an unblock
+/// restores them immediately. Business posts are not filtered by it: a
+/// business is a polity, not a peer, and a block names a peer.
 List<FeedEntry> rankFeed({
   required List<Post> posts,
   required List<BusinessPost> businessPosts,
@@ -110,12 +117,14 @@ List<FeedEntry> rankFeed({
   required double Function(String polity) standingOfBusiness,
   required String Function(String polity) nameOfBusiness,
   required double Function(double ts) recency,
+  bool Function(List<int> authorUuid)? isHiddenAuthor,
 }) {
   final entries = <FeedEntry>[
     for (final p in posts)
-      PersonEntry(p,
-          score: (p.outgoing ? 1.0 : strengthOfAuthor(p.authorUuid)) *
-              recency(p.ts)),
+      if (p.outgoing || isHiddenAuthor == null || !isHiddenAuthor(p.authorUuid))
+        PersonEntry(p,
+            score: (p.outgoing ? 1.0 : strengthOfAuthor(p.authorUuid)) *
+                recency(p.ts)),
     for (final b in businessPosts)
       BusinessEntry(b,
           score: (b.outgoing ? 1.0 : standingOfBusiness(b.polity)) *

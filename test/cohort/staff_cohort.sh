@@ -617,11 +617,18 @@ class Ev(ctypes.Structure):
         ("business_post_ts", ctypes.c_double),
         ("business_post_hops", ctypes.c_int32),
         ("business_post_bundle", ctypes.c_char * (BPBUN + 1)),
+        # Moderation (Phase 4 P4.1), appended LAST so every prior offset
+        # is unchanged. blocked rides the PEER event; rep_tier and
+        # rep_ceiling ride the REPUTATION event. rep_ceiling is -1 when
+        # the peer is unbounded and is meaningless on any other kind.
+        ("blocked", ctypes.c_uint8),
+        ("rep_tier", ctypes.c_int32),
+        ("rep_ceiling", ctypes.c_double),
     ]
 
 # ABI guard: MUST equal sizeof(agora_event_t) in at_agora_shim.h. A silent drift
 # here would decode every field past the drift point as garbage.
-assert ctypes.sizeof(Ev) == 22152, f"Ev size {ctypes.sizeof(Ev)} != 22152 (ABI drift)"
+assert ctypes.sizeof(Ev) == 22168, f"Ev size {ctypes.sizeof(Ev)} != 22168 (ABI drift)"
 
 EV_PEER = 1
 EV_COSIGN_REQUEST = 13

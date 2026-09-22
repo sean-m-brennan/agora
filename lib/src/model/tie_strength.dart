@@ -23,9 +23,14 @@ import '../ffi/at_peer.dart';
 /// Reputation-score floors for AT trust tiers 1..4, mirroring the C core's
 /// `TIER_FLOORS` (reputation/rep_proc.c:64-76). A rated score at/above a floor
 /// is that tier; below 0.50 (and any unrated peer) is tier 0 (admitted/presence
-/// only). Tier is NOT on the app event surface today (at_app_peer_t.rank is
-/// topology rank, a different axis), so Agora derives it app-side from the
-/// PEER_REPUTATION score. A dedicated tier event is a possible later upgrade.
+/// only).
+///
+/// A FALLBACK since Phase 4 P4.1, not this app's own derivation. The core now
+/// sends the tier it actually used on the reputation event, after any standing
+/// ceiling, and reports a local block on the peer event — neither of which is a
+/// function of the score, so deriving the tier here left a blocked or expelled
+/// peer ranking exactly as before. These floors apply only until the first
+/// reputation event arrives (see [trustTier]).
 const List<double> tierFloors = [0.50, 0.65, 0.80, 0.90];
 
 /// The 0..4 trust tier for a peer's reputation. Unrated => 0 (we have no earned
@@ -43,8 +48,10 @@ int trustTierForScore(double score, bool rated) {
   return tier;
 }
 
-/// Trust tier for a peer (convenience over [trustTierForScore]).
+/// Trust tier for a peer: the core's composed tier when it has sent one (a
+/// block reads 0, a ceiling is already applied), else derived from the score.
 int trustTier(AgoraPeer peer) =>
+    peer.effectiveTier ??
     trustTierForScore(peer.reputationScore, peer.reputationRated);
 
 /// The post-audience bands (§3.4). A post is addressed to a minimum tier; these

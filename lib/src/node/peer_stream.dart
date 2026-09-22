@@ -21,6 +21,8 @@ import '../model/cosign_exchanges.dart';
 import '../model/dm.dart';
 import '../model/feed_entry.dart';
 import '../model/member_roll.dart';
+import '../model/moderation.dart';
+import '../model/moderation_store.dart';
 import '../model/feed_store.dart';
 import '../model/post.dart';
 import '../model/staff_identity.dart';
@@ -28,6 +30,13 @@ import '../model/staff_roster.dart';
 import '../model/tie_settings.dart';
 import '../model/tie_strength.dart';
 import 'agora_daemon.dart';
+import 'moderation_verbs.dart';
+import 'polity_acts.dart';
+
+/// The app-side rc for a report the advisory cap refused before anything was
+/// sent (Phase 4 P4.1). Distinct from AT_APP_NOT_READY (-2) and -1 (no channel),
+/// so the UI can say what actually happened instead of lying or going silent.
+const int reportRefusedCap = -3;
 
 class PeerService extends ChangeNotifier {
   PeerService({
@@ -38,7 +47,11 @@ class PeerService extends ChangeNotifier {
     @visibleForTesting StaffRoster? staffRoster,
     @visibleForTesting CosignDescriber? cosignDescriber,
     @visibleForTesting RollPublisher? rollPublisher,
+    @visibleForTesting ModerationVerbs? moderationVerbs,
+    @visibleForTesting PolityActs? polityActs,
   })  : _daemon = daemon ?? _defaultDaemon(),
+        _polityActsOverride = polityActs,
+        _moderationVerbsOverride = moderationVerbs,
         _bundleVerifierOverride = bundleVerifier,
         _staffOverride = staffIdentity,
         _rosterOverride = staffRoster,
@@ -63,6 +76,16 @@ class PeerService extends ChangeNotifier {
   /// Test-only stand-in for minting and checking a member roll. Null in the app,
   /// where the root key signs and the cdylib checks.
   final RollPublisher? _rollPublisherOverride;
+
+  /// Test-only stand-in for the four moderation verbs. Null in the app, where
+  /// they go to the core over the shim.
+  final ModerationVerbs? _moderationVerbsOverride;
+  late final ModerationVerbs _moderationVerbs =
+      _moderationVerbsOverride ?? _ShimModerationVerbs(this);
+
+  /// Test-only stand-in for the polity acts an expulsion needs. Null in the
+  /// app, where they are the cdylib over this node's charter archive.
+  final PolityActs? _polityActsOverride;
 
   /// Build the default daemon. When $AGORA_EXTERNAL_DAEMON is set (to a non-empty
   /// value other than "0"/"false"), attach to an already-running `agorad` under
@@ -113,6 +136,9 @@ class PeerService extends ChangeNotifier {
   /// Stamp an interaction with [peer] (tends the tie, feeding the recency term),
   /// and persist it durably so the tie survives a restart. Debounced save.
   void _tend(AgoraPeer peer, [double? nowSec]) {
+    // A blocked tie is not an attended tie (Phase 4 P4.1): nothing we do or
+    // receive while they are blocked may warm it.
+    if (peer.blocked) return;
     final now = nowSec ?? DateTime.now().millisecondsSinceEpoch / 1000.0;
     peer.markInteraction(now);
     final s = _settings;
@@ -504,8 +530,19 @@ class PeerService extends ChangeNotifier {
       standingOfBusiness: _standingOfBusiness,
       nameOfBusiness: _nameOfBusiness,
       recency: (ts) => _feed.recency(ts, now),
+      isHiddenAuthor: isBlockedUuid,
     );
   }
+
+  /// True iff the peer with [uuid] is locally blocked, as the core reports it.
+  bool isBlockedUuid(List<int> uuid) => _peers[_hex(uuid)]?.blocked ?? false;
+
+  /// How many held posts the feed is hiding because their author is blocked —
+  /// shown so a block never reads as "nothing arrived". Counted, not deleted:
+  /// unblocking restores them at once.
+  int get feedHiddenByBlock => _feed.posts
+      .where((p) => !p.outgoing && isBlockedUuid(p.authorUuid))
+      .length;
 
   /// Total items held across both feed stores.
   int get feedCount => _feed.length + _businessPosts.length;
@@ -632,17 +669,96 @@ class PeerService extends ChangeNotifier {
     return rc;
   }
 
-  /// Locally block [peer] (Increment 8): asks the core to clamp the peer's
-  /// effective trust tier to 0 for this node only. Purely local — no wire traffic
-  /// and no reputation transaction. Returns the shim rc (0 ok, -2 daemon not
-  /// ready), or -1 if no channel is open yet.
+  // --- moderation (Phase 4 P4.1) --------------------------------------------
+
+  /// This device's moderation memory: why the operator reported whom, and the
+  /// advisory daily count. Persisted in [start]; in-memory until then.
+  ModerationStore? _moderationStore;
+  ModerationState _moderationFallback = ModerationState();
+  ModerationState get moderation =>
+      _moderationStore?.state ?? _moderationFallback;
+
+  @visibleForTesting
+  set moderationForTest(ModerationState s) => _moderationFallback = s;
+
+  /// Locally block [peer]: the core clamps their effective tier to 0 on this
+  /// node, drops their directed traffic and hides their posts. Nothing crosses
+  /// the wire. The block becomes VISIBLE when the core re-emits the peer with
+  /// `blocked` set — not here, so the UI never shows a block that did not land.
+  /// Returns the shim rc (0 queued, -2 not ready, -1 no channel).
   int blockPeer(AgoraPeer peer) {
-    final ev = _events;
-    if (ev == null) return -1;
-    final rc = ev.block(_daemon.queues.appToAt, peer.uuid);
+    final rc = _moderationVerbs.block(peer.uuid);
     notifyListeners();
     return rc;
   }
+
+  /// Lift a local block. The peer is told nothing, as they were told nothing
+  /// of the block. Returns the shim rc.
+  int unblockPeer(AgoraPeer peer) {
+    final rc = _moderationVerbs.unblock(peer.uuid);
+    notifyListeners();
+    return rc;
+  }
+
+  /// True when the Report action should be offered for [peer] now (the
+  /// advisory cap; the core's own check is the authority).
+  bool canReport(AgoraPeer peer) =>
+      moderation.canReport(_hex(peer.uuid), _nowSec());
+
+  /// Report [peer] for [reason]. The REASON STAYS ON THIS DEVICE — the core is
+  /// sent the peer and nothing else. Returns [reportRefusedCap] without sending
+  /// when this device already reported them today, else the shim rc; the
+  /// reason is remembered only once the core has the ask on its queue.
+  ///
+  /// A report does not block, and blocking does not stop a report.
+  int reportPeer(AgoraPeer peer, ReportReason reason) {
+    final key = _hex(peer.uuid);
+    final now = _nowSec();
+    if (!moderation.canReport(key, now)) return reportRefusedCap;
+    final rc = _moderationVerbs.report(peer.uuid);
+    if (rc == 0) {
+      moderation.recordReport(key, reason, now);
+      _moderationStore?.save();
+    }
+    notifyListeners();
+    return rc;
+  }
+
+  /// "Block · Report · Both": two verbs, never one with a hidden second
+  /// effect. Reports first so a refused report is reported back to the
+  /// operator rather than masked by a block that went through. Returns the
+  /// report's rc when it failed, else the block's.
+  int blockAndReport(AgoraPeer peer, ReportReason reason) {
+    final rrc = reportPeer(peer, reason);
+    final brc = blockPeer(peer);
+    return rrc != 0 ? rrc : brc;
+  }
+
+  /// Peers this node has blocked, for the blocked list.
+  List<AgoraPeer> get blockedPeers =>
+      _peers.values.where((p) => p.blocked).toList()
+        ..sort((a, b) => a.displayLabel.compareTo(b.displayLabel));
+
+  /// Peers bounded by an authority finding — the only place the generalized
+  /// ceiling is legible as itself rather than as a low tier.
+  List<AgoraPeer> get standingBoundedPeers =>
+      _peers.values.where((p) => p.isStandingBounded).toList()
+        ..sort((a, b) => a.displayLabel.compareTo(b.displayLabel));
+
+  /// Hand the core the consequence of an expulsion that has ALREADY LANDED in
+  /// the polity's log: a ceiling, never a score. Callers must only call this
+  /// after the signed act verified — see [StaffRosterPage]'s expel flow.
+  int applyExpulsionStanding(AgoraPeer peer, {String reason = 'expelled'}) =>
+      _moderationVerbs.peerStanding(peer.uuid,
+          standing: 'capped', ceiling: ethneExpelCeiling, reason: reason);
+
+  /// Reinstate: lift the community's ceiling, and nothing else — any other
+  /// authority's bound on the peer stays.
+  int liftExpulsionStanding(AgoraPeer peer, {String reason = 'reinstated'}) =>
+      _moderationVerbs.peerStanding(peer.uuid,
+          standing: 'proved', ceiling: -1, reason: reason);
+
+  static double _nowSec() => DateTime.now().millisecondsSinceEpoch / 1000.0;
 
   /// Pull a FRESH attendance attestation from [peer] NOW (Phase 2, presence):
   /// asks the core to issue a nonce-fresh operator_attest_query. The refreshed
@@ -700,6 +816,9 @@ class PeerService extends ChangeNotifier {
   /// here rather than by [AgoraPeer.applyEvent]).
   bool _ingestReaction(AtRawEvent e) {
     if (e.kind != agoraEventReaction) return false;
+    // The core already drops a blocked peer's reaction; this is the second of
+    // two refusals. Not tallied, not tended.
+    if (isBlockedUuid(e.uuid)) return true;
     if (e.reactionPostId.isNotEmpty) {
       _reactionCounts.update(e.reactionPostId, (c) => c + 1, ifAbsent: () => 1);
     }
@@ -926,6 +1045,12 @@ class PeerService extends ChangeNotifier {
   bool _ingestDm(AtRawEvent e) {
     if (e.kind != agoraEventDm) return false;
     final key = _hex(e.uuid);
+    // The core drops a blocked peer's DMs before they get here; should one
+    // arrive anyway, it is dropped and COUNTED, never silently shown.
+    if (_peers[key]?.blocked ?? false) {
+      _dmsDroppedFromBlocked++;
+      return true;
+    }
     final peer = _peers.putIfAbsent(key, () => _newPeer(e.uuid));
     final thread = _dms[key] ??= <DmMessage>[];
     // Dedup by seq: the core may re-deliver, but incoming seqs are monotone per
@@ -946,14 +1071,25 @@ class PeerService extends ChangeNotifier {
     return true;
   }
 
+  int _dmsDroppedFromBlocked = 0;
+
+  /// DMs dropped here because their sender is blocked. Should stay 0 — the core
+  /// drops them first — so a non-zero count is worth seeing.
+  int get dmsDroppedFromBlocked => _dmsDroppedFromBlocked;
+
   /// Peers ordered by tie strength (§3.2) descending — the proximity-weighted
   /// social ranking that makes local, tended, trusted ties surface first. Ties
   /// break by topology rank then a stable id, so the order is deterministic.
   /// The strength itself is exposed via [strengthOf] for the UI.
+  ///
+  /// Blocked peers STAY in the roster and sort last (Phase 4 P4.1). A blocked
+  /// neighbour vanishing would be a lie about who is on the segment, and the
+  /// operator has to be able to find them to unblock.
   List<AgoraPeer> get peers {
     final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
     final list = _peers.values.toList();
     list.sort((a, b) {
+      if (a.blocked != b.blocked) return a.blocked ? 1 : -1;
       final sa = tieStrength(a,
           ownGeohash: _ownGeohash, nowEpochSeconds: now, weights: _weights);
       final sb = tieStrength(b,
@@ -980,8 +1116,11 @@ class PeerService extends ChangeNotifier {
   /// of the budget the tended, proximity-weighted connections consume, and which
   /// weakest ties are over the line (advisory — never severed). The UI reads this
   /// for the "stretched" indicator and to fade over-budget tiles.
+  ///
+  /// Blocked peers are left out: a blocked tie is not an attended tie, and it
+  /// must not spend budget or be the tie the ledger fades.
   BudgetLedger get budgetLedger => BudgetLedger.compute(
-        _peers.values,
+        _peers.values.where((p) => !p.blocked),
         ownGeohash: _ownGeohash,
         nowEpochSeconds: DateTime.now().millisecondsSinceEpoch / 1000.0,
         weights: _weights,
@@ -1163,6 +1302,190 @@ class PeerService extends ChangeNotifier {
     return true;
   }
 
+  // --- expulsion, initiated here (Phase 4 P4.1) ------------------------------
+
+  PolityActs? get _polityActs {
+    final o = _polityActsOverride;
+    if (o != null) return o;
+    final arc = _polityArchive;
+    final lib = _ethneLib();
+    final self = staffIdentity;
+    if (arc == null || lib == null || self == null) return null;
+    return _ArchivePolityActs(arc, lib, self);
+  }
+
+  /// Whether this node can start an expulsion: it is staff of a polity and can
+  /// read and sign its log.
+  bool get canExpel => ownPolityDid != null && _polityActs != null;
+
+  /// Why the last expulsion step was refused, in the library's words.
+  String? get lastExpulsionError => _lastExpulsionError;
+  String? _lastExpulsionError;
+
+  /// Expulsions this node started, newest first.
+  List<AuthoredExchange> get authoredExchanges => _cosign.authored;
+
+  /// Start expelling [memberDid]: open the exchange, sign this node's own
+  /// share if it is a decider, and ask [askPeers] for theirs.
+  ///
+  /// [targetPeer] is the peer the operator says IS this member, or null. There
+  /// is no DID→peer mapping, so it is a manual pick; nothing is done with it
+  /// until the act has landed (see [completeExpulsion]).
+  ///
+  /// Returns the exchange, or null with [lastExpulsionError] set.
+  AuthoredExchange? beginExpulsion({
+    required String memberDid,
+    required String rationale,
+    required List<String> deciderDids,
+    required List<AgoraPeer> askPeers,
+    AgoraPeer? targetPeer,
+  }) {
+    _lastExpulsionError = null;
+    final acts = _polityActs;
+    final polity = ownPolityDid;
+    if (acts == null || polity == null) {
+      _lastExpulsionError = 'This node cannot sign for a polity.';
+      return null;
+    }
+    final Map<String, dynamic> pending;
+    try {
+      pending = acts.pendingExpel(
+        polityDid: polity,
+        memberDid: memberDid,
+        rationale: rationale,
+        deciderDids: deciderDids,
+      );
+    } on Object catch (e) {
+      _lastExpulsionError = '$e';
+      notifyListeners();
+      return null;
+    }
+    final ax = AuthoredExchange.fromPending(pending,
+        memberDid: memberDid,
+        createdAt: _nowSec(),
+        targetPeerUuid: targetPeer?.uuid);
+    final own = staffIdentity?.did;
+    final othersNeeded = ax.signersRequired.any((d) => d != own);
+    if (othersNeeded && askPeers.isEmpty) {
+      _lastExpulsionError = 'Pick at least one peer to ask for a signature.';
+      notifyListeners();
+      return null;
+    }
+    // This node's own share, signed where its key lives.
+    if (own != null && ax.signersRequired.contains(own)) {
+      try {
+        _cosign.addSignature(CosignSignature(
+            cid: ax.cid, signerDid: own, sig: acts.signOwn(ax.bytes), ts: 0));
+      } on Object catch (e) {
+        _lastExpulsionError = '$e';
+        notifyListeners();
+        return null;
+      }
+    }
+    if (othersNeeded) {
+      final rc = _moderationVerbs.requestCosign(
+          [for (final p in askPeers) p.uuid],
+          record: ax.record,
+          op: ax.op,
+          polityDid: ax.polityDid,
+          cid: ax.cid,
+          bytes: ax.bytes);
+      if (rc != 0) {
+        _lastExpulsionError = rc == -2
+            ? 'Not connected yet — the ask was not sent.'
+            : 'The ask could not be sent.';
+        notifyListeners();
+        return null;
+      }
+    }
+    _cosign.addAuthored(ax);
+    notifyListeners();
+    return ax;
+  }
+
+  /// Signatures counted toward [ax] so far.
+  List<CosignSignature> countedSignatures(AuthoredExchange ax) =>
+      ax.countedFrom(_cosign.signaturesFor(ax.cid));
+
+  /// Whether every required signer has signed [ax].
+  bool expulsionReady(AuthoredExchange ax) =>
+      ax.status == AuthoredStatus.collecting &&
+      ax.readyFrom(_cosign.signaturesFor(ax.cid));
+
+  /// Close [ax], in the order the decision requires:
+  ///
+  ///   1. assemble the signatures onto the payload EXACTLY as it was returned;
+  ///   2. re-read the log and re-verify — the act must verify AND the member
+  ///      must be gone from the roll;
+  ///   3. only then persist the log, and
+  ///   4. only then hand the core the reputation consequence.
+  ///
+  /// The reputation consequence follows the decision landing in the log, never
+  /// the intent. A log that did not verify after the append is discarded, not
+  /// saved, and nothing is sent to the core. Returns whether the act landed.
+  bool completeExpulsion(AuthoredExchange ax) {
+    _lastExpulsionError = null;
+    final acts = _polityActs;
+    if (acts == null || !expulsionReady(ax)) {
+      _lastExpulsionError = 'Not every decider has signed yet.';
+      notifyListeners();
+      return false;
+    }
+    final sigs = countedSignatures(ax);
+    try {
+      acts.assemble(
+          ax.payload, [for (final s in sigs) (did: s.signerDid, sig: s.sig)]);
+    } on Object catch (e) {
+      return _expulsionFailed(ax, '$e');
+    }
+    // The cached fold describes the log BEFORE the append.
+    _affirmationState = null;
+    _guardianStateMap = null;
+    _polityVerified = null;
+    final bool verified;
+    final bool stillOnRoll;
+    try {
+      verified = acts.verify();
+      stillOnRoll = acts.rollDids(ax.polityDid).contains(ax.memberDid);
+    } on Object catch (e) {
+      _openPolityArchive(); // drop the unverified append
+      return _expulsionFailed(ax, '$e');
+    }
+    if (!verified || stillOnRoll) {
+      _openPolityArchive();
+      return _expulsionFailed(
+          ax,
+          !verified
+              ? 'The log did not verify after the append; nothing was kept.'
+              : 'The member is still on the roll; nothing was kept.');
+    }
+    try {
+      final dump = acts.dump();
+      _staff?.updateArchive(dump);
+      _staff?.save();
+    } on Object {
+      // The act landed in memory; losing durability is reported by the save.
+    }
+    ax.status = AuthoredStatus.landed;
+    final target = ax.targetPeerUuid;
+    if (target != null) {
+      ax.standingRc = _moderationVerbs.peerStanding(target,
+          standing: 'capped',
+          ceiling: ethneExpelCeiling,
+          reason: 'expelled from ${ax.polityDid}');
+    }
+    notifyListeners();
+    return true;
+  }
+
+  bool _expulsionFailed(AuthoredExchange ax, String why) {
+    ax.status = AuthoredStatus.failed;
+    ax.error = why;
+    _lastExpulsionError = why;
+    notifyListeners();
+    return false;
+  }
+
   /// Decline [e]. NOTHING is sent: a refusal is silence, the same posture the
   /// unhappy customer takes. The ask is settled so a replay does not raise it
   /// again.
@@ -1183,6 +1506,11 @@ class PeerService extends ChangeNotifier {
     // small JSON file under the config root. Best-effort — defaults on any error.
     _settings = await TieSettingsStore(
             File('${_daemon.root}/etc/at/agora.settings.json'))
+        .load();
+    // Why the operator reported whom (Phase 4 P4.1). Local-only; the core never
+    // sees a reason.
+    _moderationStore = await ModerationStore(
+            File('${_daemon.root}/etc/at/agora.moderation.json'))
         .load();
 
     // This node's staff membership, if it has one (Phase 3 P3.3). Staff of no
@@ -1306,4 +1634,94 @@ class PeerService extends ChangeNotifier {
 
   static String _hex(List<int> b) =>
       b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
+}
+
+/// The polity acts over the cdylib and this node's charter archive.
+class _ArchivePolityActs implements PolityActs {
+  _ArchivePolityActs(this._arc, this._lib, this._self);
+  final EthneArchive _arc;
+  final EthneFfi _lib;
+  final EthneKeypair _self;
+
+  @override
+  Map<String, dynamic> pendingExpel({
+    required String polityDid,
+    required String memberDid,
+    required String rationale,
+    required List<String> deciderDids,
+  }) =>
+      _arc.pendingChange(
+          op: 'expel',
+          polityDid: polityDid,
+          memberDid: memberDid,
+          rationale: rationale,
+          deciderDids: deciderDids);
+
+  @override
+  String signOwn(String bytesHex) =>
+      _lib.signDetached(priv: _self.priv, bytesHex: bytesHex);
+
+  @override
+  void assemble(Map<String, dynamic> payload,
+          List<({String did, String sig})> signatures) =>
+      _arc.assembleSigned(payload: payload, signatures: signatures);
+
+  @override
+  bool verify() => _arc.verify();
+
+  @override
+  List<String> rollDids(String polityDid) {
+    final members = _arc.affirmationState(polityDid)['members'];
+    if (members is! List) return const [];
+    return [
+      for (final m in members)
+        if (m is Map && m['did'] is String) m['did'] as String,
+    ];
+  }
+
+  @override
+  Map<String, dynamic> dump() =>
+      jsonDecode(_arc.dumpJson()) as Map<String, dynamic>;
+}
+
+/// The moderation verbs over the shim. -1 while no event channel is open.
+class _ShimModerationVerbs implements ModerationVerbs {
+  _ShimModerationVerbs(this._svc);
+  final PeerService _svc;
+
+  String get _q => _svc._daemon.queues.appToAt;
+
+  @override
+  int block(List<int> peerUuid) => _svc._events?.block(_q, peerUuid) ?? -1;
+
+  @override
+  int unblock(List<int> peerUuid) => _svc._events?.unblock(_q, peerUuid) ?? -1;
+
+  @override
+  int report(List<int> peerUuid) =>
+      _svc._events?.reportPeer(_q, peerUuid) ?? -1;
+
+  @override
+  int peerStanding(List<int> peerUuid,
+          {required String standing,
+          required double ceiling,
+          required String reason}) =>
+      _svc._events?.peerStanding(
+          _q, peerUuid, standing, ceiling, standingSourceEthne, reason) ??
+      -1;
+
+  @override
+  int requestCosign(List<List<int>> peerUuids,
+          {required String record,
+          required String op,
+          required String polityDid,
+          required String cid,
+          required String bytes}) =>
+      _svc._events?.requestCosign(_q, peerUuids,
+          record: record,
+          op: op,
+          polityDid: polityDid,
+          cid: cid,
+          bytes: bytes) ??
+      -1;
 }

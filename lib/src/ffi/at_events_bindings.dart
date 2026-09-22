@@ -99,6 +99,16 @@ const int agoraEventCosignSignature = 14;
 /// [AtRawEvent.businessPostBundle] is, and only this side can check it.
 const int agoraEventBusinessPost = 15;
 
+/// [AtRawEvent.repCeiling] when no authority bounds the peer (Phase 4 P4.1).
+/// Mirrors the C `AGORA_NO_CEILING`. Any negative value means the same; this
+/// is the one the shim writes.
+const double agoraNoCeiling = -1.0;
+
+/// [AtRawEvent.repTier] when the event carries no tier — one built by a test or
+/// any producer that predates Phase 4 P4.1. The app then falls back to deriving
+/// the tier from the score. The shim always writes a real 0..4.
+const int agoraTierUnknown = -1;
+
 /// dart:ffi mirror of `agora_event_t` (native/at_agora_shim.h). Field order and
 /// element counts MUST match the C struct exactly — the layout is the ABI
 /// contract, and the C side asserts the lengths against AT's own constants.
@@ -289,7 +299,8 @@ final class AgoraEvent extends Struct {
   external Array<Uint8> cosignBytes;
 
   /// [agoraEventBusinessPost] (Phase 3 P3.4). Appended after [cosignBytes] to
-  /// mirror the C `agora_event_t`, which grew from 17872 to 22152 bytes; every
+  /// mirror the C `agora_event_t`, which grew from 17872 to 22152 to 22168
+  /// bytes; every
   /// prior field offset is unchanged (businessBundle stays at 8208,
   /// cosignBytes at 11720).
   ///
@@ -316,6 +327,33 @@ final class AgoraEvent extends Struct {
 
   @Array(agoraBusinessPostBundleMax + 1)
   external Array<Uint8> businessPostBundle;
+
+  /// Moderation (Phase 4 P4.1). Appended LAST, so every prior offset is
+  /// unchanged.
+  ///
+  /// [blocked] rides [agoraEventPeer] — identity holds the block, so identity
+  /// reports it. [repTier] and [repCeiling] ride [agoraEventReputation] —
+  /// reputation's own truth. Compose them exactly as the core does: a blocked
+  /// peer's effective tier is 0 whatever they have earned.
+  ///
+  /// Before P4.1 a block emitted nothing at all and this app derived a peer's
+  /// tier from the score, which a block does not touch — so a blocked peer
+  /// went on ranking exactly as before. These three fields are what make a
+  /// block, and a community's bound, visible.
+  @Uint8()
+  external int blocked;
+
+  /// The tier reputation actually used, after any ceiling. 0..4.
+  @Int32()
+  external int repTier;
+
+  /// The ceiling in force, or [agoraNoCeiling] when the peer is unbounded.
+  ///
+  /// READ ONLY ON [agoraEventReputation]. The native flatten path memsets each
+  /// event and writes this explicitly on the reputation case alone, so on any
+  /// other kind it is 0.0 — which would read as "floored at zero".
+  @Double()
+  external double repCeiling;
 }
 
 /// A pure-Dart copy of one decoded event. Decoupled from native memory so it
@@ -369,6 +407,9 @@ class AtRawEvent {
     this.businessPostTs = 0,
     this.businessPostHops = 0,
     this.businessPostBundle = '',
+    this.blocked = false,
+    this.repTier = agoraTierUnknown,
+    this.repCeiling = agoraNoCeiling,
   });
 
   final int kind;
@@ -502,6 +543,23 @@ class AtRawEvent {
   final double businessPostTs;
   final int businessPostHops;
   final String businessPostBundle;
+
+  /// True iff THIS node has locally blocked the peer (Phase 4 P4.1). Rides
+  /// [agoraEventPeer]; identity holds the block, so identity reports it.
+  final bool blocked;
+
+  /// The tier reputation actually used for this peer, after any ceiling
+  /// (0..4), or [agoraTierUnknown]. Rides [agoraEventReputation]. The app's own tier floors are a
+  /// FALLBACK for a core that predates P4.1 — a ceiling is not a function of
+  /// the score, so the app cannot derive this one.
+  final int repTier;
+
+  /// The ceiling bounding this peer, or [agoraNoCeiling] when unbounded.
+  /// Rides [agoraEventReputation]; meaningless on any other kind.
+  ///
+  /// Lets the app tell "low because they have earned little" from "bounded by
+  /// a community decision" — different things to show a person.
+  final double repCeiling;
 }
 
 typedef _SetRootC = Void Function(Pointer<Utf8>);
@@ -556,6 +614,11 @@ typedef _ReturnCosignDart = int Function(Pointer<Void>, Pointer<Utf8>,
 
 typedef _BlockC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
 typedef _BlockDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
+// agora_unblock and agora_report_peer share block's shape: (handle, queue, uuid).
+typedef _PeerStandingC = Int32 Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Uint8>, Pointer<Utf8>, Double, Pointer<Utf8>, Pointer<Utf8>);
+typedef _PeerStandingDart = int Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Uint8>, Pointer<Utf8>, double, Pointer<Utf8>, Pointer<Utf8>);
 
 typedef _AttendC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
 typedef _AttendDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
@@ -755,6 +818,12 @@ class AtEvents {
       _lib.lookupFunction<_ReactC, _ReactDart>('agora_react_post');
   static final _BlockDart _block =
       _lib.lookupFunction<_BlockC, _BlockDart>('agora_block');
+  static final _BlockDart _unblock =
+      _lib.lookupFunction<_BlockC, _BlockDart>('agora_unblock');
+  static final _BlockDart _reportPeer =
+      _lib.lookupFunction<_BlockC, _BlockDart>('agora_report_peer');
+  static final _PeerStandingDart _peerStanding = _lib
+      .lookupFunction<_PeerStandingC, _PeerStandingDart>('agora_peer_standing');
   static final _RequestCosignDart _requestCosign = _lib
       .lookupFunction<_RequestCosignC, _RequestCosignDart>('agora_request_cosign');
   static final _ReturnCosignDart _returnCosign = _lib
@@ -1037,6 +1106,61 @@ class AtEvents {
     }
   }
 
+  /// Run one peer-uuid verb ([block], [unblock], [reportPeer]): marshal the
+  /// queue name and the 16 raw uuid bytes, call, free.
+  int _peerVerb(_BlockDart fn, String sendQueue, List<int> peerUuid) {
+    final q = sendQueue.toNativeUtf8();
+    final u = calloc<Uint8>(agoraUuidLen);
+    try {
+      for (var i = 0; i < agoraUuidLen && i < peerUuid.length; i++) {
+        u[i] = peerUuid[i];
+      }
+      return fn(_handle, q, u);
+    } finally {
+      calloc.free(q);
+      calloc.free(u);
+    }
+  }
+
+  /// Lift a local block on [peerUuid] (Phase 4 P4.1). The core re-emits the
+  /// peer, whose [AtRawEvent.blocked] then reads false. Returns 0 on success,
+  /// negative on error (-2 == daemon not ready yet).
+  int unblock(String sendQueue, List<int> peerUuid) =>
+      _peerVerb(_unblock, sendQueue, peerUuid);
+
+  /// Report [peerUuid] (Phase 4 P4.1): the core sends them a directed report
+  /// and stages a low first-person score. No reason travels. A 0 means QUEUED,
+  /// not accepted — the core applies its daily caps afterwards. Returns 0 on
+  /// success, negative on error (-2 == daemon not ready yet).
+  int reportPeer(String sendQueue, List<int> peerUuid) =>
+      _peerVerb(_reportPeer, sendQueue, peerUuid);
+
+  /// Hand the core an authority finding about [peerUuid]'s standing (Phase 4
+  /// P4.1) — a CEILING, never a score. [standing] is "proved" (reinstated,
+  /// lifts this source's ceiling), "capped" or "failed"; [ceiling] in [0, 1] or
+  /// negative for none; [source] names the authority ("ethne"). Returns 0 on
+  /// success, negative on error (-2 == daemon not ready yet).
+  int peerStanding(String sendQueue, List<int> peerUuid, String standing,
+      double ceiling, String source, String reason) {
+    final q = sendQueue.toNativeUtf8();
+    final u = calloc<Uint8>(agoraUuidLen);
+    final st = standing.toNativeUtf8();
+    final src = source.toNativeUtf8();
+    final why = reason.toNativeUtf8();
+    try {
+      for (var i = 0; i < agoraUuidLen && i < peerUuid.length; i++) {
+        u[i] = peerUuid[i];
+      }
+      return _peerStanding(_handle, q, u, st, ceiling, src, why);
+    } finally {
+      calloc.free(q);
+      calloc.free(u);
+      calloc.free(st);
+      calloc.free(src);
+      calloc.free(why);
+    }
+  }
+
   /// Pull a fresh operator-attendance attestation from [peerUuid] (16 raw
   /// identity bytes) NOW (Phase 2, presence). The identity process issues a
   /// nonce-fresh attest query; the refreshed operator_attested_at rides the next
@@ -1219,6 +1343,13 @@ class AtEvents {
           businessPostTs: e.businessPostTs,
           businessPostHops: e.businessPostHops,
           businessPostBundle: _businessPostBundleString(e.businessPostBundle),
+          blocked: e.blocked != 0,
+          repTier: e.repTier,
+          // Only the reputation event carries a ceiling; every other kind
+          // leaves the field at the memset zero, which would read as "floored
+          // at zero" rather than "unbounded".
+          repCeiling:
+              e.kind == agoraEventReputation ? e.repCeiling : agoraNoCeiling,
         );
       }, growable: false);
     } finally {

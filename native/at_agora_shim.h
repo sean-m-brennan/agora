@@ -270,6 +270,27 @@ typedef struct {
     double  business_post_ts;
     int32_t business_post_hops;
     char    business_post_bundle[AGORA_BUSINESS_POST_BUNDLE_MAX + 1];
+    /* Moderation (Phase 4 P4.1). Appended LAST after business_post_bundle, so
+     * every prior field offset is unchanged; the Dart AgoraEvent and the cohort
+     * ctypes Ev mirror this order and re-check the new sizeof.
+     *
+     * blocked rides AGORA_EVENT_PEER — identity's own state, since identity is
+     * what holds the block. rep_tier and rep_ceiling ride
+     * AGORA_EVENT_REPUTATION — reputation's. Compose them exactly as the core
+     * does: a blocked peer's effective tier is 0 whatever they have earned.
+     *
+     * Before P4.1 a block emitted NOTHING and the app derived a peer's tier
+     * from the score, which a block does not touch — so a blocked peer went on
+     * rendering exactly as before. These three fields are what make a block,
+     * and a community's bound, visible at all.
+     *
+     * rep_ceiling is AGORA_NO_CEILING (-1) when the peer is unbounded. It is
+     * written on every reputation event and left at that sentinel elsewhere —
+     * READ IT ONLY ON AGORA_EVENT_REPUTATION. The flatten path memsets each
+     * event, so an unwritten 0.0 would read as "floored at zero". */
+    uint8_t blocked;                           /* AGORA_EVENT_PEER; 0/1 */
+    int32_t rep_tier;                          /* AGORA_EVENT_REPUTATION; 0..4 */
+    double  rep_ceiling;                       /* AGORA_EVENT_REPUTATION */
 } agora_event_t;
 
 /** Set $AUTONOMOUS_TRUST_ROOT for THIS process, so the app-events client below
@@ -350,6 +371,46 @@ int agora_react_post(void *handle, const char *send_queue,
  *  wire traffic and no reputation transaction. Returns 0 on success, negative on
  *  error (AT_APP_NOT_READY == -2). */
 int agora_block(void *handle, const char *send_queue, const uint8_t *peer_uuid);
+
+/** Lift a local block (Phase 4 P4.1). The core re-emits the peer, whose
+ *  `blocked` flag then reads 0; the peer is told nothing. Returns 0 on success,
+ *  negative on error (AT_APP_NOT_READY == -2). */
+int agora_unblock(void *handle, const char *send_queue, const uint8_t *peer_uuid);
+
+/** Report a peer (Phase 4 P4.1). `send_queue` is the app -> AT queue;
+ *  `peer_uuid` is the peer's 16 raw identity bytes. The identity process sends
+ *  the peer a directed encrypted report and stages a low first-person score
+ *  about them. NO REASON TRAVELS: whatever the operator picked stays in the app.
+ *
+ *  A 0 means the ask was queued, not that the report was accepted: the daily
+ *  caps (one report per peer per day, plus the shared accrual budget) are
+ *  applied in the core afterwards, so the app keeps its own advisory count to
+ *  grey the action out. A report does not block, and a block does not stop a
+ *  report. Returns 0 on success, negative on error (AT_APP_NOT_READY == -2). */
+int agora_report_peer(void *handle, const char *send_queue,
+                      const uint8_t *peer_uuid);
+
+/** Hand the core an AUTHORITY FINDING about a peer's standing (Phase 4 P4.1).
+ *
+ *  `standing` is "proved", "capped" or "failed"; `ceiling` is in [0, 1] or
+ *  negative for "no bound"; `source` names the authority ("ethne").
+ *
+ *  A CEILING, NEVER A SCORE. The app has decided something AT's [0, 1] scale
+ *  cannot express — a polity expelled this member — and a scalar penalty has no
+ *  representation on that scale at all. The bound closes every tier-gate while
+ *  leaving the peer above the network-layer cut-off, so an expulsion is a
+ *  reputation event rather than a hard cut, and is reversible by the same
+ *  authority: "proved" from the app means REINSTATED and lifts only THIS
+ *  source's ceiling.
+ *
+ *  The core verifies NOTHING about the finding — an Ethne expulsion is proved
+ *  by co-signatures inside a record it cannot parse, exactly as a page bundle
+ *  is. It trusts that this arrived on the local app queue, and checks the shape.
+ *  `source` may not be "zta": an app cannot know what a credential authority
+ *  proved. Returns 0 on success, negative on error (AT_APP_NOT_READY == -2). */
+int agora_peer_standing(void *handle, const char *send_queue,
+                        const uint8_t *peer_uuid, const char *standing,
+                        double ceiling, const char *source, const char *reason);
 
 /** Pull a fresh operator-attendance attestation from a peer NOW (Phase 2,
  *  presence). `send_queue` is the app -> AT queue; `peer_uuid` is the peer's 16
@@ -440,6 +501,10 @@ int agora_request_cosign(void *handle, const char *send_queue,
 int agora_return_cosign(void *handle, const char *send_queue,
                         const uint8_t *peer_uuid, const char *cid,
                         const char *signer_did, const char *sig_hex);
+
+/** @c rep_ceiling when no authority bounds the peer. Mirrors PEER_NO_CEILING.
+ *  Any negative value means the same thing; this is the one written. */
+#define AGORA_NO_CEILING (-1.0)
 
 /** Non-blocking poll. Writes up to @p max flattened events into @p out. Returns
  *  the count written (0 = nothing arrived), or a negative AT error code. */

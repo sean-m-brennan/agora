@@ -71,16 +71,31 @@ class FeedStore {
   /// break by post time (newest first) then a stable id, so the order is
   /// deterministic. An outgoing echo is always shown near the top (its author is
   /// self, S treated as maximal so your own post never sinks).
+  ///
+  /// [isHiddenAuthor] leaves out posts by an author the operator has blocked
+  /// (Phase 4 P4.1) — omitted from the result, NOT removed from the store, so
+  /// an unblock restores them at once rather than waiting for a redelivery the
+  /// dedup map would refuse anyway.
+  ///
+  /// TEST-ONLY IN PRACTICE: the live feed is [rankFeed], which merges business
+  /// posts in. The predicate is here too so the two cannot disagree about what
+  /// a block hides.
   List<Post> ranked({
     required double Function(List<int> authorUuid) strengthOfAuthor,
     required double nowEpochSeconds,
+    bool Function(List<int> authorUuid)? isHiddenAuthor,
   }) {
     double score(Post p) {
       final s = p.outgoing ? 1.0 : strengthOfAuthor(p.authorUuid);
       return s * recency(p.ts, nowEpochSeconds);
     }
 
-    final list = _byId.values.toList();
+    final list = _byId.values
+        .where((p) =>
+            p.outgoing ||
+            isHiddenAuthor == null ||
+            !isHiddenAuthor(p.authorUuid))
+        .toList();
     list.sort((a, b) {
       final byScore = score(b).compareTo(score(a));
       if (byScore != 0) return byScore;

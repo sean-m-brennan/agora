@@ -274,15 +274,22 @@ class Ev(ctypes.Structure):
         ("business_post_ts", ctypes.c_double),
         ("business_post_hops", ctypes.c_int32),
         ("business_post_bundle", ctypes.c_char * (BPBUN + 1)),
+        # Moderation (Phase 4 P4.1), appended LAST so every prior offset
+        # is unchanged. blocked rides the PEER event; rep_tier and
+        # rep_ceiling ride the REPUTATION event. rep_ceiling is -1 when
+        # the peer is unbounded and is meaningless on any other kind.
+        ("blocked", ctypes.c_uint8),
+        ("rep_tier", ctypes.c_int32),
+        ("rep_ceiling", ctypes.c_double),
     ]
-# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (22152 with
+# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (22168 with
 # the geohash + profile_json + connection_state + DM + POST + REACTION + in_group +
 # proximity_band + BUSINESS_AD tail; rtt@116, geohash@120, profile_json@133,
 # connection_state@2696, dm_seq@2704, post_id@3745, post_seq@3752, reaction tail after
 # post_body, in_group@8016 + proximity_band@8020 in the tail padding, business tail
 # from 8024, co-signing tail from 11288, business-post tail from 17864). If the C struct grows and this is not updated in lockstep, poll() would
 # misread every field past the drift.
-assert ctypes.sizeof(Ev) == 22152, f"Ev size {ctypes.sizeof(Ev)} != 22152 (ABI drift)"
+assert ctypes.sizeof(Ev) == 22168, f"Ev size {ctypes.sizeof(Ev)} != 22168 (ABI drift)"
 
 lib = ctypes.CDLL(shim)
 lib.agora_set_root.argtypes = [ctypes.c_char_p]; lib.agora_set_root.restype = None

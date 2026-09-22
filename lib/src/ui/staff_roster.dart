@@ -23,6 +23,7 @@ import 'package:flutter/material.dart' hide ConnectionState;
 import '../model/cosign_exchanges.dart';
 import '../model/staff_roster.dart';
 import '../node/peer_stream.dart';
+import 'expel_dialog.dart';
 
 class StaffRosterPage extends StatelessWidget {
   const StaffRosterPage({super.key, required this.service});
@@ -50,8 +51,13 @@ class StaffRosterPage extends StatelessWidget {
               if (pending.isNotEmpty) const _PendingHeader(),
               for (final e in pending)
                 _CosignTile(exchange: e, service: service),
+              if (service.authoredExchanges.isNotEmpty)
+                const _AuthoredHeader(),
+              for (final a in service.authoredExchanges)
+                _AuthoredTile(exchange: a, service: service),
               if (roster != null)
-                for (final m in roster.members) _MemberTile(member: m),
+                for (final m in roster.members)
+                  _MemberTile(member: m, roster: roster, service: service),
             ],
           );
         },
@@ -521,10 +527,91 @@ class _CosignTile extends StatelessWidget {
   }
 }
 
+class _AuthoredHeader extends StatelessWidget {
+  const _AuthoredHeader();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Padding(
+      padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
+      child: Text(
+        'Expulsions you started',
+        style: TextStyle(fontWeight: FontWeight.w600),
+      ),
+    );
+  }
+}
+
+/// An expulsion this node is authoring (Phase 4 P4.1): who has signed, who has
+/// not, and — only once every decider has — the step that records it. The
+/// reputation consequence is applied by that step and only after the log
+/// re-verifies, so nothing on this card can bound anybody early.
+class _AuthoredTile extends StatelessWidget {
+  const _AuthoredTile({required this.exchange, required this.service});
+
+  final AuthoredExchange exchange;
+  final PeerService service;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final small = TextStyle(fontSize: 11, color: scheme.onSurfaceVariant);
+    final counted = service.countedSignatures(exchange);
+    final need = exchange.signersRequired.length;
+    final missing = exchange.signersRequired
+        .where((d) => !counted.any((s) => s.signerDid == d))
+        .toList();
+    final status = switch (exchange.status) {
+      AuthoredStatus.collecting => '${counted.length} of $need signed',
+      AuthoredStatus.landed => exchange.targetPeerUuid == null
+          ? 'Recorded. No peer was picked, so no standing was changed.'
+          : (exchange.standingRc == 0
+              ? 'Recorded. Their standing on this node is now capped.'
+              : 'Recorded, but the standing could not be handed to the core '
+                  '(rc ${exchange.standingRc}).'),
+      AuthoredStatus.failed => 'Not recorded: ${exchange.error ?? 'refused'}',
+    };
+    return Card(
+      key: Key('authored-${exchange.cid}'),
+      margin: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Expel ${_short(exchange.memberDid)}',
+                style: const TextStyle(fontWeight: FontWeight.w600)),
+            const SizedBox(height: 4),
+            Text(status, key: const Key('authored-status')),
+            if (exchange.status == AuthoredStatus.collecting &&
+                missing.isNotEmpty)
+              Text('Waiting on ${missing.map(_short).join(', ')}',
+                  style: small),
+            if (exchange.status == AuthoredStatus.collecting)
+              Align(
+                alignment: Alignment.centerRight,
+                child: FilledButton(
+                  key: const Key('authored-complete'),
+                  onPressed: service.expulsionReady(exchange)
+                      ? () => service.completeExpulsion(exchange)
+                      : null,
+                  child: const Text('Record expulsion'),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _MemberTile extends StatelessWidget {
-  const _MemberTile({required this.member});
+  const _MemberTile(
+      {required this.member, required this.roster, required this.service});
 
   final StaffMember member;
+  final StaffRoster roster;
+  final PeerService service;
 
   @override
   Widget build(BuildContext context) {
@@ -609,6 +696,21 @@ class _MemberTile extends StatelessWidget {
                   '${member.observer != null ? ', signed by ${_short(member.observer!)}' : ''}.',
                   style:
                       TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+                ),
+              ),
+            // Starting an expulsion (Phase 4 P4.1). Offered only where it could
+            // succeed: this node can sign for the polity, the bar is reachable,
+            // and nobody expels themselves.
+            if (service.canExpel &&
+                roster.expelReachable &&
+                member.did != service.staffIdentity?.did)
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  key: Key('expel-${member.did}'),
+                  onPressed: () => showExpelDialog(context,
+                      service: service, roster: roster, member: member),
+                  child: const Text('Expel…'),
                 ),
               ),
           ],

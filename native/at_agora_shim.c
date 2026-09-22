@@ -110,10 +110,16 @@ _Static_assert(AGORA_BUSINESS_POST_ID_MAX == AT_APP_BUSINESS_POST_ID_LEN,
  * NOTE WHAT DID NOT GROW: at_app_event_t is a UNION and at_app_business_post_t
  * (~4.3 KB) stays under at_app_cosign_request_t's 6145, so agora_events_poll's
  * 16-event batch budget is exactly what it was. This flat struct is the only
- * thing that widened. */
-_Static_assert(sizeof(agora_event_t) == 22152,
-               "agora_event_t size changed — update the Dart struct and both "
-               "cohort ctypes Ev asserts in lockstep");
+ * thing that widened.
+ *
+ * 22152 -> 22168 at Phase 4 P4.1 (blocked + rep_tier + rep_ceiling). The union
+ * again did NOT grow: at_app_reputation_t is ~40 bytes against
+ * at_app_cosign_request_t's 6145, so the batch budget is untouched a second
+ * time. Offsets, measured not assumed: blocked 22149, rep_tier 22152,
+ * rep_ceiling 22160. */
+_Static_assert(sizeof(agora_event_t) == 22168,
+               "agora_event_t size changed — update the Dart struct and ALL "
+               "FIVE cohort ctypes Ev asserts in lockstep");
 
 void *agora_events_open(const char *recv_queue)
 {
@@ -173,6 +179,27 @@ int agora_react_post(void *handle, const char *send_queue,
 int agora_block(void *handle, const char *send_queue, const uint8_t *peer_uuid)
 {
     return at_app_events_block((at_app_events_t *)handle, send_queue, peer_uuid);
+}
+
+int agora_unblock(void *handle, const char *send_queue, const uint8_t *peer_uuid)
+{
+    return at_app_events_unblock((at_app_events_t *)handle, send_queue, peer_uuid);
+}
+
+int agora_report_peer(void *handle, const char *send_queue,
+                      const uint8_t *peer_uuid)
+{
+    return at_app_events_report_peer((at_app_events_t *)handle, send_queue,
+                                     peer_uuid);
+}
+
+int agora_peer_standing(void *handle, const char *send_queue,
+                        const uint8_t *peer_uuid, const char *standing,
+                        double ceiling, const char *source, const char *reason)
+{
+    return at_app_events_peer_standing((at_app_events_t *)handle, send_queue,
+                                       peer_uuid, standing, ceiling, source,
+                                       reason);
 }
 
 int agora_request_attend(void *handle, const char *send_queue,
@@ -283,6 +310,7 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             memcpy(e->operator_pubkey, raw[i].data.peer.operator_pubkey, AGORA_KEY_LEN);
 #ifdef AT_SOCIAL_ENABLED
             e->in_group = raw[i].data.peer.in_group ? 1 : 0;
+            e->blocked = raw[i].data.peer.blocked ? 1 : 0;
 #endif /* AT_SOCIAL_ENABLED */
             w++;
             break;
@@ -292,6 +320,14 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             memcpy(e->peer_uuid, raw[i].data.reputation.peer_uuid, AGORA_UUID_LEN);
             e->rep_score = raw[i].data.reputation.score;
             e->rep_rated = raw[i].data.reputation.rated ? 1 : 0;
+            e->rep_tier = raw[i].data.reputation.effective_tier;
+            /* Written EXPLICITLY, including when unbounded. The event was
+             * memset above, so leaving it would report 0.0 — "floored at zero"
+             * — for every unbounded peer, which is the most likely defect in
+             * this whole change. */
+            e->rep_ceiling = raw[i].data.reputation.standing_ceiling < 0.0
+                                 ? AGORA_NO_CEILING
+                                 : raw[i].data.reputation.standing_ceiling;
             w++;
             break;
 
