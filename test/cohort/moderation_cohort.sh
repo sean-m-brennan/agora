@@ -51,9 +51,9 @@
 # derives from that record, through the same agora_peer_standing verb.
 #
 # BOUNDED BY OPEN AT ISSUES (ISSUES.md): §2.13, the Paxos quorum is 1 by
-# accident, so nothing here leans on quorum size; §2.15, chains do not fully
-# converge across three nodes, so a report is asserted to have committed on AT
-# LEAST ONE node, never that all three agree.
+# accident, so nothing here leans on quorum size; §2.15, the chains still fork
+# by order across three nodes, so the report is asserted bilateral on AT LEAST
+# ONE node, never that all three agree.
 #
 # Requirements: python3, the built native layer (./build.sh), and EITHER root +
 # iproute2 (netns) OR a usable docker daemon. Nothing is minted, so no
@@ -1167,19 +1167,27 @@ if [ -z "$task" ]; then
 fi
 ok "phase 7 — ada's report paired bilaterally (task $task)"
 
-DL=$(( SECONDS + WAIT )); committed=0
+# BILATERAL, not merely committed. "Transaction committed" names ONE side's
+# Paxos round; the report exists only once the reported peer's half is in the
+# same entry. Run 9 (2026-09-23) passed the weaker check with ada's half alone
+# and moved no score. One node is enough (§2.15): this phase asserts the
+# report, not replication.
+DL=$(( SECONDS + WAIT )); bilateral=0
 while [ "$SECONDS" -lt "$DL" ]; do
   for r in "$ROOT_ADA" "$ROOT_BOB" "$ROOT_CAROL"; do
-    if saw "$r" "Transaction committed (task $task)"; then committed=1; break 2; fi
+    if saw "$r" "task $task is bilateral"; then bilateral=1; break 2; fi
   done
   sleep 2
 done
-if [ "$committed" -ne 1 ]; then
-  err "FAIL (phase 7) — the report round $task never committed on ANY node."
-  err "  At least one is all §2.15 lets this cohort ask for."
+if [ "$bilateral" -ne 1 ]; then
+  err "FAIL (phase 7) — the report $task never became a bilateral entry on ANY node."
+  for r in "$ROOT_ADA" "$ROOT_BOB" "$ROOT_CAROL"; do
+    err "  $(basename "$r"): rounds committed for it: $(count_in "$r" "Transaction committed (task $task)")"
+  done
+  err "  One side's round committing is not the report; both halves must land."
   dump_logs; exit 1
 fi
-ok "phase 7 — the report committed (on at least one node; §2.15)"
+ok "phase 7 — the report is a bilateral entry (on at least one node)"
 
 log "Phase 7: ada reports bob AGAIN — the daily cap must refuse it"
 before_ok="$(count_in "$ROOT_ADA" "reported peer $BOB_UUID")"
