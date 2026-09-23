@@ -26,6 +26,12 @@
 # ACTUALLY holds, measured live: phase 1 needs tier >= 1, and phase 6 caps him
 # one tier below whatever carol and ada both give him.
 #
+# Once the chains converged (ISSUES.md §2.15), he DID sink below it, to 0.43:
+# the pure score divided by the task weights alone, so every score was
+# multiplied by its reporter's reputation and the rescore sweep compounded it.
+# Since 2026-09-23 it is a true weighted average (trust-tiers.md §5), and a peer
+# whose transactions score 0.90 holds near 0.90.
+#
 # What it proves, in order:
 #   1. discovery; the starting tier reached carol and ada, and an unbounded
 #      peer's ceiling reads -1 on the wire, not 0.0 (the memset trap);
