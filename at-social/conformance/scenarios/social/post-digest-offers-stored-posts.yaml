@@ -1,0 +1,33 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-digest-offers-stored-posts
+byte_pinning: false
+description: |
+    STORE-AND-FORWARD (Agora Phase 4 DDIL). A post is a fire-and-forget
+    multicast, so a node off the segment when it went out (the other island of
+    a partition) never hears it. Every node therefore keeps its recent posts and
+    periodically advertises their content ids in a digest; a heal needs no
+    detection, because whoever missed a post asks for it afterwards.
+
+    bob accepts alice's post, so a digest from bob offers it. The post's ts is
+    far in the future so it is inside the 24 h window whatever the clock says.
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: peer_post
+    payload: {body: "while we were apart", seq: 1, ts: 4102444800, tier: 0}
+  - id: 2
+    from: bob
+    to: bob
+    function: trigger_post_digest
+    description: bob's periodic digest.
+expected_state:
+  bob:
+    post_digests_emitted: 1

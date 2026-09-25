@@ -64,7 +64,7 @@ for it: a build has social when `AT_EXTERNAL_EXTENSIONS` names `c/social` (below
 from load-time constructors:
 
 - the identity hooks (AT's `identity/id_ext.h`, below);
-- its 34 identity verbs, 16 from the wire and 18 from the app, through
+- its 37 identity verbs, 19 from the wire and 18 from the app, through
   `processes/extension.h` on "identity" only;
 - its 12 message types and 18 `AT_APP_*` verbs (`social/social_msg_types.h`);
 - the app-event decoders behind `at_agora.h`.
@@ -126,8 +126,8 @@ while failing its operator.
 prefix `autonomous_trust.social.`), found by its entry point or its
 `_at_extension.py` marker. The modules are:
 
-- `protocol` holds `SocialProtocol`, the 17 verbs moved off `IdentityProtocol`
-  with their strings unchanged;
+- `protocol` holds `SocialProtocol`: the 17 verbs moved off `IdentityProtocol`
+  with their strings unchanged, and the three store-and-forward verbs;
 - `extension` is the `Extension`;
 - `handlers` holds the handlers and senders, as module functions `f(proc, …)`;
 - `state` holds `SocialState`, on `proc.social`;
@@ -173,3 +173,59 @@ when `$AT_CONFORMANCE_PLUGINS` names `conformance/`. Without them AT's corpus ha
 no `social` cases at all. The identity adapters name nothing social.
 `tools/at_diagram.py` lets a plug-in scenario use its base protocol's verbs
 (`_PROTOCOL_BASES`).
+
+## Store-and-forward (Phase 4 DDIL)
+
+A post is a group multicast, and a multicast is fire-and-forget: a node that is
+not on the segment when it goes out never hears it. Across a partition that was
+every post the other island made, lost for good at the heal, because no node
+kept a post's body past delivering it. Now each node keeps its recent posts and
+the network repairs itself, with no partition detection, because the first
+step is periodic.
+
+| Verb | Channel | Carries |
+|---|---|---|
+| `peer_post_digest` | group multicast, encrypted | the content ids of our recent stored posts, `{"feed":[...], "biz":[...]}` |
+| `peer_post_want` | directed, encrypted | the ids from a digest that our dedup rings do not hold, back to its sender |
+| `peer_post_backfill` | directed, encrypted | one stored post's ORIGINAL signed envelope, `{"kind":"feed"\|"biz","post":{...}}` |
+
+**Nothing is taken on trust.** A backfilled post goes through the same inbound
+path as the original (`_ingest_post` / `_ingest_business_post`): the author's
+signature is re-verified, the tier gate or the business page gate applies, and
+dedup is by the same content id. The node serving it vouches for nothing. Two
+things only the group channel does: record co-membership (a backfill did not
+decrypt with the group key) and relay (a backfill is terminal, or every heal
+would re-flood the group). A digest or a want is honoured only from an admitted
+peer, and a post is never backfilled to its own author.
+
+**Bounds.**
+- `POST_STORE_CAP` 256 posts per kind (`post_store.h`), oldest evicted.
+- A digest offers only posts younger than 24 h, by their own signed timestamp.
+- At most 32 ids per kind per want, and 32 posts per kind per backfill.
+- One want sent to, and one served for, each peer per 10 s.
+- The digest goes out at most every `$AT_SOCIAL_DIGEST_SEC` (default 60),
+  checked on identity's ~20 s resync sweep, and at the next sweep after a peer
+  is confirmed.
+- A full digest, 256 + 256 ids, is ~46 KB on the wire (base64), under the 65,507-byte
+  UDP limit (`post_store_test`).
+
+**Limits, stated.**
+- The store is in memory. A restarted node cannot backfill what it held before
+  the restart.
+- A blocked author's posts are stored and served (a personal block governs what
+  we see, not what our neighbours may: the reason the relay still runs).
+- Python has no feed publish verb, so its store holds received posts only.
+- The digest is a group multicast, so it reaches the other island only once
+  both hold one group key again: posts are the group's, and this is by design.
+- A digest per node per minute is fine at Dunbar scale. Its cost at city scale
+  belongs to the relay work (SOCIAL_APP_PLAN.md Phase 4).
+
+**Tests.**
+- `c/social/test/post_store_test.c` and `python/tests/a_unit/test_post_store.py`
+  cover the store.
+- 13 conformance scenarios cover the verbs: `post-digest-*`, `post-want-*`,
+  `post-backfill-*` and `business-post-backfill-*`. The C adapter's social state
+  is a singleton shared by every participant, so each scenario tests ONE hop.
+- `../test/cohort/partition_cohort.sh` runs the whole chain live across a real
+  split.
+

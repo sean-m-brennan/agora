@@ -17,7 +17,7 @@
 
 Pins: discovery finds this distribution with nothing but the source tree on
 the path (its ``_at_extension.py`` marker); social is then an Extension like
-first contact, always on where present -- its 17 verbs, its state on
+first contact, always on where present -- its 20 verbs, its state on
 proc.social, and the IdentityHooks the core calls. The hook machinery itself
 is tested in the core (tests/a_unit/test_extensions.py), and a node without
 this distribution by the core's test_identity_without_social.py.
@@ -67,10 +67,10 @@ SOCIAL_VERBS = (
     'cosign_request', 'cosign_sig', 'proximity_trigger', 'proximity_probe',
     'proximity_reply', 'profile_query', 'profile_response',
     'connection_request', 'connection_response', 'dm', 'post', 'reaction',
-    'report')
+    'report', 'post_digest', 'post_want', 'post_backfill')
 
 
-def test_social_registers_its_17_verbs_on_identity_only():
+def test_social_registers_its_20_verbs_on_identity_only():
     proc = _identity_process()
     assert 'social' in proc._extensions
     for verb in SOCIAL_VERBS:

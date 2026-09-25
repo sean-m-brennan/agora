@@ -1,0 +1,32 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-digest-all-held-no-want
+byte_pinning: false
+description: |
+    A digest naming only posts carol already holds asks her for nothing (Agora
+    Phase 4 DDIL): the digest is compared against the dedup ring, so a heal
+    costs one want per post actually missed, not one per post offered.
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+  - id: carol
+    role: group_member
+steps:
+  - id: 1
+    from: alice
+    to: carol
+    function: peer_post
+    payload: {body: "carol has this", seq: 1, ts: 4102444800, tier: 0}
+  - id: 2
+    from: bob
+    to: carol
+    function: peer_post_digest
+    payload:
+      feed:
+        - {author: alice, body: "carol has this", seq: 1, ts: 4102444800, tier: 0}
+expected_state:
+  carol:
+    post_wants_emitted: 0

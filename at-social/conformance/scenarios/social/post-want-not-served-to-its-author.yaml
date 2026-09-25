@@ -1,0 +1,30 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-want-not-served-to-its-author
+byte_pinning: false
+description: |
+    A post is never backfilled to its own author (Agora Phase 4 DDIL): the
+    author wrote it, and a copy coming back would show twice in its app, whose
+    own echo carries no content id.
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: peer_post
+    payload: {body: "mine", seq: 1, ts: 4102444800, tier: 0}
+  - id: 2
+    from: alice
+    to: bob
+    function: peer_post_want
+    payload:
+      feed:
+        - {author: alice, body: "mine", seq: 1, ts: 4102444800, tier: 0}
+expected_state:
+  bob:
+    post_backfills_emitted: 0

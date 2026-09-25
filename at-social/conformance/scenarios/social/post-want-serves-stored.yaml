@@ -1,0 +1,31 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-want-serves-stored
+byte_pinning: false
+description: |
+    A want for a post bob holds is served: bob sends it back, directed, as its
+    ORIGINAL signed envelope (Agora Phase 4 DDIL). One backfill.
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+  - id: carol
+    role: group_member
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: peer_post
+    payload: {body: "worth forwarding", seq: 1, ts: 4102444800, tier: 0}
+  - id: 2
+    from: carol
+    to: bob
+    function: peer_post_want
+    payload:
+      feed:
+        - {author: alice, body: "worth forwarding", seq: 1, ts: 4102444800, tier: 0}
+expected_state:
+  bob:
+    post_backfills_emitted: 1

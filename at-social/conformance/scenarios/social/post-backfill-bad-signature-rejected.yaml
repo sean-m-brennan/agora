@@ -1,0 +1,34 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-backfill-bad-signature-rejected
+byte_pinning: false
+description: |
+    A backfill re-verifies the AUTHOR's signature (Agora Phase 4 DDIL): the node
+    serving a post vouches for nothing, so a copy it altered, or made up, is
+    refused exactly as the original would be.
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+  - id: carol
+    role: group_member
+steps:
+  - id: 1
+    from: bob
+    to: carol
+    function: peer_post_backfill
+    payload:
+      kind: feed
+      post:
+        author: alice
+        body: "forged"
+        seq: 1
+        ts: 0
+        tier: 0
+        sig: "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+expected_state:
+  carol:
+    post_last:
+      alice: {absent: true}

@@ -1,0 +1,42 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: business-post-backfill-delivered-with-the-page
+byte_pinning: false
+description: |
+    With the page held, a backfilled business post is accepted and recorded,
+    and, being a backfill, NOT relayed (Agora Phase 4 DDIL). Compare
+    business-post-shared, where the same post by multicast is relayed once.
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_business_ad
+    payload:
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      sat: 255
+      seq: 1
+      ts: 0
+      bundle: '{"page":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","name":"Corner Cafe","locality":"9q8yyk8y"},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_post_backfill
+    payload:
+      kind: biz
+      post:
+        author: bg
+        polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+        seq: 1
+        ts: 0
+        bundle: '{"post":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","body":"Fresh croissants at seven.","seq":1},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+expected_state:
+  newcomer:
+    business_post_last:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ": {seq: 1, hops: 0}
+    business_posts_emitted: 0

@@ -16,7 +16,7 @@
 
 /* libat_social present after link (FEATURE_SPLIT_PLAN Phase 5): the "social"
  * identity extension is registered, identity_register_handlers on a real
- * process gives it all 34 social verbs, and a block reaches the core through
+ * process gives it all 37 social verbs, and a block reaches the core through
  * the hooks -- PEER_OBSERVED's `blocked` and the tier clamp. The core's
  * identity_test asserts the converse, that a core-only binary registers none
  * of these verbs. */
@@ -37,7 +37,7 @@
 #include "social/id_social.h"
 #include "social/social_msg_types.h"
 
-/* The 16 wire verbs and 18 app verbs social registers on identity. */
+/* The 19 wire verbs and 18 app verbs social registers on identity. */
 static const char *const SOCIAL_VERBS[] = {
     "peer_position_query", "peer_position_response",
     "peer_profile_query", "peer_profile_response",
@@ -46,6 +46,7 @@ static const char *const SOCIAL_VERBS[] = {
     "peer_dm", "peer_post", "peer_reaction", "peer_report",
     "peer_business_ad", "peer_business_post",
     "peer_cosign_request", "peer_cosign_sig",
+    "peer_post_digest", "peer_post_want", "peer_post_backfill",
     AT_APP_SET_POSITION, AT_APP_SET_PROFILE,
     AT_APP_CONNECT_REQUEST, AT_APP_CONNECT_RESPOND,
     AT_APP_SEND_DM, AT_APP_PUBLISH_POST, AT_APP_REACT_POST,
@@ -60,7 +61,7 @@ DEFINE_TEST(test_social_is_registered_and_owns_its_verbs)
 {
     at_social_link();
     ck_assert(identity_ext_present("social"));
-    ck_assert_int_eq(sizeof(SOCIAL_VERBS) / sizeof(*SOCIAL_VERBS), 34);
+    ck_assert_int_eq(sizeof(SOCIAL_VERBS) / sizeof(*SOCIAL_VERBS), 37);
 
     process_t proc;
     memset(&proc, 0, sizeof(proc));

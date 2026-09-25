@@ -66,6 +66,7 @@ ATCORE="$NATIVE/at_core"
 
 WAIT="${WAIT:-90}"
 CHECKPOINT_SEC="${CHECKPOINT_SEC:-20}"
+LOG_LEVEL="${LOG_LEVEL:-2}"   # agorad: 1=DEBUG 2=INFO (1 shows Paxos retries)
 SUBNET="${SUBNET:-10.9.4}"
 GEO="${GEO:-u4pruy}"
 IP_ALICE="$SUBNET.11"; IP_BOB="$SUBNET.12"; IP_CAROL="$SUBNET.13"; PREFIX=24
@@ -259,7 +260,7 @@ node_start() { # ns-or-container root name seed ip -> echoes a handle
       AT_OWN_GEOHASH="$GEO" \
       AT_REP_CHECKPOINT_SEC="$CHECKPOINT_SEC" \
       LD_LIBRARY_PATH="$ATCORE:${LD_LIBRARY_PATH:-}" \
-      "$AGORAD" extern_to_at at_to_extern 2 \
+      "$AGORAD" extern_to_at at_to_extern "$LOG_LEVEL" \
       >"$root/agorad.log" 2>&1 &
     echo $!
   else
@@ -272,7 +273,7 @@ node_start() { # ns-or-container root name seed ip -> echoes a handle
       -e AT_REP_CHECKPOINT_SEC="$CHECKPOINT_SEC" \
       -e LD_LIBRARY_PATH="$LIBSTAGE:$ATCORE" \
       "$DOCKER_IMAGE" \
-      sh -c "exec '$AGORAD' extern_to_at at_to_extern 2 >'$root/agorad.log' 2>&1" \
+      sh -c "exec '$AGORAD' extern_to_at at_to_extern $LOG_LEVEL >'$root/agorad.log' 2>&1" \
       >/dev/null || return 1
     echo "$id"
   fi

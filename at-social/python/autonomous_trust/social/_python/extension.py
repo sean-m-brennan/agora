@@ -75,6 +75,12 @@ def _register(proc, proc_name: str) -> None:
                                    functools.partial(handlers.handle_reaction, proc))
     proc.protocol.register_handler(SocialProtocol.report,
                                    functools.partial(handlers.handle_peer_report, proc))
+    proc.protocol.register_handler(SocialProtocol.post_digest,
+                                   functools.partial(handlers.handle_post_digest, proc))
+    proc.protocol.register_handler(SocialProtocol.post_want,
+                                   functools.partial(handlers.handle_post_want, proc))
+    proc.protocol.register_handler(SocialProtocol.post_backfill,
+                                   functools.partial(handlers.handle_post_backfill, proc))
 
 
 def _post_fork(proc) -> None:
@@ -102,6 +108,11 @@ def _on_peer_confirmed(proc, queues, peer) -> None:
     # Opt-in profile (Increment 3): same pattern — ask every confirmed
     # peer for its agora.profile; an opted-out peer answers nothing.
     handlers._send_profile_query(proc, queues, peer)
+    # Store-and-forward: a peer we just confirmed may have missed our posts
+    # (a partition healing, a late joiner), so the next sweep sends a digest
+    # whatever the interval says. Twin of C _social_peer_confirmed.
+    with proc.lock:
+        proc.social.last_digest_at = 0.0
 
 
 def _periodic_resync(proc, queues) -> None:
@@ -148,6 +159,9 @@ def _periodic_resync(proc, queues) -> None:
     if fsent:
         proc.logger.debug(
             'Profile resync: re-queried %d profile-less peer(s)', fsent)
+    # Store-and-forward: advertise our recent posts, at most every
+    # $AT_SOCIAL_DIGEST_SEC. Twin of C _maybe_send_post_digest.
+    handlers.maybe_send_post_digest(proc, queues)
 
 
 def _is_blocked_locked(proc, uuid_str) -> bool:

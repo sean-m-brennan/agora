@@ -32,6 +32,7 @@ at_extension_library(social
         post.c
         business_ad.c
         business_post.c
+        post_store.c
         cosign.c
         social_tx.c
         social_store.c
@@ -58,6 +59,7 @@ at_extension_tests(social
     app_verb_origin_test
     app_events_test
     social_link_test
+    post_store_test
 )
 
 # The social halves of three AT core tests (app_node_test, msg_types3_test,

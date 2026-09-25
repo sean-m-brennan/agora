@@ -124,6 +124,19 @@ class SocialState:
         state._seen_business_post_ids: list = []
         state._business_post_seq: int = 0
         state.last_business_post: dict = {}
+        # Store-and-forward (Agora Phase 4 DDIL): the recent signed posts this
+        # node can backfill, one store per kind (content id -> {'ts','author',
+        # 'env'}, oldest first, capped at POST_STORE_CAP); when our last digest
+        # went out (0 == due now); and, per peer uuid, when we last sent it a
+        # want and last served one of its wants (the two rate limits). Twins
+        # of C social_state.feed_store / biz_store / last_digest_at /
+        # want_sent_at / want_served_at.
+        from collections import OrderedDict
+        state.feed_store = OrderedDict()
+        state.biz_store = OrderedDict()
+        state.last_digest_at: float = 0.0
+        state.want_sent_at: dict = {}
+        state.want_served_at: dict = {}
         # Detached co-signing (Phase 3 P3.3). The most recent ask received from
         # each peer, and the most recent signature each peer returned — a live
         # stream, never roster-replayed, exactly like a DM. Nothing here is

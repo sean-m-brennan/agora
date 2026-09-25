@@ -77,6 +77,12 @@ _TRIGGER_PROXIMITY_PROBE = 'trigger_proximity_probe'
 # See business-ad-shared / business-ad-customer-relays.
 _TRIGGER_ADVERTISE_BUSINESS = 'trigger_advertise_business'
 
+# Pseudo-function: the step's `to` participant sends its store-and-forward
+# digest (Agora Phase 4 DDIL), as the periodic resync would; the emission is
+# what the scenario tallies (post_digests_emitted). The C adapter recognizes
+# the same string and calls identity_send_post_digest.
+_TRIGGER_POST_DIGEST = 'trigger_post_digest'
+
 
 # -- expected_state keys (moved from _Participant._check_expected_state) -- #
 
@@ -447,6 +453,19 @@ def _check_profile_responses_emitted(self: _Participant, key: str, expected: Any
             f'expected {expected}'
         )
 
+def _check_sf_emitted(self: _Participant, key: str, expected: Any) -> None:
+    # Store-and-forward emissions by this participant (Agora Phase 4 DDIL):
+    # digests sent, wants sent, backfills served, and plain feed posts sent
+    # (a relay -- a backfill must never cause one). C mirrors by scanning
+    # captured[] for (from==self, function).
+    verb = {'post_digests_emitted': SocialProtocol.post_digest,
+            'post_wants_emitted': SocialProtocol.post_want,
+            'post_backfills_emitted': SocialProtocol.post_backfill,
+            'posts_emitted': SocialProtocol.post}[key]
+    actual = self.emit_tally.get(verb, 0)
+    if actual != expected:
+        raise AssertionError(f'{self.id}: {key}={actual}, expected {expected}')
+
 def _check_proximity_probes_emitted(self: _Participant, key: str, expected: Any) -> None:
     # peer_proximity_probe emissions by this participant (Phase 2).
     # The initiator's opt-in guard observable: an opted-OUT initiator
@@ -627,7 +646,87 @@ def _trigger_advertise_business(self: IdentityAdapter, participant: _Participant
     return participant.drain_outbox()
 
 
+def _trigger_post_digest(self: IdentityAdapter, participant: _Participant, inbound: Message):
+    # Pseudo-function: `participant` sends its digest, as the periodic resync
+    # would. Mirrors the C adapter's trigger_post_digest.
+    social_handlers.send_post_digest(participant.process, participant.queues)
+    return participant.drain_outbox()
+
+
 # -- inbound builders (moved from IdentityAdapter._build_inbound) -------- #
+
+def _sf_author(participants, sender: _Participant, spec: dict):
+    # The participant a post spec names as its `author`, else the sender.
+    pid = spec.get('author')
+    if isinstance(pid, str) and pid in participants:
+        return participants[pid].impl
+    return sender
+
+def _sf_spec_id(participants, sender, spec: dict, biz: bool) -> str:
+    # The content id of the post a spec describes, computed as the runtime
+    # does. Scenarios cannot name ids (they are hashes), so they name posts.
+    from autonomous_trust.social.codec import post_content_id, business_post_id
+    a = _sf_author(participants, sender, spec)
+    seq = int(spec.get('seq', 1))
+    ts = float(spec.get('ts', 0.0))
+    if biz:
+        return business_post_id(a.process.identity.uuid,
+                                str(spec.get('polity', '')), seq, ts,
+                                str(spec.get('bundle', '')))
+    return post_content_id(a.process.identity.uuid, seq, ts,
+                           int(spec.get('tier', 0)), str(spec.get('body', '')))
+
+def _build_post_ids(self: IdentityAdapter, participants, sender: _Participant,
+        sender_identity, *, from_id: str, to_id: str, function: str,
+        payload: dict[str, Any]) -> str:
+    # peer_post_digest / peer_post_want (Agora Phase 4 DDIL) carry content ids:
+    # {"feed": [post spec], "biz": [business post spec]} -> the ids. Mirrors the
+    # C _sf_ids_body builder.
+    payload = payload if isinstance(payload, dict) else {}
+    body = {}
+    for kind in ('feed', 'biz'):
+        specs = payload.get(kind)
+        specs = specs if isinstance(specs, list) else []
+        body[kind] = [_sf_spec_id(participants, sender, sp, kind == 'biz')
+                      for sp in specs if isinstance(sp, dict)]
+    return to_json_string(body)
+
+def _build_post_backfill(self: IdentityAdapter, participants, sender: _Participant,
+        sender_identity, *, from_id: str, to_id: str, function: str,
+        payload: dict[str, Any]) -> str:
+    # peer_post_backfill (Agora Phase 4 DDIL): {"kind": "feed"|"biz", "post":
+    # spec}, the post signed by its `author` (default: the sender); `sig`
+    # overrides the signature. Mirrors the C _sf_post_env builder.
+    from autonomous_trust.social.codec import post_sign, business_post_sign
+    payload = payload if isinstance(payload, dict) else {}
+    kind = payload.get('kind', 'feed')
+    spec = payload.get('post') if isinstance(payload.get('post'), dict) else {}
+    a = _sf_author(participants, sender, spec)
+    ident = a.process.identity
+    seq = int(spec.get('seq', 1))
+    ts = float(spec.get('ts', 0.0))
+    hops = int(spec.get('hops', 0))
+    pk = bytes(ident.signature.public).hex()
+    sig = spec.get('sig') if isinstance(spec.get('sig'), str) else None
+    if kind == 'biz':
+        did = str(spec.get('polity', ''))
+        bundle = str(spec.get('bundle', ''))
+        if sig is None:
+            sig = business_post_sign(ident.signature.private, ident.uuid, did,
+                                     seq, ts, bundle)
+        post = {'author': str(ident.uuid), 'author_pk': pk, 'polity': did,
+                'seq': seq, 'ts': ts, 'bundle': bundle, 'sig': sig,
+                'hops': hops}
+    else:
+        tier = int(spec.get('tier', 0))
+        text = str(spec.get('body', ''))
+        if sig is None:
+            sig = post_sign(ident.signature.private, ident.uuid, seq, ts, tier,
+                            text)
+        post = {'author': str(ident.uuid), 'author_pk': pk, 'seq': seq,
+                'ts': ts, 'tier': tier, 'body': text, 'sig': sig,
+                'hops': hops}
+    return to_json_string({'kind': kind, 'post': post})
 
 def _build_position_query(self: IdentityAdapter, participants, sender: _Participant,
         sender_identity, *, from_id: str, to_id: str, function: str,
@@ -959,6 +1058,7 @@ class SocialAdapter(IdentityAdapter):
                 _TRIGGER_BLOCK: _trigger_block,
                 _TRIGGER_PROXIMITY_PROBE: _trigger_proximity_probe,
                 _TRIGGER_ADVERTISE_BUSINESS: _trigger_advertise_business,
+                _TRIGGER_POST_DIGEST: _trigger_post_digest,
                 }
     INBOUND_BUILDERS = {**IdentityAdapter.INBOUND_BUILDERS,
                         SocialProtocol.position_query: _build_position_query,
@@ -975,6 +1075,9 @@ class SocialAdapter(IdentityAdapter):
                         SocialProtocol.report: _build_report,
                         SocialProtocol.cosign_request: _build_cosign_request,
                         SocialProtocol.cosign_sig: _build_cosign_sig,
+                        SocialProtocol.post_digest: _build_post_ids,
+                        SocialProtocol.post_want: _build_post_ids,
+                        SocialProtocol.post_backfill: _build_post_backfill,
                         }
     STATE_CHECKS = {**IdentityAdapter.STATE_CHECKS,
                     'peer_position': _check_peer_position,
@@ -995,6 +1098,10 @@ class SocialAdapter(IdentityAdapter):
                     'profile_responses_emitted': _check_profile_responses_emitted,
                     'proximity_probes_emitted': _check_proximity_probes_emitted,
                     'proximity_replies_emitted': _check_proximity_replies_emitted,
+                    'post_digests_emitted': _check_sf_emitted,
+                    'post_wants_emitted': _check_sf_emitted,
+                    'post_backfills_emitted': _check_sf_emitted,
+                    'posts_emitted': _check_sf_emitted,
                     }
 
     def _run_proximity_probe(self, initiator: _Participant,

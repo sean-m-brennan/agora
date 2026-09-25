@@ -1,0 +1,27 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-digest-omits-over-age
+byte_pinning: false
+description: |
+    A digest offers only posts younger than the 24 h backfill window, by the
+    post's own signed timestamp (Agora Phase 4 DDIL). bob holds one post, from
+    1970, so he has nothing to offer and sends no digest at all.
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: peer_post
+    payload: {body: "long ago", seq: 1, ts: 1, tier: 0}
+  - id: 2
+    from: bob
+    to: bob
+    function: trigger_post_digest
+expected_state:
+  bob:
+    post_digests_emitted: 0

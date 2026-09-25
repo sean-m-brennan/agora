@@ -123,6 +123,18 @@ class SocialProtocol(Protocol):
     # signature on the end.
     cosign_request = 'peer_cosign_request'  # msg.obj <- json {record,op,polity,cid,bytes,seq,ts}
     cosign_sig = 'peer_cosign_sig'  # msg.obj <- json {cid,signer,sig,seq,ts}
+    # STORE-AND-FORWARD (Agora Phase 4 DDIL). A post is a fire-and-forget
+    # multicast, so a node off the segment when it went out (the other island of
+    # a partition) never hears it. The digest (group, encrypted) advertises the
+    # content ids of our recent stored posts; the want (directed, encrypted)
+    # asks the digest's sender for the ones we lack; the backfill (directed,
+    # encrypted) carries one stored post's ORIGINAL signed envelope, which the
+    # receiver re-verifies and gates exactly as the original, and never relays.
+    # None is in UNENCRYPTED_VERBS. Twins of C ID_POST_DIGEST / ID_POST_WANT /
+    # ID_POST_BACKFILL.
+    post_digest = 'peer_post_digest'      # msg.obj <- json {'feed': [ids], 'biz': [ids]}
+    post_want = 'peer_post_want'          # msg.obj <- json {'feed': [ids], 'biz': [ids]}
+    post_backfill = 'peer_post_backfill'  # msg.obj <- json {'kind': 'feed'|'biz', 'post': {...}}
     proximity_probe = 'peer_proximity_probe'      # msg.obj <- json {'salt','tags'}
     proximity_reply = 'peer_proximity_reply'      # msg.obj <- json {'salt','tags'}
     proximity_trigger = 'peer_proximity_trigger'  # local IPC: {'target': uuid_str}

@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>Agora</title>
+  <rect x="4" y="4" width="248" height="248" rx="52" fill="#C2562A" stroke="#9E4220" stroke-width="4"/>
+  <polygon points="26,74 128,40 230,74" fill="#1F1A17"/>
+  <rect x="30" y="76" width="196" height="14" fill="#1F1A17"/>
+  <rect x="24" y="140" width="208" height="10" fill="#1F1A17"/>
+  <rect x="39.5" y="96" width="13" height="42" fill="#1F1A17"/>
+  <rect x="72.5" y="96" width="13" height="42" fill="#1F1A17"/>
+  <rect x="105.5" y="96" width="13" height="42" fill="#1F1A17"/>
+  <rect x="137.5" y="96" width="13" height="42" fill="#1F1A17"/>
+  <rect x="170.5" y="96" width="13" height="42" fill="#1F1A17"/>
+  <rect x="203.5" y="96" width="13" height="42" fill="#1F1A17"/>
+  <circle cx="56" cy="168" r="10" fill="#1F1A17"/>
+  <path d="M41,203 A15,22 0 0 1 71,203 Z" fill="#1F1A17"/>
+  <circle cx="92" cy="178.5" r="10" fill="#1F1A17"/>
+  <path d="M77,213.5 A15,22 0 0 1 107,213.5 Z" fill="#1F1A17"/>
+  <circle cx="128" cy="182" r="10" fill="#1F1A17"/>
+  <path d="M113,217 A15,22 0 0 1 143,217 Z" fill="#1F1A17"/>
+  <circle cx="164" cy="178.5" r="10" fill="#1F1A17"/>
+  <path d="M149,213.5 A15,22 0 0 1 179,213.5 Z" fill="#1F1A17"/>
+  <circle cx="200" cy="168" r="10" fill="#1F1A17"/>
+  <path d="M185,203 A15,22 0 0 1 215,203 Z" fill="#1F1A17"/>
+</svg>

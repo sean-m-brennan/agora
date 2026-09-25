@@ -19,7 +19,7 @@ from autonomous_trust.core.identity.protocol import IdentityProtocol
 from autonomous_trust.social.protocol import SocialProtocol
 
 
-def test_the_17_verbs():
+def test_the_20_verbs():
     """Iterates the social verbs.
 
         - opt-in coarse position, the "with-distance" feature
@@ -56,14 +56,22 @@ def test_the_17_verbs():
         - first-person reports, Phase 4 P4.1 (report) — directed and
           encrypted like a reaction, {seq, ts} only. No reason travels:
           on the wire it would make a score a published accusation.
+        - store-and-forward, Phase 4 DDIL (post_digest, post_want,
+          post_backfill) — a post is a fire-and-forget multicast, so a
+          node off the segment when it went out (the other island of a
+          partition) asks for it afterwards. Three verbs, not one: the
+          periodic digest of ids, the directed want for the missing ones,
+          and the directed backfill carrying one post's ORIGINAL signed
+          envelope, which the receiver re-verifies and never relays.
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update.
     """
     values = list(SocialProtocol)
-    assert len(values) == 17
+    assert len(values) == 20
     for verb in ('report', 'business_ad', 'business_post', 'cosign_request',
-                 'cosign_sig', 'dm', 'proximity_trigger'):
+                 'cosign_sig', 'dm', 'proximity_trigger', 'post_digest',
+                 'post_want', 'post_backfill'):
         assert verb in values, verb
 
 

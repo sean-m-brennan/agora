@@ -1,0 +1,32 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-want-from-non-member-refused
+byte_pinning: false
+description: |
+    A want is honoured only from an admitted peer (Agora Phase 4 DDIL): the
+    posts are the group's, and a stranger who could ask for them would read a
+    group channel it never joined. dan is not admitted, so bob serves nothing.
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+  - id: dan
+    role: new_node
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: peer_post
+    payload: {body: "members only", seq: 1, ts: 4102444800, tier: 0}
+  - id: 2
+    from: dan
+    to: bob
+    function: peer_post_want
+    payload:
+      feed:
+        - {author: alice, body: "members only", seq: 1, ts: 4102444800, tier: 0}
+expected_state:
+  bob:
+    post_backfills_emitted: 0

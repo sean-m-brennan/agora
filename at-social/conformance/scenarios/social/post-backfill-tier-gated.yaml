@@ -1,0 +1,26 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-backfill-tier-gated
+byte_pinning: false
+description: |
+    A backfill passes the same audience gate as the original (Agora Phase 4
+    DDIL): the post requires tier 1, and the newcomer's view of bg's tier is 0,
+    so it is dropped. The serving node does not decide who may read a post.
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_post_backfill
+    payload:
+      kind: feed
+      post: {author: bg, body: "friends only", seq: 1, ts: 0, tier: 1}
+expected_state:
+  newcomer:
+    post_last:
+      bg: {absent: true}

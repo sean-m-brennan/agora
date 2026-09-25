@@ -56,6 +56,7 @@
 #include "post.h"
 #include "business_ad.h"
 #include "business_post.h"
+#include "post_store.h"
 #include "cosign.h"
 #include "social_tx.h"
 #include "social_store.h"
@@ -112,12 +113,34 @@ static char ID_REPORT[]      = "peer_report";
  * person. There is no hop count: ads are re-advertised by customers, never
  * relayed (social/business_ad.h). */
 static char ID_BUSINESS_AD[] = "peer_business_ad";
-/* Business posts (Phase 3 P3.4). Group multicast on the plaintext allowlist,
+/* Business posts (Phase 3 P3.4). Encrypted GROUP MULTICAST like a feed post
+ * (NOT on the plaintext allowlist: ID_UNENCRYPTED_VERBS does not name it),
  * carrying {author, author_pk, polity, seq, ts, bundle, sig, hops}. UNLIKE an
  * ad, a post IS relayed: its authority is the envoy signature sealed inside the
  * opaque bundle, so passing it along cannot launder it. The detached Ed25519
  * signature here authenticates only WHO SENT THIS COPY. */
 static char ID_BUSINESS_POST[] = "peer_business_post";
+/* STORE-AND-FORWARD (Agora Phase 4 DDIL, 2026-09-25). A post is a multicast,
+ * and a multicast is fire-and-forget: a node that is not on the segment when it
+ * goes out never hears it, so across a partition every post the other island
+ * made was lost for good. Three verbs close that, with no partition detection
+ * at all, because the first is periodic:
+ *
+ *   peer_post_digest    GROUP MULTICAST, encrypted: the content ids of our
+ *                       recent stored posts, {"feed":[...], "biz":[...]};
+ *   peer_post_want      DIRECTED, encrypted: the ids from a digest that our
+ *                       dedup rings do not hold, back to its sender;
+ *   peer_post_backfill  DIRECTED, encrypted: one stored post, its ORIGINAL
+ *                       signed envelope, {"kind":"feed"|"biz","post":{...}}.
+ *
+ * A backfilled post re-verifies against its author's signature and passes the
+ * same gate and dedup as the original (_ingest_post / _ingest_business_post),
+ * so the node serving it vouches for nothing. It is terminal: never relayed.
+ * Digest and want are honoured only from admitted peers. None of the three is
+ * on the plaintext allowlist. See post_store.h. */
+static char ID_POST_DIGEST[]   = "peer_post_digest";
+static char ID_POST_WANT[]     = "peer_post_want";
+static char ID_POST_BACKFILL[] = "peer_post_backfill";
 /* Detached co-signing (Phase 3 P3.3). Both directed + ENCRYPTED (never on the
  * plaintext allowlist), exactly like a DM: crypto_box authenticates the sender,
  * so neither message carries a signature of its own. The request carries the
@@ -151,6 +174,16 @@ static char ID_APP_RETURN_COSIGN[] = AT_APP_RETURN_COSIGN;
 static char ID_APP_PUBLISH_BUSINESS_POST[] = AT_APP_PUBLISH_BUSINESS_POST;
 #define POST_MAX_HOPS 1
 #define POST_DEDUP_CAP 256
+/* Store-and-forward bounds. A digest offers only posts younger than
+ * POST_BACKFILL_MAX_AGE (by the post's own signed ts); a want asks for, and a
+ * backfill serves, at most POST_WANT_MAX ids per kind; and each peer is sent at
+ * most one want, and served at most one, per POST_WANT_COOLDOWN seconds. The
+ * digest goes out at most every $AT_SOCIAL_DIGEST_SEC seconds (default
+ * POST_DIGEST_DEFAULT_SEC), checked on identity's ~20 s resync sweep. */
+#define POST_BACKFILL_MAX_AGE   (24.0 * 3600.0)
+#define POST_WANT_MAX           32
+#define POST_WANT_COOLDOWN      10.0
+#define POST_DIGEST_DEFAULT_SEC 60
 
 /* Business-ad bounds (Phase 3 P3.2). There is deliberately NO max-hops twin of
  * POST_MAX_HOPS: a business ad is never relayed. Only a CUSTOMER carries a
@@ -334,6 +367,16 @@ static struct {
      * (so our own tier-gates deny it) and emits/gossips nothing. No reputation
      * transaction, unlike a decline. Guarded by social_state.lock. */
     map_t social_blocks;
+    /* Store-and-forward (Agora Phase 4 DDIL): the recent signed posts we can
+     * backfill, one store per kind (post_store.h); when our last digest went
+     * out (0 == due now); and, keyed by peer uuid, when we last sent that peer
+     * a want and last served one of its wants (integer_data of epoch seconds),
+     * the two rate limits. Guarded by social_state.lock. */
+    post_store_t feed_store;
+    post_store_t biz_store;
+    double       last_digest_at;
+    map_t        want_sent_at;
+    map_t        want_served_at;
     pthread_mutex_t lock;
     bool initialized;
 } social_state = { .lock = PTHREAD_MUTEX_INITIALIZER };
@@ -3456,6 +3499,35 @@ static int identity_emit_post(const uuid_t author_uuid, const char *post_id,
     return messaging_send(AT_MAIN_QUEUE, PEER_POST_OBSERVED, &msg, false);
 }
 
+/* Whether @p id_hex is in the feed-post dedup ring, WITHOUT recording it: what
+ * a digest is compared against. Own locking. */
+static bool _post_seen_peek(const char *id_hex)
+{
+    bool seen = false;
+    pthread_mutex_lock(&social_state.lock);
+    for (size_t i = 0; i < social_state.seen_post_count && !seen; i++)
+        seen = strncmp(social_state.seen_post_ids[i], id_hex,
+                       AT_POST_ID_HEX_LEN) == 0;
+    pthread_mutex_unlock(&social_state.lock);
+    return seen;
+}
+
+/* Keep @p env (a post's wire envelope, borrowed) in @p store for backfill,
+ * under content id @p id_hex. Own locking. */
+static void _store_for_backfill(post_store_t *store, const char *id_hex,
+                                double ts, const uuid_t author, json_t *env)
+{
+    if (env == NULL)
+        return;
+    char *compact = json_dumps(env, JSON_COMPACT);
+    if (compact == NULL)
+        return;
+    pthread_mutex_lock(&social_state.lock);
+    (void)post_store_put(store, id_hex, ts, author, compact);
+    pthread_mutex_unlock(&social_state.lock);
+    free(compact);
+}
+
 /* App-content dedup: return true if @p id_hex was ALREADY recorded (caller
  * drops), else record it in the bounded ring and return false. Own locking.
  * This is the app store; net_proc's transport dedup ring is a different thing. */
@@ -3594,6 +3666,14 @@ static bool handle_app_publish_post(const process_t *proc, directory_t *queues,
     /* Record BEFORE sending so a loopback copy of our own multicast is deduped
      * rather than re-emitted. */
     (void)_post_seen_or_record(id_hex);
+    /* Kept for backfill: a peer that was not on the segment asks for it later
+     * (store-and-forward). */
+    {
+        json_t *own = at_post_to_json(self->uuid, pk_hex, seq, ts,
+                                      (uint8_t)required_tier, body, sig_hex, 0);
+        _store_for_backfill(&social_state.feed_store, id_hex, ts, self->uuid, own);
+        json_decref(own);
+    }
 
     if (_multicast_post(proc, self->uuid, pk_hex, seq, ts,
                         (uint8_t)required_tier, body, sig_hex, 0) != 0)
@@ -3611,15 +3691,15 @@ static bool handle_app_publish_post(const process_t *proc, directory_t *queues,
  * best-effort against the carried key, which is how a post reaches one hop beyond
  * the author's cohort). Then TIER-GATE, content-id DEDUP, emit, and gossip-
  * forward (hops+1) while under POST_MAX_HOPS. */
-static bool handle_post(const process_t *proc, directory_t *queues,
-                        generic_msg_t *msg)
+/* The one inbound path for a feed post, whether it came as the group multicast
+ * (handle_post, @p via_group true) or as a directed backfill after the fact
+ * (handle_post_backfill, false): verify, key binding, tier gate, dedup, store,
+ * emit. Two things only the group channel does. It records co-membership (a
+ * backfilled copy did not decrypt with our group key, so it proves nothing
+ * about where its author is), and it relays (a backfill is terminal, or every
+ * heal would re-flood the group). @p payload is borrowed. */
+static bool _ingest_post(const process_t *proc, json_t *payload, bool via_group)
 {
-    (void)queues;
-    net_msg_t *nmsg = &msg->info.net_msg;
-
-    json_t *payload = NULL;
-    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
-        return true;
     uuid_t author;
     char author_pk[AT_POST_SIG_HEX_LEN + 1];
     char sig_hex[AT_POST_SIG_HEX_LEN + 1];
@@ -3630,11 +3710,9 @@ static bool handle_post(const process_t *proc, directory_t *queues,
     int hops = 0;
     if (at_post_from_json(payload, author, author_pk, &seq, &ts, &tier,
                           body, sizeof(body), sig_hex, &hops) != 0) {
-        json_decref(payload);
         log_warn(proc->logger, "Identity: peer_post malformed, refusing\n");
         return true;
     }
-    json_decref(payload);
 
     char author_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(author, author_str);
@@ -3683,8 +3761,9 @@ static bool handle_post(const process_t *proc, directory_t *queues,
      * though posts arrive. Record our own current group as "theirs" so the
      * swap-robust check (both halves == our current uuid) passes. Recorded
      * BEFORE the tier-gate/dedup: decrypt + signature already prove membership,
-     * independent of whether we ultimately surface this particular post. */
-    {
+     * independent of whether we ultimately surface this particular post.
+     * Only for the group channel: a backfill arrived directed. */
+    if (via_group) {
         char ours_now[UUID_STRING_LEN + 1];
         uuid_unparse_lower(proc->protocol.group.uuid, ours_now);
         _record_peer_group_uuid(proc, author_str, ours_now);
@@ -3711,6 +3790,10 @@ static bool handle_post(const process_t *proc, directory_t *queues,
                   id_hex);
         return true;
     }
+    /* Kept for backfill, the blocked author's too: a personal block governs
+     * what WE see, not what our neighbours may (the reason the relay below
+     * still runs). */
+    _store_for_backfill(&social_state.feed_store, id_hex, ts, author, payload);
 
     /* A blocked author's post is HIDDEN, not dropped (Phase 4 P4.1), and the
      * relay below still runs.
@@ -3736,7 +3819,7 @@ static bool handle_post(const process_t *proc, directory_t *queues,
         log_debug(proc->logger,
                   "Identity: peer_post %s from %s hidden (locally blocked); "
                   "still relaying\n", id_hex, author_str);
-        if (hops < POST_MAX_HOPS)
+        if (via_group && hops < POST_MAX_HOPS)
             _multicast_post(proc, author, author_pk, seq, ts, tier, body,
                             sig_hex, hops + 1);
         return true;
@@ -3744,14 +3827,27 @@ static bool handle_post(const process_t *proc, directory_t *queues,
 
     _last_post_store(author_str, id_hex, seq, ts, (int)tier, body);
     identity_emit_post(author, id_hex, seq, ts, (int)tier, body);
-    log_debug(proc->logger, "Identity: post %s from %s accepted (hops=%d)\n",
-              id_hex, author_str, hops);
+    log_debug(proc->logger, "Identity: post %s from %s accepted (hops=%d%s)\n",
+              id_hex, author_str, hops, via_group ? "" : ", backfilled");
 
     /* Gossip forward: relay one more hop while under the reach bound. The dedup
-     * ring above guarantees we forward a given post at most once. */
-    if (hops < POST_MAX_HOPS)
+     * ring above guarantees we forward a given post at most once. A backfill is
+     * never relayed. */
+    if (via_group && hops < POST_MAX_HOPS)
         _multicast_post(proc, author, author_pk, seq, ts, tier, body, sig_hex,
                         hops + 1);
+    return true;
+}
+
+static bool handle_post(const process_t *proc, directory_t *queues,
+                        generic_msg_t *msg)
+{
+    (void)queues;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(&msg->info.net_msg, &payload) != 0 || payload == NULL)
+        return true;
+    _ingest_post(proc, payload, true);
+    json_decref(payload);
     return true;
 }
 
@@ -4431,6 +4527,18 @@ static bool _business_post_seen_or_record(const char *id_hex)
     return seen;
 }
 
+/* The business-post twin of _post_seen_peek. Own locking. */
+static bool _business_post_seen_peek(const char *id_hex)
+{
+    bool seen = false;
+    pthread_mutex_lock(&social_state.lock);
+    for (size_t i = 0; i < social_state.seen_business_post_count && !seen; i++)
+        seen = strncmp(social_state.seen_business_posts[i], id_hex,
+                       AT_BUSINESS_POST_ID_HEX_LEN) == 0;
+    pthread_mutex_unlock(&social_state.lock);
+    return seen;
+}
+
 /* THE AUDIENCE GATE: does this node hold a page for @p did? A post from a
  * business we know nothing about is dropped unread and unrelayed — the reader
  * cannot verify it (it has no page to compare against and no reason to care),
@@ -4576,6 +4684,12 @@ static int _business_post_publish(const process_t *proc, const char *did,
     /* Record BEFORE sending so a loopback copy of our own multicast is deduped
      * rather than re-emitted and relayed back into the group. */
     (void)_business_post_seen_or_record(id_hex);
+    {
+        json_t *own = at_business_post_to_json(self->uuid, pk_hex, did, seq,
+                                               ts, bundle, sig_hex, 0);
+        _store_for_backfill(&social_state.biz_store, id_hex, ts, self->uuid, own);
+        json_decref(own);
+    }
 
     _multicast_business_post(proc, self->uuid, pk_hex, did, seq, ts, bundle,
                              sig_hex, 0);
@@ -4654,15 +4768,13 @@ static bool handle_app_publish_business_post(const process_t *proc,
  * bytes on the wire — which is still not an authority, just a witness that the
  * bytes have not changed since.
  ****************************/
-static bool handle_business_post(const process_t *proc, directory_t *queues,
-                                 generic_msg_t *msg)
+/* The one inbound path for a business post: the group multicast
+ * (handle_business_post, @p via_group true) or a directed backfill
+ * (handle_post_backfill, false). A backfill passes the same page gate and dedup
+ * and is never relayed. @p payload is borrowed. */
+static bool _ingest_business_post(const process_t *proc, json_t *payload,
+                                  bool via_group)
 {
-    (void)queues;
-    net_msg_t *nmsg = &msg->info.net_msg;
-
-    json_t *payload = NULL;
-    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
-        return true;
     uuid_t author;
     char auth_pk[AT_BUSINESS_POST_SIG_HEX_LEN + 1];
     char sig_hex[AT_BUSINESS_POST_SIG_HEX_LEN + 1];
@@ -4674,12 +4786,10 @@ static bool handle_business_post(const process_t *proc, directory_t *queues,
     if (at_business_post_from_json(payload, author, auth_pk, did, sizeof(did),
                                    &seq, &ts, bundle, sizeof(bundle), sig_hex,
                                    &hops) != 0) {
-        json_decref(payload);
         log_warn(proc->logger,
                  "Identity: peer_business_post malformed, refusing\n");
         return true;
     }
-    json_decref(payload);
 
     char auth_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(author, auth_str);
@@ -4740,6 +4850,7 @@ static bool handle_business_post(const process_t *proc, directory_t *queues,
                   id_hex);
         return true;
     }
+    _store_for_backfill(&social_state.biz_store, id_hex, ts, author, payload);
 
     _last_business_post_store(did, id_hex, seq, ts, hops, bundle);
     /* A blocked PUBLISHER's copy is hidden from us (Phase 4 P4.1) — the sender
@@ -4754,8 +4865,8 @@ static bool handle_business_post(const process_t *proc, directory_t *queues,
         identity_emit_business_post(author, did, id_hex, seq, ts, hops, bundle);
     }
     log_info(proc->logger,
-             "Identity: business post %s for %s from %s accepted (hops=%d)\n",
-             id_hex, did, auth_str, hops);
+             "Identity: business post %s for %s from %s accepted (hops=%d%s)\n",
+             id_hex, did, auth_str, hops, via_group ? "" : ", backfilled");
 
     /* Gossip one more hop, under the same bound as a feed post — FORWARDING
      * THE ORIGINAL ENVELOPE, exactly as handle_post does. Everything but the
@@ -4769,11 +4880,299 @@ static bool handle_business_post(const process_t *proc, directory_t *queues,
      * re-signing quietly destroys that. It is also why the hop count lives
      * outside the signature — so the one field a relay may change is the one
      * field the signature does not cover. */
-    if (hops < POST_MAX_HOPS)
+    if (via_group && hops < POST_MAX_HOPS)
         (void)_multicast_business_post(proc, author, auth_pk, did, seq, ts,
                                        bundle, sig_hex, hops + 1);
     return true;
 }
+
+static bool handle_business_post(const process_t *proc, directory_t *queues,
+                                 generic_msg_t *msg)
+{
+    (void)queues;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(&msg->info.net_msg, &payload) != 0 || payload == NULL)
+        return true;
+    _ingest_business_post(proc, payload, true);
+    json_decref(payload);
+    return true;
+}
+/* ======================================================================
+ * STORE-AND-FORWARD (Agora Phase 4 DDIL). See ID_POST_DIGEST above.
+ * ====================================================================== */
+
+/* $AT_SOCIAL_DIGEST_SEC, else POST_DIGEST_DEFAULT_SEC. */
+static double _digest_interval(void)
+{
+    const char *env = getenv("AT_SOCIAL_DIGEST_SEC");
+    if (env != NULL && *env != '\0') {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env && *end == '\0' && v > 0)
+            return (double)v;
+    }
+    return (double)POST_DIGEST_DEFAULT_SEC;
+}
+
+/* True, and records @p now, unless @p map holds a time for @p peer_str less
+ * than POST_WANT_COOLDOWN ago. Caller holds social_state.lock. */
+static bool _cooldown_pass_locked(map_t *map, const char *peer_str, double now)
+{
+    data_t *dat = NULL;
+    int when = 0;
+    if (map_get(map, (map_key_t)peer_str, &dat) == 0 && dat != NULL
+        && data_integer(dat, &when) == 0
+        && now - (double)when < POST_WANT_COOLDOWN)
+        return false;
+    map_set(map, (map_key_t)peer_str, integer_data((int)now));
+    return true;
+}
+
+/* A digest or want is honoured only from an admitted peer: the answer to a want
+ * is the posts themselves, and the posts are the group's. */
+static bool _admitted_sender(const process_t *proc, const net_msg_t *nmsg,
+                             const char *verb, public_identity_t *out)
+{
+    if (identity_find_peer_pub(proc, nmsg->from_whom.uuid, out))
+        return true;
+    log_warn(proc->logger, "Identity: %s from a peer we have not admitted (%s), "
+             "refusing\n", verb, nmsg->from_whom.nickname);
+    return false;
+}
+
+static json_t *_ids_json(char ids[][POST_STORE_ID_LEN + 1], size_t n)
+{
+    json_t *arr = json_array();
+    for (size_t i = 0; arr != NULL && i < n; i++)
+        json_array_append_new(arr, json_string(ids[i]));
+    return arr;
+}
+
+/* Group-multicast the ids of our recent stored posts. Returns 0 when sent, 1
+ * when there was nothing to offer, -1 on failure. Conformance seam as
+ * identity_send_post_digest. */
+int identity_send_post_digest(const process_t *proc)
+{
+    static char feed[POST_STORE_CAP][POST_STORE_ID_LEN + 1];
+    static char biz[POST_STORE_CAP][POST_STORE_ID_LEN + 1];
+    double now = (double)time(NULL);
+    pthread_mutex_lock(&social_state.lock);
+    size_t nf = post_store_digest(&social_state.feed_store, now,
+                                  POST_BACKFILL_MAX_AGE, feed, POST_STORE_CAP);
+    size_t nb = post_store_digest(&social_state.biz_store, now,
+                                  POST_BACKFILL_MAX_AGE, biz, POST_STORE_CAP);
+    social_state.last_digest_at = now;
+    json_t *env = (nf + nb > 0) ? json_object() : NULL;
+    if (env != NULL) {
+        json_object_set_new(env, "feed", _ids_json(feed, nf));
+        json_object_set_new(env, "biz", _ids_json(biz, nb));
+    }
+    pthread_mutex_unlock(&social_state.lock);
+    if (nf + nb == 0)
+        return 1;
+    if (env == NULL)
+        return -1;
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = ID_POST_DIGEST;
+    out.info.net_msg.encrypt = false;          /* the group path encrypts */
+    out.info.net_msg.group_multicast = true;
+    strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    net_msg_pack_json(&out.info.net_msg, env);
+    json_decref(env);
+    log_debug(proc->logger, "Identity: post digest: %zu feed, %zu business\n",
+              nf, nb);
+    return identity_send_to_network(proc, &out, "a post digest", "the group");
+}
+
+static void _maybe_send_post_digest(const process_t *proc)
+{
+    double now = (double)time(NULL);
+    pthread_mutex_lock(&social_state.lock);
+    bool due = now - social_state.last_digest_at >= _digest_interval();
+    pthread_mutex_unlock(&social_state.lock);
+    if (due)
+        (void)identity_send_post_digest(proc);
+}
+
+/* Directed, encrypted send of one store-and-forward message to @p peer. */
+static int _send_directed(const process_t *proc, const public_identity_t *peer,
+                          char *verb, json_t *env, const char *what)
+{
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = verb;
+    out.info.net_msg.encrypt = true;
+    memcpy(&out.info.net_msg.to_whom, peer, sizeof(public_identity_t));
+    strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    net_msg_pack_json(&out.info.net_msg, env);
+    return identity_send_to_network(proc, &out, what, peer->nickname);
+}
+
+/* Collect up to POST_WANT_MAX ids from @p arr that @p seen does not hold. */
+static json_t *_missing_ids(json_t *arr, bool (*seen)(const char *))
+{
+    json_t *want = json_array();
+    size_t i;
+    json_t *v;
+    if (want == NULL || !json_is_array(arr))
+        return want;
+    json_array_foreach(arr, i, v) {
+        if (json_array_size(want) >= POST_WANT_MAX)
+            break;
+        const char *id = json_string_value(v);
+        if (id != NULL && strlen(id) == POST_STORE_ID_LEN && !seen(id))
+            json_array_append_new(want, json_string(id));
+    }
+    return want;
+}
+
+/* Handler: a peer's digest. Ask it, directed, for the ids we do not hold. */
+static bool handle_post_digest(const process_t *proc, directory_t *queues,
+                               generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    const identity_t *self = identity_self_identity(proc);
+    if (self != NULL && uuid_compare(self->uuid, nmsg->from_whom.uuid) == 0)
+        return true;                               /* our own, looped back */
+    public_identity_t peer;
+    if (!_admitted_sender(proc, nmsg, "peer_post_digest", &peer))
+        return true;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *feed = _missing_ids(json_object_get(payload, "feed"), _post_seen_peek);
+    json_t *biz = _missing_ids(json_object_get(payload, "biz"),
+                               _business_post_seen_peek);
+    json_decref(payload);
+    size_t n = json_array_size(feed) + json_array_size(biz);
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer.uuid, peer_str);
+    bool send = false;
+    if (n > 0) {
+        pthread_mutex_lock(&social_state.lock);
+        send = _cooldown_pass_locked(&social_state.want_sent_at, peer_str,
+                                     (double)time(NULL));
+        pthread_mutex_unlock(&social_state.lock);
+    }
+    if (send) {
+        json_t *env = json_object();
+        if (env != NULL) {
+            json_object_set(env, "feed", feed);
+            json_object_set(env, "biz", biz);
+            log_info(proc->logger, "Identity: asking %s for %zu missed post(s)\n",
+                     peer.nickname, n);
+            _send_directed(proc, &peer, ID_POST_WANT, env, "a post want");
+            json_decref(env);
+        }
+    }
+    json_decref(feed);
+    json_decref(biz);
+    return true;
+}
+
+/* Handler: a peer asks for stored posts. Serve each, directed, as its original
+ * envelope; never a post back to its own author. */
+static bool handle_post_want(const process_t *proc, directory_t *queues,
+                             generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    public_identity_t peer;
+    if (!_admitted_sender(proc, nmsg, "peer_post_want", &peer))
+        return true;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer.uuid, peer_str);
+
+    /* Copy out under the lock, send after it. */
+    char *envs[2 * POST_WANT_MAX];
+    const char *kinds[2 * POST_WANT_MAX];
+    size_t n = 0;
+    pthread_mutex_lock(&social_state.lock);
+    bool serve = _cooldown_pass_locked(&social_state.want_served_at, peer_str,
+                                       (double)time(NULL));
+    for (int k = 0; serve && k < 2; k++) {
+        json_t *arr = json_object_get(payload, k == 0 ? "feed" : "biz");
+        post_store_t *store = k == 0 ? &social_state.feed_store
+                                     : &social_state.biz_store;
+        size_t i, taken = 0;
+        json_t *v;
+        if (!json_is_array(arr))
+            continue;
+        json_array_foreach(arr, i, v) {
+            if (taken >= POST_WANT_MAX)
+                break;
+            const post_store_entry_t *e = post_store_get(store, json_string_value(v));
+            if (e == NULL || uuid_compare(e->author, peer.uuid) == 0)
+                continue;
+            envs[n] = strdup(e->envelope);
+            if (envs[n] == NULL)
+                continue;
+            kinds[n++] = k == 0 ? "feed" : "biz";
+            taken++;
+        }
+    }
+    pthread_mutex_unlock(&social_state.lock);
+    json_decref(payload);
+    if (!serve)
+        log_debug(proc->logger, "Identity: post want from %s within the "
+                  "cooldown, not served\n", peer.nickname);
+
+    for (size_t i = 0; i < n; i++) {
+        json_t *post = json_loads(envs[i], 0, NULL);
+        free(envs[i]);
+        if (post == NULL)
+            continue;
+        json_t *env = json_object();
+        if (env != NULL) {
+            json_object_set_new(env, "kind", json_string(kinds[i]));
+            json_object_set(env, "post", post);
+            _send_directed(proc, &peer, ID_POST_BACKFILL, env, "a post backfill");
+            json_decref(env);
+        }
+        json_decref(post);
+    }
+    if (n > 0)
+        log_info(proc->logger, "Identity: backfilled %zu post(s) to %s\n", n,
+                 peer.nickname);
+    return true;
+}
+
+/* Handler: one backfilled post. Through the same path as the original, minus
+ * the co-membership record and the relay. crypto_box authenticated the sender;
+ * the post's own signature authenticates its author. */
+static bool handle_post_backfill(const process_t *proc, directory_t *queues,
+                                 generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    public_identity_t peer;
+    if (!_admitted_sender(proc, nmsg, "peer_post_backfill", &peer))
+        return true;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    const char *kind = json_string_value(json_object_get(payload, "kind"));
+    json_t *post = json_object_get(payload, "post");
+    if (kind == NULL || !json_is_object(post))
+        log_warn(proc->logger, "Identity: peer_post_backfill malformed, refusing\n");
+    else if (strcmp(kind, "feed") == 0)
+        _ingest_post(proc, post, false);
+    else if (strcmp(kind, "biz") == 0)
+        _ingest_business_post(proc, post, false);
+    else
+        log_warn(proc->logger, "Identity: peer_post_backfill of unknown kind "
+                 "'%s', refusing\n", kind);
+    json_decref(payload);
+    return true;
+}
+
 /****************************
  * Social as an identity extension (FEATURE_SPLIT_PLAN Phase 5): the hooks
  * identity calls (identity/id_ext.h) and its verb handlers
@@ -4810,6 +5209,11 @@ static void _social_init(void)
     social_state.seen_business_post_count = 0;
     social_state.business_post_seq = 0;
     map_init(&social_state.last_business_post_map);
+    post_store_init(&social_state.feed_store);
+    post_store_init(&social_state.biz_store);
+    social_state.last_digest_at = 0.0;
+    map_init(&social_state.want_sent_at);
+    map_init(&social_state.want_served_at);
     map_init(&social_state.last_cosign_request_map);
     map_init(&social_state.last_cosign_sig_map);
     map_init(&social_state.social_edges);
@@ -4873,6 +5277,13 @@ static void _social_reset(void)
     social_state.business_post_seq = 0;
     map_free(&social_state.last_business_post_map);
     map_init(&social_state.last_business_post_map);
+    post_store_clear(&social_state.feed_store);
+    post_store_clear(&social_state.biz_store);
+    social_state.last_digest_at = 0.0;
+    map_free(&social_state.want_sent_at);
+    map_init(&social_state.want_sent_at);
+    map_free(&social_state.want_served_at);
+    map_init(&social_state.want_served_at);
     map_free(&social_state.last_cosign_request_map);
     map_init(&social_state.last_cosign_request_map);
     map_free(&social_state.last_cosign_sig_map);
@@ -4926,6 +5337,12 @@ static void _social_peer_confirmed(const process_t *proc, const public_identity_
     /* Opt-in profile (Increment 3): same pattern — ask every confirmed peer
      * for its agora.profile; an opted-out peer answers nothing. */
     _send_profile_query(proc, peer);
+    /* Store-and-forward: a peer we just confirmed may have missed our posts
+     * (a partition healing, a late joiner), so the next sweep sends a digest
+     * whatever the interval says. */
+    pthread_mutex_lock(&social_state.lock);
+    social_state.last_digest_at = 0.0;
+    pthread_mutex_unlock(&social_state.lock);
 }
 
 static void _social_group_update_seen(const process_t *proc, const char *from_uuid_str,
@@ -4991,6 +5408,11 @@ static void _social_periodic_resync(const process_t *proc)
     peers_read_unlock(proc);
     for (size_t i = 0; i < fcnt; i++)
         _send_profile_query(proc, &profless[i]);
+
+    /* Store-and-forward: advertise our recent posts, at most every
+     * $AT_SOCIAL_DIGEST_SEC. No partition detection is needed: whoever missed
+     * a post while apart asks for it after the heal. */
+    _maybe_send_post_digest(proc);
 }
 
 static bool _social_roster_replay(const process_t *proc, int n)
@@ -5075,6 +5497,9 @@ static int _social_register(process_t *proc, const char *proc_name)
                              (handler_ptr_t)handle_business_post);
     process_register_handler(proc, ID_APP_PUBLISH_BUSINESS_POST,
                              (handler_ptr_t)handle_app_publish_business_post);
+    process_register_handler(proc, ID_POST_DIGEST,   (handler_ptr_t)handle_post_digest);
+    process_register_handler(proc, ID_POST_WANT,     (handler_ptr_t)handle_post_want);
+    process_register_handler(proc, ID_POST_BACKFILL, (handler_ptr_t)handle_post_backfill);
     return 0;
 }
 

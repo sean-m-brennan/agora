@@ -1126,6 +1126,19 @@ def handle_post(proc, queues, message):
         return False
     try:
         body = from_json_string(message.obj)
+    except Exception as err:
+        proc.report_exception(err, 'handle_post')
+        return True
+    return _ingest_post(proc, queues, body, True)
+
+
+def _ingest_post(proc, queues, body, via_group):
+    """The one inbound path for a feed post: the group multicast
+    (``handle_post``, ``via_group`` True) or a directed backfill
+    (``handle_post_backfill``, False). Python records no co-membership from a
+    post and never relays one, so the flag changes nothing here but the log;
+    it is kept for parity with C ``_ingest_post``, where it gates both."""
+    try:
         if not isinstance(body, dict):
             return True
         author = body.get('author')
@@ -1191,6 +1204,10 @@ def handle_post(proc, queues, message):
             proc.social._seen_post_ids.append(pid)
             if len(proc.social._seen_post_ids) > 256:
                 proc.social._seen_post_ids.pop(0)
+            # Kept for backfill, the blocked author's too: a personal block
+            # governs what WE see, not what our neighbours may.
+            _store_for_backfill_locked(proc.social.feed_store, pid, float(ts),
+                                       str(author), body)
             # A blocked author's post is HIDDEN (Phase 4 P4.1): recorded in
             # the dedup ring above, but never stored for the app.
             #
@@ -1216,8 +1233,9 @@ def handle_post(proc, queues, message):
                 'tier': int(tier),
                 'body': bound_post_body(text),
             }
-        proc.logger.debug('post %s from %s accepted (hops=%d)',
-                          pid, str(author)[:8], int(hops))
+        proc.logger.debug('post %s from %s accepted (hops=%d%s)',
+                          pid, str(author)[:8], int(hops),
+                          '' if via_group else ', backfilled')
     except Exception as err:
         proc.report_exception(err, 'handle_post')
     return True
@@ -1658,6 +1676,18 @@ def handle_business_post(proc, queues, message):
         return False
     try:
         body = from_json_string(message.obj)
+    except Exception as err:
+        proc.report_exception(err, 'handle_business_post')
+        return True
+    return _ingest_business_post(proc, queues, body, True)
+
+
+def _ingest_business_post(proc, queues, body, via_group):
+    """The one inbound path for a business post: the group multicast
+    (``via_group`` True) or a directed backfill (False). A backfill passes the
+    same page gate and dedup and is never relayed. Twin of C
+    ``_ingest_business_post``."""
+    try:
         if not isinstance(body, dict):
             return True
         author = body.get('author')
@@ -1726,21 +1756,240 @@ def handle_business_post(proc, queues, message):
                 'peer_business_post %s already seen, dropping', post_id)
             return True
         with proc.lock:
+            _store_for_backfill_locked(proc.social.biz_store, post_id,
+                                       float(ts), str(author), body)
             proc.social.last_business_post[str(did)] = {
                 'post_id': post_id, 'seq': int(seq), 'ts': float(ts),
                 'hops': int(hops), 'bundle': bundle,
             }
         proc.logger.info(
-            'business post %s for %s from %s accepted (hops=%d)', post_id,
-            did[:16], str(author)[:8], int(hops))
+            'business post %s for %s from %s accepted (hops=%d%s)', post_id,
+            did[:16], str(author)[:8], int(hops),
+            '' if via_group else ', backfilled')
         # Gossip one more hop, under the same bound as a feed post,
         # FORWARDING THE ORIGINAL ENVELOPE — see _business_post_forward for
-        # why a relay must not re-sign.
-        if int(hops) < BUSINESS_POST_MAX_HOPS:
+        # why a relay must not re-sign. A backfill is never relayed.
+        if via_group and int(hops) < BUSINESS_POST_MAX_HOPS:
             _business_post_forward(proc, queues, body, int(hops) + 1)
     except Exception as err:
         proc.report_exception(err, 'handle_business_post')
     return True
+
+# ------------------------------------------------------------------
+# STORE-AND-FORWARD (Agora Phase 4 DDIL). Twin of the C block in id_social.c;
+# see SocialProtocol.post_digest. Bounds: POST_STORE_CAP per store, only posts
+# younger than POST_BACKFILL_MAX_AGE (their own signed ts) are offered, at most
+# POST_WANT_MAX ids per kind per want and posts per kind per backfill, and one
+# want sent to and one served for each peer per POST_WANT_COOLDOWN seconds. The
+# digest goes out at most every $AT_SOCIAL_DIGEST_SEC (default
+# POST_DIGEST_DEFAULT_SEC), from the periodic resync. In memory only, and
+# Python's store holds received posts only (it has no feed publish verb).
+# ------------------------------------------------------------------
+
+POST_STORE_CAP = 256
+POST_BACKFILL_MAX_AGE = 24.0 * 3600.0
+POST_WANT_MAX = 32
+POST_WANT_COOLDOWN = 10.0
+POST_DIGEST_DEFAULT_SEC = 60
+
+
+def _store_for_backfill_locked(store, post_id, ts, author, body):
+    """Keep one verified post's wire envelope under its content id. Caller
+    holds proc.lock. A known id is left as is; a full store drops its
+    oldest."""
+    if post_id in store:
+        return
+    store[post_id] = {'ts': float(ts), 'author': str(author),
+                      'env': to_json_string(body)}
+    while len(store) > POST_STORE_CAP:
+        store.popitem(last=False)
+
+
+def _digest_interval():
+    try:
+        v = int(os.environ.get('AT_SOCIAL_DIGEST_SEC', ''))
+        if v > 0:
+            return float(v)
+    except ValueError:
+        pass
+    return float(POST_DIGEST_DEFAULT_SEC)
+
+
+def _digest_ids_locked(store, now):
+    live = [(e['ts'], pid) for pid, e in store.items()
+            if e['ts'] > now - POST_BACKFILL_MAX_AGE]
+    live.sort(key=lambda t: -t[0])
+    return [pid for _, pid in live[:POST_STORE_CAP]]
+
+
+def send_post_digest(proc, queues):
+    """Group-multicast the content ids of our recent stored posts. Returns 0
+    when sent, 1 when there was nothing to offer, -1 on failure. Twin of C
+    ``identity_send_post_digest``; also the conformance seam."""
+    now = time.time()
+    with proc.lock:
+        feed = _digest_ids_locked(proc.social.feed_store, now)
+        biz = _digest_ids_locked(proc.social.biz_store, now)
+        proc.social.last_digest_at = now
+    if not feed and not biz:
+        return 1
+    try:
+        out = Message(proc.name, SocialProtocol.post_digest,
+                      to_json_string({'feed': feed, 'biz': biz}),
+                      to_whom=proc.group, from_whom=proc.identity)
+        queues[CfgIds.network].put(out, block=True, timeout=proc.q_cadence)
+        return 0
+    except Full:
+        proc.logger.error('send_post_digest: Network queue full')
+    except Exception as err:
+        proc.report_exception(err, 'send_post_digest')
+    return -1
+
+
+def maybe_send_post_digest(proc, queues):
+    with proc.lock:
+        due = time.time() - proc.social.last_digest_at >= _digest_interval()
+    if due:
+        send_post_digest(proc, queues)
+
+
+def _cooldown_pass_locked(table, peer_str, now):
+    when = table.get(peer_str)
+    if when is not None and now - when < POST_WANT_COOLDOWN:
+        return False
+    table[peer_str] = now
+    return True
+
+
+def _admitted_sender(proc, message, verb):
+    """A digest, want or backfill is honoured only from an admitted peer."""
+    sender = getattr(message, 'from_whom', None)
+    peer = (proc.peers.find_by_uuid(str(sender.uuid))
+            if sender is not None and proc.peers else None)
+    if peer is None:
+        proc.logger.warning('%s from a peer we have not admitted, refusing',
+                            verb)
+    return peer
+
+
+def _send_directed(proc, queues, peer, verb, payload, what):
+    try:
+        out = Message(proc.name, verb, to_json_string(payload),
+                      to_whom=peer, from_whom=proc.identity, encrypt=True)
+        queues[CfgIds.network].put(out, block=True, timeout=proc.q_cadence)
+        return True
+    except Full:
+        proc.logger.error('%s: Network queue full', what)
+    except Exception as err:
+        proc.report_exception(err, what)
+    return False
+
+
+def handle_post_digest(proc, queues, message):
+    """A peer's digest: ask it, directed, for the ids we do not hold. Twin of
+    C ``handle_post_digest``."""
+    if message.function != SocialProtocol.post_digest:
+        return False
+    sender = getattr(message, 'from_whom', None)
+    if sender is not None and str(sender.uuid) == str(proc.identity.uuid):
+        return True  # our own, looped back
+    peer = _admitted_sender(proc, message, 'peer_post_digest')
+    if peer is None:
+        return True
+    try:
+        body = from_json_string(message.obj)
+        if not isinstance(body, dict):
+            return True
+        with proc.lock:
+            want = {}
+            for kind, seen in (('feed', proc.social._seen_post_ids),
+                               ('biz', proc.social._seen_business_post_ids)):
+                ids = body.get(kind)
+                ids = ids if isinstance(ids, list) else []
+                want[kind] = [i for i in ids
+                              if isinstance(i, str) and len(i) == 64
+                              and i not in seen][:POST_WANT_MAX]
+            if not (want['feed'] or want['biz']):
+                return True
+            if not _cooldown_pass_locked(proc.social.want_sent_at,
+                                         str(peer.uuid), time.time()):
+                return True
+        proc.logger.info('asking %s for %d missed post(s)', str(peer.uuid)[:8],
+                         len(want['feed']) + len(want['biz']))
+        _send_directed(proc, queues, peer, SocialProtocol.post_want, want,
+                       'handle_post_digest')
+    except Exception as err:
+        proc.report_exception(err, 'handle_post_digest')
+    return True
+
+
+def handle_post_want(proc, queues, message):
+    """A peer asks for stored posts: serve each, directed, as its original
+    envelope, never a post back to its own author. Twin of C
+    ``handle_post_want``."""
+    if message.function != SocialProtocol.post_want:
+        return False
+    peer = _admitted_sender(proc, message, 'peer_post_want')
+    if peer is None:
+        return True
+    try:
+        body = from_json_string(message.obj)
+        if not isinstance(body, dict):
+            return True
+        requester = str(peer.uuid)
+        serve = []
+        with proc.lock:
+            if not _cooldown_pass_locked(proc.social.want_served_at,
+                                         requester, time.time()):
+                proc.logger.debug('post want from %s within the cooldown, '
+                                  'not served', requester[:8])
+                return True
+            for kind, store in (('feed', proc.social.feed_store),
+                                ('biz', proc.social.biz_store)):
+                ids = body.get(kind)
+                ids = ids if isinstance(ids, list) else []
+                taken = 0
+                for pid in ids:
+                    if taken >= POST_WANT_MAX:
+                        break
+                    e = store.get(pid) if isinstance(pid, str) else None
+                    if e is None or e['author'] == requester:
+                        continue
+                    serve.append((kind, e['env']))
+                    taken += 1
+        for kind, env in serve:
+            _send_directed(proc, queues, peer, SocialProtocol.post_backfill,
+                           {'kind': kind, 'post': from_json_string(env)},
+                           'handle_post_want')
+        if serve:
+            proc.logger.info('backfilled %d post(s) to %s', len(serve),
+                             requester[:8])
+    except Exception as err:
+        proc.report_exception(err, 'handle_post_want')
+    return True
+
+
+def handle_post_backfill(proc, queues, message):
+    """One backfilled post, through the same path as the original minus the
+    relay. Twin of C ``handle_post_backfill``."""
+    if message.function != SocialProtocol.post_backfill:
+        return False
+    if _admitted_sender(proc, message, 'peer_post_backfill') is None:
+        return True
+    try:
+        body = from_json_string(message.obj)
+    except Exception as err:
+        proc.report_exception(err, 'handle_post_backfill')
+        return True
+    kind = body.get('kind') if isinstance(body, dict) else None
+    post = body.get('post') if isinstance(body, dict) else None
+    if not isinstance(post, dict) or kind not in ('feed', 'biz'):
+        proc.logger.warning('peer_post_backfill malformed, refusing')
+        return True
+    if kind == 'feed':
+        return _ingest_post(proc, queues, post, False)
+    return _ingest_business_post(proc, queues, post, False)
+
 
 def get_last_business_post(proc, did):
     """The most-recent business post this node ACCEPTED for polity ``did``,

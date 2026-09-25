@@ -1,0 +1,30 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-backfill-delivers-and-does-not-relay
+byte_pinning: false
+description: |
+    A backfilled post is accepted as the original would have been, and is
+    TERMINAL (Agora Phase 4 DDIL): it is never relayed, or every heal would
+    re-flood the group. carol records alice's post from bob's backfill and
+    sends no post of her own.
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+  - id: carol
+    role: group_member
+steps:
+  - id: 1
+    from: bob
+    to: carol
+    function: peer_post_backfill
+    payload:
+      kind: feed
+      post: {author: alice, body: "you missed this", seq: 3, ts: 0, tier: 0}
+expected_state:
+  carol:
+    post_last:
+      alice: {seq: 3, body: "you missed this"}
+    posts_emitted: 0

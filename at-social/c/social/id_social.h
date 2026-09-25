@@ -125,6 +125,13 @@ bool identity_get_last_cosign_sig(const char *uuid_str, char *cid_buf,
                                   size_t signer_sz, char *sig_buf,
                                   size_t sig_sz, int64_t *seq_out);
 
+/** STORE-AND-FORWARD (Agora Phase 4 DDIL): group-multicast the content ids of
+ *  this node's recent stored posts (peer_post_digest), as the periodic resync
+ *  does at most every $AT_SOCIAL_DIGEST_SEC. Returns 0 when sent, 1 when there
+ *  was nothing to offer, -1 on failure. Also the conformance seam behind
+ *  trigger_post_digest. */
+int identity_send_post_digest(const process_t *proc);
+
 /** The most-recent feed post this node accepted from AUTHOR @p uuid_str
  *  (Increment 7). Copies the content id into @p post_id_buf and the body into
  *  @p body_buf (both always NUL-terminated) and, when non-NULL, the author's

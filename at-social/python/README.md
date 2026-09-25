@@ -8,7 +8,7 @@ co-signing.
 
 | Module | What |
 |---|---|
-| `autonomous_trust.social.protocol` | `SocialProtocol`, the 17 verbs (strings unchanged from their `IdentityProtocol` days) |
+| `autonomous_trust.social.protocol` | `SocialProtocol`: the 17 verbs (strings unchanged from their `IdentityProtocol` days) and the three store-and-forward verbs |
 | `autonomous_trust.social.extension` | the `Extension`: registers the verbs on the identity process and follows it through `IdentityHooks` |
 | `autonomous_trust.social.handlers` | the handlers and senders, module functions over the identity process |
 | `autonomous_trust.social.state` | `SocialState` (`proc.social`), seeded from `$AT_OWN_GEOHASH` / `$AT_OWN_EXACT` / `$AT_OWN_PROFILE` |

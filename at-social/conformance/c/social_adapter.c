@@ -508,6 +508,142 @@ static void _social_fixtures(sce_run_ctx_t *ctx, json_t *fixtures)
     }
 }
 
+/* ---- Store-and-forward (Agora Phase 4 DDIL) --------------------------- */
+
+/* Put @p pub on @p p's peer list if it is not there. The C adapter does not
+ * cross-populate rosters the way the Python one does (every existing
+ * participant knows every other; a `new_node` is known by none), so the three
+ * store-and-forward verbs, which are honoured only from an admitted peer,
+ * admit their sender on delivery by the same rule. Idempotent. */
+static void _sf_admit(process_t *p, const public_identity_t *pub)
+{
+    bool have = false;
+    peers_read_lock(p);
+    for (size_t i = 0; i < p->protocol.num_peers; i++)
+        if (uuid_compare(p->protocol.peers[i].uuid, pub->uuid) == 0)
+            have = true;
+    peers_read_unlock(p);
+    if (have)
+        return;
+    peers_write_lock(p);
+    if (p->protocol.num_peers < DEFAULT_MAX_PEERS) {
+        memcpy(&p->protocol.peers[p->protocol.num_peers], pub,
+               sizeof(public_identity_t));
+        p->protocol.num_peers++;
+    }
+    peers_write_unlock(p);
+}
+
+static bool _sf_verb(const char *function)
+{
+    return function != NULL
+        && (strcmp(function, "peer_post_digest") == 0
+            || strcmp(function, "peer_post_want") == 0
+            || strcmp(function, "peer_post_backfill") == 0);
+}
+
+/* The participant a post spec names as its `author`, else the step's sender. */
+static ic_impl_t *_sf_author(sce_run_ctx_t *ctx, ic_impl_t *sender_impl,
+                             json_t *spec)
+{
+    const char *pid = json_string_value(json_object_get(spec, "author"));
+    sce_participant_t *ap = pid != NULL ? sce_find_participant(ctx, pid) : NULL;
+    return ap != NULL ? (ic_impl_t *)ap->impl : sender_impl;
+}
+
+/* The content id of the post a spec describes, computed as the runtime does:
+ * feed {author, seq, ts, tier, body}, business {author, polity, seq, ts,
+ * bundle}. Scenarios cannot name ids (they are hashes), so they name posts. */
+static int _sf_spec_id(sce_run_ctx_t *ctx, ic_impl_t *sender_impl, json_t *spec,
+                       bool biz, char id_out[AT_POST_ID_HEX_LEN + 1])
+{
+    ic_impl_t *a = _sf_author(ctx, sender_impl, spec);
+    if (a == NULL || a->full == NULL)
+        return -1;
+    json_t *jseq = json_object_get(spec, "seq");
+    int64_t seq = json_is_integer(jseq) ? (int64_t)json_integer_value(jseq) : 1;
+    json_t *jts = json_object_get(spec, "ts");
+    double ts = json_is_number(jts) ? json_number_value(jts) : 0.0;
+    if (biz) {
+        const char *did = json_string_value(json_object_get(spec, "polity"));
+        const char *bundle = json_string_value(json_object_get(spec, "bundle"));
+        return at_business_post_content_id(a->full->uuid, did ? did : "", seq,
+                                           ts, bundle ? bundle : "", id_out);
+    }
+    json_t *jtier = json_object_get(spec, "tier");
+    int tier = json_is_integer(jtier) ? (int)json_integer_value(jtier) : 0;
+    const char *body = json_string_value(json_object_get(spec, "body"));
+    return at_post_content_id(a->full->uuid, seq, ts, (uint8_t)tier,
+                              body ? body : "", id_out);
+}
+
+/* {"feed":[spec...], "biz":[spec...]} -> {"feed":[id...], "biz":[id...]}. */
+static json_t *_sf_ids_body(sce_run_ctx_t *ctx, ic_impl_t *sender_impl,
+                            json_t *payload)
+{
+    json_t *out = json_object();
+    for (int k = 0; out != NULL && k < 2; k++) {
+        const char *key = k == 0 ? "feed" : "biz";
+        json_t *arr = json_array();
+        json_t *specs = json_object_get(payload, key);
+        size_t i;
+        json_t *spec;
+        if (json_is_array(specs))
+            json_array_foreach(specs, i, spec) {
+                char id[AT_POST_ID_HEX_LEN + 1];
+                if (json_is_object(spec)
+                    && _sf_spec_id(ctx, sender_impl, spec, k == 1, id) == 0)
+                    json_array_append_new(arr, json_string(id));
+            }
+        json_object_set_new(out, key, arr);
+    }
+    return out;
+}
+
+/* One post's signed envelope, as its author would have sent it. `sig`
+ * overrides the signature (bad-signature drop). */
+static json_t *_sf_post_env(sce_run_ctx_t *ctx, ic_impl_t *sender_impl,
+                            json_t *spec, bool biz)
+{
+    ic_impl_t *a = _sf_author(ctx, sender_impl, spec);
+    if (a == NULL || a->full == NULL)
+        return NULL;
+    json_t *jseq = json_object_get(spec, "seq");
+    int64_t seq = json_is_integer(jseq) ? (int64_t)json_integer_value(jseq) : 1;
+    json_t *jts = json_object_get(spec, "ts");
+    double ts = json_is_number(jts) ? json_number_value(jts) : 0.0;
+    json_t *jhops = json_object_get(spec, "hops");
+    int hops = json_is_integer(jhops) ? (int)json_integer_value(jhops) : 0;
+    char pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+    sodium_bin2hex(pk_hex, sizeof(pk_hex), a->full->signature.public,
+                   crypto_sign_PUBLICKEYBYTES);
+    const char *sig_over = json_string_value(json_object_get(spec, "sig"));
+    if (biz) {
+        const char *did = json_string_value(json_object_get(spec, "polity"));
+        const char *bundle = json_string_value(json_object_get(spec, "bundle"));
+        char sig[AT_BUSINESS_POST_SIG_HEX_LEN + 1] = {0};
+        if (sig_over != NULL)
+            snprintf(sig, sizeof(sig), "%s", sig_over);
+        else
+            at_business_post_sign(a->full->signature.private, a->full->uuid,
+                                  did ? did : "", seq, ts, bundle ? bundle : "",
+                                  sig);
+        return at_business_post_to_json(a->full->uuid, pk_hex, did ? did : "",
+                                        seq, ts, bundle ? bundle : "", sig, hops);
+    }
+    json_t *jtier = json_object_get(spec, "tier");
+    int tier = json_is_integer(jtier) ? (int)json_integer_value(jtier) : 0;
+    const char *body = json_string_value(json_object_get(spec, "body"));
+    char sig[AT_POST_SIG_HEX_LEN + 1] = {0};
+    if (sig_over != NULL)
+        snprintf(sig, sizeof(sig), "%s", sig_over);
+    else
+        at_post_sign(a->full->signature.private, a->full->uuid, seq, ts,
+                     (uint8_t)tier, body ? body : "", sig);
+    return at_post_to_json(a->full->uuid, pk_hex, seq, ts, (uint8_t)tier,
+                           body ? body : "", sig, hops);
+}
+
 static int _social_inbound(sce_run_ctx_t *ctx, sce_participant_t *sender,
                            ic_impl_t *sender_impl, const char *from_id,
                            const char *to_id, const char *function,
@@ -634,6 +770,42 @@ static int _social_inbound(sce_run_ctx_t *ctx, sce_participant_t *sender,
                             json_real(json_is_number(jts)
                                       ? json_number_value(jts) : 0.0));
         _ic_set_seq(body, payload);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
+
+    /* Store-and-forward (Agora Phase 4 DDIL). peer_post_digest and
+     * peer_post_want carry content ids, which a scenario cannot name, so it
+     * names POSTS ({"feed":[{author, seq, ts, tier, body}], "biz":[{author,
+     * polity, seq, ts, bundle}]}) and the ids are computed here as the runtime
+     * computes them. peer_post_backfill carries one post's envelope, signed by
+     * its `author` (default: the sender), {"kind", "post": {...}}. Mirrors the
+     * Python builders. */
+    if ((strcmp(function, "peer_post_digest") == 0
+         || strcmp(function, "peer_post_want") == 0) && json_is_object(payload)) {
+        json_t *body = _sf_ids_body(ctx, sender_impl, payload);
+        if (body == NULL)
+            return -1;
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
+    if (strcmp(function, "peer_post_backfill") == 0 && json_is_object(payload)) {
+        const char *kind = json_string_value(json_object_get(payload, "kind"));
+        json_t *spec = json_object_get(payload, "post");
+        json_t *env = json_is_object(spec)
+            ? _sf_post_env(ctx, sender_impl, spec,
+                           kind != NULL && strcmp(kind, "biz") == 0)
+            : NULL;
+        if (env == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "peer_post_backfill: could not build the post envelope");
+            return -1;
+        }
+        json_t *body = json_object();
+        json_object_set_new(body, "kind", json_string(kind ? kind : "feed"));
+        json_object_set_new(body, "post", env);
         net_msg_pack_json(&out->info.net_msg, body);
         json_decref(body);
         return 0;
@@ -923,6 +1095,25 @@ static int _social_dispatch(sce_run_ctx_t *ctx, sce_participant_t *target,
 {
     ic_impl_t *impl = (ic_impl_t *)target->impl;
     (void)impl;
+    if (inbound->type == NET_MESSAGE && _sf_verb(inbound->info.net_msg.function)) {
+        /* Admit the sender the way the Python adapter's rosters already do
+         * (see _sf_admit), then let the real handler run. */
+        ic_impl_t *snd = _ic_impl_for_uuid(ctx, inbound->info.net_msg.from_whom.uuid);
+        sce_participant_t *sp = snd != NULL ? sce_find_participant(ctx, snd->id) : NULL;
+        if (snd != NULL && snd->pub != NULL
+            && !(sp != NULL && strcmp(sp->role, "new_node") == 0))
+            _sf_admit(impl->proc, snd->pub);
+        return 1;
+    }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function, "trigger_post_digest") == 0) {
+        /* Pseudo-function: `impl` sends its digest (store-and-forward), as the
+         * periodic resync would. Mirrors the Python adapter's
+         * _TRIGGER_POST_DIGEST. */
+        (void)identity_send_post_digest(impl->proc);
+        return 0;
+    }
     if (inbound->type == NET_MESSAGE
         && inbound->info.net_msg.function != NULL
         && strcmp(inbound->info.net_msg.function,
@@ -1410,6 +1601,30 @@ static int _social_check_key(sce_run_ctx_t *ctx, const char *pid,
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: business_posts_emitted=%d, expected %d",
                              pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "post_digests_emitted") == 0
+                       || strcmp(key, "post_wants_emitted") == 0
+                       || strcmp(key, "post_backfills_emitted") == 0
+                       || strcmp(key, "posts_emitted") == 0) {
+                /* Store-and-forward emissions attributed to this participant
+                 * (Agora Phase 4 DDIL): digests sent, wants sent, backfills
+                 * served, and plain feed posts sent (a relay; a backfill must
+                 * never cause one). Mirrors the Python emit tallies. */
+                const char *fn =
+                    strcmp(key, "post_digests_emitted") == 0 ? "peer_post_digest"
+                  : strcmp(key, "post_wants_emitted") == 0 ? "peer_post_want"
+                  : strcmp(key, "post_backfills_emitted") == 0 ? "peer_post_backfill"
+                  : "peer_post";
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->captured_count; i++)
+                    if (strcmp(ctx->captured[i].from, pid) == 0
+                        && strcmp(ctx->captured[i].function, fn) == 0)
+                        got++;
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err), "%s: %s=%d, expected %d",
+                             pid, key, got, want);
                     return -1;
                 }
             } else if (strcmp(key, "dm_last") == 0) {

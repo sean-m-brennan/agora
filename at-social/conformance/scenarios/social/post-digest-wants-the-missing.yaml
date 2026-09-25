@@ -1,0 +1,26 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-digest-wants-the-missing
+byte_pinning: false
+description: |
+    A digest naming a post carol does not hold makes her ask its sender for it,
+    directed (Agora Phase 4 DDIL): one want.
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+  - id: carol
+    role: group_member
+steps:
+  - id: 1
+    from: bob
+    to: carol
+    function: peer_post_digest
+    payload:
+      feed:
+        - {author: alice, body: "carol missed this", seq: 1, ts: 4102444800, tier: 0}
+expected_state:
+  carol:
+    post_wants_emitted: 1

@@ -1,0 +1,45 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-want-rate-limited
+byte_pinning: false
+description: |
+    One want per requester is served per 10 s (Agora Phase 4 DDIL): the answer
+    to a want is traffic, and a peer that could ask as fast as it liked could
+    turn every node into an amplifier. carol's second want, straight after the
+    first, is not served.
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+  - id: carol
+    role: group_member
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: peer_post
+    payload: {body: "one", seq: 1, ts: 4102444800, tier: 0}
+  - id: 2
+    from: alice
+    to: bob
+    function: peer_post
+    payload: {body: "two", seq: 2, ts: 4102444800, tier: 0}
+  - id: 3
+    from: carol
+    to: bob
+    function: peer_post_want
+    payload:
+      feed:
+        - {author: alice, body: "one", seq: 1, ts: 4102444800, tier: 0}
+  - id: 4
+    from: carol
+    to: bob
+    function: peer_post_want
+    payload:
+      feed:
+        - {author: alice, body: "two", seq: 2, ts: 4102444800, tier: 0}
+expected_state:
+  bob:
+    post_backfills_emitted: 1
