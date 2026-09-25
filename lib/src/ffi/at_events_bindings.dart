@@ -41,7 +41,7 @@ const int agoraBusinessSatSelf = 0xFF;
 
 /// Max hex characters of a detached exchange's exported canonical bytes, Phase 3
 /// P3.3 (must match AGORA_COSIGN_BYTES_MAX in at_agora_shim.h, and the same
-/// bound in app_events.h, msg_types.h, cosign.h and ethne_ffi). MEASURED against
+/// bound in at_agora.h, social_msg_types.h, cosign.h and ethne_ffi). MEASURED against
 /// real exchanges: the evidence carried by a guardian change is what grows it.
 const int agoraCosignBytesMax = 6144;
 

@@ -338,7 +338,7 @@ net_up || exit 1
 INJECT="$RUN/at_inject"
 ATC="$AGORA_DIR/../../lib/autonomous_trust/src/c"
 CC_BIN="$(command -v cc || command -v gcc)"
-if ! "$CC_BIN" -DAT_SOCIAL_ENABLED -fms-extensions \
+if ! "$CC_BIN" -fms-extensions \
      -I"$ATC" -I"$ATC/autonomous_trust" \
      -I"$NATIVE/at_core" -I"$NATIVE/at_core/autonomous_trust" \
      -I"$NATIVE/at_core/protobuf" \

@@ -81,6 +81,7 @@
 #include "config/configuration.h"  /* get_cfg_dir, get_data_dir, CFG_PATH_LEN */
 #include "config/generate.h"       /* random_config */
 #include "utilities/util.h"        /* makedirs */
+#include "social/at_social.h"      /* at_social_link */
 
 /* True if an identity config already exists in cfg_dir (either serialization). */
 static bool identity_present(const char *cfg_dir)
@@ -193,6 +194,9 @@ static int supervise(pid_t daemon_pid)
 
 int main(int argc, char **argv)
 {
+    /* agorad IS a social node: keep libat_social in the link (present means
+     * on; without it the daemon would run with no social verbs at all). */
+    at_social_link();
     if (argc < 3) {
         fprintf(stderr,
                 "usage: %s <app_to_at_queue> <at_to_app_queue> "

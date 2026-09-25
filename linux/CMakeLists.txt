@@ -128,19 +128,27 @@ if(NOT CMAKE_BUILD_TYPE MATCHES "Debug")
 endif()
 
 # === Agora native layer ===
-# Bundle Agora's own native artifacts (the agorad daemon, the FFI shim, and the
-# AutonomousTrust C core) into the app's lib/ dir so the app runs self-contained
-# — no AGORA_DAEMON_PATH / AGORA_SHIM_PATH / LD_LIBRARY_PATH needed. These are
-# built out-of-tree by native/CMakeLists.txt (see build.sh, which runs the native
-# build before `flutter build`). Their $ORIGIN rpath resolves libautonomous_trust
-# beside them here. The Dart layer (agora_daemon.dart, at_events_bindings.dart)
-# looks for them at <exe_dir>/lib/ before falling back to the dev env vars.
+# Bundle Agora's own native artifacts (the agorad daemon, the FFI shim, the
+# AutonomousTrust C core and its verification layers) into the app's lib/ dir so
+# the app runs self-contained — no AGORA_DAEMON_PATH / AGORA_SHIM_PATH /
+# LD_LIBRARY_PATH needed. These are built out-of-tree by native/CMakeLists.txt
+# (see build.sh, which runs the native build before `flutter build`). Their
+# $ORIGIN rpath resolves libautonomous_trust and the layers beside them here.
+# The Dart layer (agora_daemon.dart, at_events_bindings.dart) looks for them at
+# <exe_dir>/lib/ before falling back to the dev env vars.
 set(AGORA_NATIVE_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../native/build"
   CACHE PATH "Agora native build output directory")
 set(_agora_native_artifacts
   "${AGORA_NATIVE_BUILD_DIR}/agorad"
   "${AGORA_NATIVE_BUILD_DIR}/libagora_shim.so"
   "${AGORA_NATIVE_BUILD_DIR}/at_core/libautonomous_trust.so")
+# The extension libraries agorad and the shim link (the five libat_<layer>
+# verification layers, AT_ORACLE_*, and libat_social; see
+# native/CMakeLists.txt), bundled beside the core.
+foreach(_layer physics calibration certificates prequential replication social)
+  list(APPEND _agora_native_artifacts
+    "${AGORA_NATIVE_BUILD_DIR}/at_core/extensions/${_layer}/libat_${_layer}.so")
+endforeach()
 foreach(_agora_art ${_agora_native_artifacts})
   if(EXISTS "${_agora_art}")
     install(FILES "${_agora_art}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"

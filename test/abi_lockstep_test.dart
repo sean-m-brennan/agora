@@ -147,7 +147,7 @@ void main() {
   });
 
   test('the business-post bounds match the C header', () {
-    // Spelled in business_post.h, msg_types.h, app_events.h, at_agora_shim.h
+    // Spelled in business_post.h, social_msg_types.h, at_agora.h, at_agora_shim.h
     // and here, with the C side _Static_asserting its four against each other.
     // The bundle bound is MEASURED (worst case 3550 of 4096, printed by
     // ethne_ffi's the_worst_case_post_bundle_fits_the_wire_bound); widen the
@@ -157,7 +157,7 @@ void main() {
   });
 
   test('the co-signing bounds match the C header', () {
-    // These are spelled in five places (cosign.h, msg_types.h, app_events.h,
+    // These are spelled in five places (cosign.h, social_msg_types.h, at_agora.h,
     // at_agora_shim.h, here) plus COSIGN_BYTES_HEX_MAX in ethne_ffi, and the C
     // side _Static_asserts its four against each other. This pins the Dart copy.
     expect(agoraCosignBytesMax, 6144);

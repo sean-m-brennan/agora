@@ -20,7 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "autonomous_trust/app_events.h"
+#include "social/at_agora.h"   /* + app_events.h */
+#include "social/at_social.h"  /* at_social_link */
 
 void agora_set_root(const char *root)
 {
@@ -95,7 +96,7 @@ _Static_assert(AGORA_BUSINESS_POST_ID_MAX == AT_APP_BUSINESS_POST_ID_LEN,
  * exactly those bytes, so a payload that arrives a byte short verifies against
  * nothing at all — which is why the authoring side refuses an oversized exchange
  * rather than letting anything truncate it. The bound is MEASURED; see
- * AT_APP_COSIGN_BYTES_LEN in app_events.h. */
+ * AT_APP_COSIGN_BYTES_LEN in at_agora.h. */
 /* Grew again from 17872 to 22152 with the Phase 3 P3.4 business-post tail
  * (business_post_polity, business_post_id, business_post_seq, business_post_ts,
  * business_post_hops, business_post_bundle) appended after cosign_bytes; every
@@ -119,10 +120,24 @@ _Static_assert(AGORA_BUSINESS_POST_ID_MAX == AT_APP_BUSINESS_POST_ID_LEN,
  * rep_ceiling 22160. */
 _Static_assert(sizeof(agora_event_t) == 22168,
                "agora_event_t size changed — update the Dart struct and ALL "
-               "FIVE cohort ctypes Ev asserts in lockstep");
+               "SIX cohort ctypes Ev asserts in lockstep");
+
+/* This file reads at_app_event_t through at_agora.h's accessors; a change to
+ * that layout is announced by a bump of AT_APP_ABI_VERSION. Pinned here so the
+ * bump fails this build and someone re-reads the conversion below. */
+_Static_assert(AT_APP_ABI_VERSION == 2,
+               "at_app_event_t ABI changed — review agora_events_poll");
 
 void *agora_events_open(const char *recv_queue)
 {
+    /* A shim compiled against one app-event layout must not read another's
+     * events: every slot after the first would be misaligned. */
+    if (at_app_abi_version() != AT_APP_ABI_VERSION)
+        return NULL;
+    /* Social is its own library (libat_social); referencing it keeps it, and
+     * the decoders this shim reads through, in the link. Present means on, so
+     * a shim without it would silently lose every social event. */
+    at_social_link();
     return (void *)at_app_events_open(recv_queue);
 }
 
@@ -274,14 +289,19 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
     if (handle == NULL || out == NULL || max <= 0)
         return 0;
 
-    /* Drain in fixed-size batches to keep the raw union buffer off the heap.
-     * The batch SHRANK from 64 to 16 at P3.3: at_app_event_t's union now holds
-     * the co-signing request, whose opaque payload alone is 6 KB, so 64 slots
-     * would put ~420 KB on the stack of whatever thread Dart calls from. The
-     * buffer is what is bounded here, not the drain — a caller asking for more
-     * than one batch simply polls again. */
-    at_app_event_t raw[16];
-    int want = max < 16 ? max : 16;
+    /* Drain in fixed-size batches to keep the raw event buffer off the heap.
+     * The batch SHRANK from 64 to 16 at P3.3 (the co-signing request's opaque
+     * payload alone is 6 KB). At app ABI v2 every at_app_event_t is a fixed
+     * 8200 B (8 + AT_APP_EVENT_PAYLOAD_MAX), so 16 slots are ~131 KB on the
+     * stack of whatever thread Dart calls from, up from ~100 KB. It stays 16
+     * anyway: "at most 16 events per call" is a CONTRACT — the cohort drivers'
+     * drain() loops stop on `n < 16`, so a smaller batch would silently end
+     * every drain after its first batch. Change it only together with them.
+     * The buffer is what is bounded here, not the drain — a caller asking for
+     * more than one batch simply polls again. */
+    enum { AGORA_POLL_BATCH = 16 };
+    at_app_event_t raw[AGORA_POLL_BATCH];
+    int want = max < AGORA_POLL_BATCH ? max : AGORA_POLL_BATCH;
 
     int n = at_app_events_poll((at_app_events_t *)handle, raw, (size_t)want);
     if (n <= 0)
@@ -308,10 +328,8 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             e->operator_bound = raw[i].data.peer.operator_bound ? 1 : 0;
             e->operator_attested_at = raw[i].data.peer.operator_attested_at;
             memcpy(e->operator_pubkey, raw[i].data.peer.operator_pubkey, AGORA_KEY_LEN);
-#ifdef AT_SOCIAL_ENABLED
             e->in_group = raw[i].data.peer.in_group ? 1 : 0;
             e->blocked = raw[i].data.peer.blocked ? 1 : 0;
-#endif /* AT_SOCIAL_ENABLED */
             w++;
             break;
 
@@ -338,164 +356,188 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             w++;
             break;
 
-        case AT_APP_EVENT_PEER_POSITION:
+        case AT_APP_EVENT_PEER_POSITION: {
+            const at_app_position_t *ev = at_agora_event_position(&raw[i]);
             e->kind = AGORA_EVENT_POSITION;
-            memcpy(e->peer_uuid, raw[i].data.position.peer_uuid, AGORA_UUID_LEN);
+            memcpy(e->peer_uuid, ev->peer_uuid, AGORA_UUID_LEN);
             /* raw geohash is already NUL-bounded by AT; copy and re-terminate. */
-            memcpy(e->geohash, raw[i].data.position.geohash, AGORA_GEOHASH_LEN);
+            memcpy(e->geohash, ev->geohash, AGORA_GEOHASH_LEN);
             e->geohash[AGORA_GEOHASH_LEN] = '\0';
             w++;
             break;
+        }
 
-        case AT_APP_EVENT_PEER_PROFILE:
+        case AT_APP_EVENT_PEER_PROFILE: {
+            const at_app_profile_t *ev = at_agora_event_profile(&raw[i]);
             e->kind = AGORA_EVENT_PROFILE;
-            memcpy(e->peer_uuid, raw[i].data.profile.peer_uuid, AGORA_UUID_LEN);
+            memcpy(e->peer_uuid, ev->peer_uuid, AGORA_UUID_LEN);
             /* raw profile_json is already NUL-bounded by AT; copy and re-terminate. */
-            memcpy(e->profile_json, raw[i].data.profile.profile_json,
+            memcpy(e->profile_json, ev->profile_json,
                    AGORA_PROFILE_JSON_MAX);
             e->profile_json[AGORA_PROFILE_JSON_MAX] = '\0';
             w++;
             break;
+        }
 
-        case AT_APP_EVENT_CONNECTION_REQUEST:
+        case AT_APP_EVENT_CONNECTION_REQUEST: {
+            const at_app_connection_t *ev = at_agora_event_connection(&raw[i]);
             e->kind = AGORA_EVENT_CONNECTION_REQUEST;
-            memcpy(e->peer_uuid, raw[i].data.connection.peer_uuid, AGORA_UUID_LEN);
-            e->connection_state = raw[i].data.connection.state;
+            memcpy(e->peer_uuid, ev->peer_uuid, AGORA_UUID_LEN);
+            e->connection_state = ev->state;
             w++;
             break;
+        }
 
-        case AT_APP_EVENT_CONNECTION_STATE:
+        case AT_APP_EVENT_CONNECTION_STATE: {
+            const at_app_connection_t *ev = at_agora_event_connection(&raw[i]);
             e->kind = AGORA_EVENT_CONNECTION_STATE;
-            memcpy(e->peer_uuid, raw[i].data.connection.peer_uuid, AGORA_UUID_LEN);
-            e->connection_state = raw[i].data.connection.state;
+            memcpy(e->peer_uuid, ev->peer_uuid, AGORA_UUID_LEN);
+            e->connection_state = ev->state;
             w++;
             break;
+        }
 
-        case AT_APP_EVENT_DM:
+        case AT_APP_EVENT_DM: {
+            const at_app_dm_t *ev = at_agora_event_dm(&raw[i]);
             e->kind = AGORA_EVENT_DM;
-            memcpy(e->peer_uuid, raw[i].data.dm.peer_uuid, AGORA_UUID_LEN);
-            e->dm_seq = raw[i].data.dm.seq;
-            e->dm_ts = raw[i].data.dm.ts;
+            memcpy(e->peer_uuid, ev->peer_uuid, AGORA_UUID_LEN);
+            e->dm_seq = ev->seq;
+            e->dm_ts = ev->ts;
             /* raw text is already NUL-bounded by AT; copy and re-terminate. */
-            memcpy(e->dm_text, raw[i].data.dm.text, AGORA_DM_TEXT_MAX);
+            memcpy(e->dm_text, ev->text, AGORA_DM_TEXT_MAX);
             e->dm_text[AGORA_DM_TEXT_MAX] = '\0';
             w++;
             break;
+        }
 
-        case AT_APP_EVENT_POST:
+        case AT_APP_EVENT_POST: {
+            const at_app_post_t *ev = at_agora_event_post(&raw[i]);
             e->kind = AGORA_EVENT_POST;
-            memcpy(e->peer_uuid, raw[i].data.post.author_uuid, AGORA_UUID_LEN);
+            memcpy(e->peer_uuid, ev->author_uuid, AGORA_UUID_LEN);
             /* raw strings are already NUL-bounded by AT; copy and re-terminate. */
-            memcpy(e->post_id, raw[i].data.post.post_id, AGORA_POST_ID_MAX);
+            memcpy(e->post_id, ev->post_id, AGORA_POST_ID_MAX);
             e->post_id[AGORA_POST_ID_MAX] = '\0';
-            e->post_seq = raw[i].data.post.seq;
-            e->post_ts = raw[i].data.post.ts;
-            e->post_required_tier = raw[i].data.post.required_tier;
-            memcpy(e->post_body, raw[i].data.post.body, AGORA_POST_BODY_MAX);
+            e->post_seq = ev->seq;
+            e->post_ts = ev->ts;
+            e->post_required_tier = ev->required_tier;
+            memcpy(e->post_body, ev->body, AGORA_POST_BODY_MAX);
             e->post_body[AGORA_POST_BODY_MAX] = '\0';
             w++;
             break;
+        }
 
-        case AT_APP_EVENT_REACTION:
+        case AT_APP_EVENT_REACTION: {
+            const at_app_reaction_t *ev = at_agora_event_reaction(&raw[i]);
             e->kind = AGORA_EVENT_REACTION;
-            memcpy(e->peer_uuid, raw[i].data.reaction.peer_uuid, AGORA_UUID_LEN);
+            memcpy(e->peer_uuid, ev->peer_uuid, AGORA_UUID_LEN);
             /* raw id is already NUL-bounded by AT; copy and re-terminate. */
-            memcpy(e->reaction_post_id, raw[i].data.reaction.post_id,
+            memcpy(e->reaction_post_id, ev->post_id,
                    AGORA_POST_ID_MAX);
             e->reaction_post_id[AGORA_POST_ID_MAX] = '\0';
-            e->reaction_seq = raw[i].data.reaction.seq;
-            e->reaction_ts = raw[i].data.reaction.ts;
+            e->reaction_seq = ev->seq;
+            e->reaction_ts = ev->ts;
             w++;
             break;
+        }
 
-        case AT_APP_EVENT_PROXIMITY:
+        case AT_APP_EVENT_PROXIMITY: {
+            const at_app_proximity_t *ev = at_agora_event_proximity(&raw[i]);
             e->kind = AGORA_EVENT_PROXIMITY;
-            memcpy(e->peer_uuid, raw[i].data.proximity.peer_uuid, AGORA_UUID_LEN);
-            e->proximity_band = raw[i].data.proximity.band;
+            memcpy(e->peer_uuid, ev->peer_uuid, AGORA_UUID_LEN);
+            e->proximity_band = ev->band;
             w++;
             break;
+        }
 
-        case AT_APP_EVENT_COSIGN_REQUEST:
+        case AT_APP_EVENT_COSIGN_REQUEST: {
+            const at_app_cosign_request_t *ev = at_agora_event_cosign_request(&raw[i]);
             e->kind = AGORA_EVENT_COSIGN_REQUEST;
-            memcpy(e->peer_uuid, raw[i].data.cosign_request.requester_uuid,
+            memcpy(e->peer_uuid, ev->requester_uuid,
                    AGORA_UUID_LEN);
             /* The core NUL-caps every string and the event was memset, so a
              * short string stays terminated after the bounded copy. */
-            memcpy(e->cosign_record, raw[i].data.cosign_request.record,
+            memcpy(e->cosign_record, ev->record,
                    AGORA_COSIGN_TOKEN_MAX);
             e->cosign_record[AGORA_COSIGN_TOKEN_MAX] = '\0';
-            memcpy(e->cosign_op, raw[i].data.cosign_request.op,
+            memcpy(e->cosign_op, ev->op,
                    AGORA_COSIGN_TOKEN_MAX);
             e->cosign_op[AGORA_COSIGN_TOKEN_MAX] = '\0';
-            memcpy(e->cosign_polity, raw[i].data.cosign_request.polity,
+            memcpy(e->cosign_polity, ev->polity,
                    AGORA_COSIGN_DID_MAX);
             e->cosign_polity[AGORA_COSIGN_DID_MAX] = '\0';
-            memcpy(e->cosign_cid, raw[i].data.cosign_request.cid,
+            memcpy(e->cosign_cid, ev->cid,
                    AGORA_COSIGN_CID_MAX);
             e->cosign_cid[AGORA_COSIGN_CID_MAX] = '\0';
-            e->cosign_seq = raw[i].data.cosign_request.seq;
-            e->cosign_ts = raw[i].data.cosign_request.ts;
-            memcpy(e->cosign_bytes, raw[i].data.cosign_request.bytes,
+            e->cosign_seq = ev->seq;
+            e->cosign_ts = ev->ts;
+            memcpy(e->cosign_bytes, ev->bytes,
                    AGORA_COSIGN_BYTES_MAX);
             e->cosign_bytes[AGORA_COSIGN_BYTES_MAX] = '\0';
             w++;
             break;
-        case AT_APP_EVENT_COSIGN_SIGNATURE:
+        }
+        case AT_APP_EVENT_COSIGN_SIGNATURE: {
+            const at_app_cosign_sig_t *ev = at_agora_event_cosign_sig(&raw[i]);
             e->kind = AGORA_EVENT_COSIGN_SIGNATURE;
-            memcpy(e->peer_uuid, raw[i].data.cosign_sig.signer_uuid,
+            memcpy(e->peer_uuid, ev->signer_uuid,
                    AGORA_UUID_LEN);
-            memcpy(e->cosign_cid, raw[i].data.cosign_sig.cid, AGORA_COSIGN_CID_MAX);
+            memcpy(e->cosign_cid, ev->cid, AGORA_COSIGN_CID_MAX);
             e->cosign_cid[AGORA_COSIGN_CID_MAX] = '\0';
-            memcpy(e->cosign_signer_did, raw[i].data.cosign_sig.signer_did,
+            memcpy(e->cosign_signer_did, ev->signer_did,
                    AGORA_COSIGN_DID_MAX);
             e->cosign_signer_did[AGORA_COSIGN_DID_MAX] = '\0';
-            memcpy(e->cosign_sig, raw[i].data.cosign_sig.sig, AGORA_COSIGN_SIG_MAX);
+            memcpy(e->cosign_sig, ev->sig, AGORA_COSIGN_SIG_MAX);
             e->cosign_sig[AGORA_COSIGN_SIG_MAX] = '\0';
-            e->cosign_seq = raw[i].data.cosign_sig.seq;
-            e->cosign_ts = raw[i].data.cosign_sig.ts;
+            e->cosign_seq = ev->seq;
+            e->cosign_ts = ev->ts;
             w++;
             break;
-        case AT_APP_EVENT_BUSINESS_POST:
+        }
+        case AT_APP_EVENT_BUSINESS_POST: {
+            const at_app_business_post_t *ev = at_agora_event_business_post(&raw[i]);
             e->kind = AGORA_EVENT_BUSINESS_POST;
-            memcpy(e->peer_uuid, raw[i].data.business_post.publisher_uuid,
+            memcpy(e->peer_uuid, ev->publisher_uuid,
                    AGORA_UUID_LEN);
             /* The core NUL-caps every string and the event was memset, so a
              * short string stays terminated after the bounded copy. */
-            memcpy(e->business_post_polity, raw[i].data.business_post.polity,
+            memcpy(e->business_post_polity, ev->polity,
                    AGORA_BUSINESS_DID_MAX);
             e->business_post_polity[AGORA_BUSINESS_DID_MAX] = '\0';
-            memcpy(e->business_post_id, raw[i].data.business_post.post_id,
+            memcpy(e->business_post_id, ev->post_id,
                    AGORA_BUSINESS_POST_ID_MAX);
             e->business_post_id[AGORA_BUSINESS_POST_ID_MAX] = '\0';
-            e->business_post_seq = raw[i].data.business_post.seq;
-            e->business_post_ts = raw[i].data.business_post.ts;
-            e->business_post_hops = raw[i].data.business_post.hops;
-            memcpy(e->business_post_bundle, raw[i].data.business_post.bundle,
+            e->business_post_seq = ev->seq;
+            e->business_post_ts = ev->ts;
+            e->business_post_hops = ev->hops;
+            memcpy(e->business_post_bundle, ev->bundle,
                    AGORA_BUSINESS_POST_BUNDLE_MAX);
             e->business_post_bundle[AGORA_BUSINESS_POST_BUNDLE_MAX] = '\0';
             w++;
             break;
-        case AT_APP_EVENT_BUSINESS_AD:
+        }
+        case AT_APP_EVENT_BUSINESS_AD: {
+            const at_app_business_ad_t *ev = at_agora_event_business_ad(&raw[i]);
             e->kind = AGORA_EVENT_BUSINESS_AD;
-            memcpy(e->peer_uuid, raw[i].data.business_ad.advertiser_uuid,
+            memcpy(e->peer_uuid, ev->advertiser_uuid,
                    AGORA_UUID_LEN);
             /* raw strings are already NUL-bounded by AT; copy and re-terminate.
              * The bundle crosses UNVERIFIED by design — the core holds no Ethne,
              * so the Dart side runs the self-contained verifier on it. */
-            memcpy(e->business_polity, raw[i].data.business_ad.polity,
+            memcpy(e->business_polity, ev->polity,
                    AGORA_BUSINESS_DID_MAX);
             e->business_polity[AGORA_BUSINESS_DID_MAX] = '\0';
-            memcpy(e->business_ad_id, raw[i].data.business_ad.ad_id,
+            memcpy(e->business_ad_id, ev->ad_id,
                    AGORA_BUSINESS_AD_ID_MAX);
             e->business_ad_id[AGORA_BUSINESS_AD_ID_MAX] = '\0';
-            e->business_satisfaction = raw[i].data.business_ad.satisfaction;
-            e->business_seq = raw[i].data.business_ad.seq;
-            e->business_ts = raw[i].data.business_ad.ts;
-            memcpy(e->business_bundle, raw[i].data.business_ad.bundle,
+            e->business_satisfaction = ev->satisfaction;
+            e->business_seq = ev->seq;
+            e->business_ts = ev->ts;
+            memcpy(e->business_bundle, ev->bundle,
                    AGORA_BUSINESS_BUNDLE_MAX);
             e->business_bundle[AGORA_BUSINESS_BUNDLE_MAX] = '\0';
             w++;
             break;
+        }
 
         default:
             /* Unknown/appended kind: drop it. Forward-compatible by design. */

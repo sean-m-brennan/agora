@@ -196,6 +196,7 @@ fi
 echo
 echo "==> Build complete."
 echo "    native : native/build/{agorad,libagora_shim.so,at_core/libautonomous_trust.so}"
+echo "             + at_core/extensions/<layer>/libat_<layer>.so (the five verification layers)"
 echo "    app    : build/$PLATFORM/  (see 'flutter build $PLATFORM' output above)"
 echo
 echo "    To run (needs a display), point the app at the native artifacts:"

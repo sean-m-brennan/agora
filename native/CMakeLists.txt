@@ -21,8 +21,10 @@
 #
 # DTN (AT_NET_DTN) and ZTA (AT_ZTA) are left OFF (their defaults) — do not
 # enable them here; the heavy third_party DTN stack is not needed for Agora.
-# AT_SOCIAL, by contrast, is forced ON below — Agora is exactly the social-app
-# consumer that flag gates.
+# The five verification layers (AT_ORACLE_*) stay ON, their default, and are
+# linked below as libat_<layer>.
+# Social (libat_social) is Agora's own extension, ../at-social/c/social, built
+# inside AT's project through AT_EXTERNAL_EXTENSIONS below.
 
 # The AT C core is project(... C CXX); enable both here so the CXX toolchain is
 # configured before the AT subdirectory is added.
@@ -46,19 +48,16 @@ endif()
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 
 # Agora IS the social-app consumer of the AT core: the shim (at_agora_shim.c) and
-# agorad call the social at_app_events_* API and reference event kinds 4-9, which
-# the core compiles in only when AT_SOCIAL is ON (default OFF for lean M2M nodes).
-# Force it ON before the AT subdirectory is added so the whole core agrees on the
-# AT_SOCIAL_ENABLED struct layout.
-set(AT_SOCIAL ON CACHE BOOL "Agora requires AT social features" FORCE)
-
-# The AT core defines AT_SOCIAL_ENABLED for its OWN targets (via
-# add_compile_definitions inside its CMakeLists), but that does not propagate up
-# to THIS directory's targets. The shim (at_agora_shim.c) and agorad include AT's
-# app_events.h / msg_types.h and use the social event kinds + payload members,
-# which are guarded by AT_SOCIAL_ENABLED — so define it here too, before any target
-# in this directory (and the AT subdirectory) is created.
-add_compile_definitions(AT_SOCIAL_ENABLED)
+# agorad call the social at_app_events_* API (social/at_agora.h) and reference
+# event kinds 4-15. Those live in the extension library libat_social, whose
+# source is Agora's (../at-social/c/social; it left the AT repo in
+# FEATURE_SPLIT_PLAN Phase 5b). AT builds each directory named in
+# AT_EXTERNAL_EXTENSIONS inside its own scope, as it would an in-tree extension,
+# with its output at at_core/extensions/social/. Name it before AT is added. No
+# compile definition is needed: the core's structs are the same in every build.
+set(AGORA_SOCIAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../at-social/c/social")
+set(AT_EXTERNAL_EXTENSIONS "${AGORA_SOCIAL_DIR}" CACHE STRING
+    "Agora's AT extensions (libat_social)" FORCE)
 
 add_subdirectory("${AT_C_DIR}" at_core)
 
@@ -76,6 +75,10 @@ set_property(TARGET autonomous_trust PROPERTY INTERFACE_SOURCES "")
 set(AT_INCLUDE_DIRS
     "${AT_C_DIR}"
     "${AT_C_DIR}/autonomous_trust"
+    # AT's in-tree extension headers, and social's (social/at_agora.h,
+    # social/at_social.h)
+    "${AT_C_DIR}/extensions"
+    "${AGORA_SOCIAL_DIR}/.."
     "${CMAKE_CURRENT_BINARY_DIR}/at_core"
     "${CMAKE_CURRENT_BINARY_DIR}/at_core/autonomous_trust"
     # generated protobuf-c headers (AT's PROTO_BINARY_DIR, its CMake line ~879)
@@ -91,7 +94,37 @@ find_library(AT_JANSSON_LIB   jansson    REQUIRED)
 find_library(AT_UUID_LIB      uuid       REQUIRED)
 find_library(AT_PROTOBUFC_LIB protobuf-c REQUIRED)
 find_library(AT_PROTOBUF_LIB  protobuf   REQUIRED)  # C++ runtime (ShutdownProtobufLibrary)
+# AT's extension libraries this build links: the five verification layers
+# (AT_ORACLE_*, ON by default, libat_<layer>, FEATURE_SPLIT_PLAN Phase 3) and
+# social (libat_social, Phase 5). They were part of the core before the split,
+# so linking them keeps agorad's behaviour unchanged; a node that declares a
+# layer ($AT_PHYSICS, ...) or a social default ($AT_OWN_PROFILE, ...) without
+# its library refuses to start. Each library registers from a constructor.
+# The shim and agorad call at_social_link(), so social is referenced; the
+# layers are not, so --as-needed (the Ubuntu/Debian default) would drop their
+# DT_NEEDED and the layer with it. --no-as-needed keeps them, and stays on for
+# the rest of the line: CMake moves a layer that another layer links
+# (certificates, under replication) after its dependent, so switching
+# --as-needed back on here would leave that one to chance. macOS ld64 keeps
+# every named dylib by default.
+set(AT_EXT_LIBS)
+set(AT_EXT_RPATH)   # their build-tree dirs, for the dev flow (rpath below)
+if(NOT TARGET at_social)
+    message(FATAL_ERROR "Agora needs AT's social library (libat_social); "
+                        "AT_EXTERNAL_EXTENSIONS names ${AGORA_SOCIAL_DIR} above, "
+                        "so this AT tree does not support external extensions")
+endif()
+foreach(_layer physics calibration certificates prequential replication social)
+    if(TARGET at_${_layer})
+        list(APPEND AT_EXT_LIBS at_${_layer})
+        list(APPEND AT_EXT_RPATH "${CMAKE_CURRENT_BINARY_DIR}/at_core/extensions/${_layer}")
+    endif()
+endforeach()
+if(AT_EXT_LIBS AND NOT APPLE)
+    set(AT_EXT_LIBS -Wl,--no-as-needed ${AT_EXT_LIBS})
+endif()
 set(AT_LINK_LIBS
+    ${AT_EXT_LIBS}
     autonomous_trust
     ${AT_SODIUM_LIB} ${AT_JANSSON_LIB} ${AT_UUID_LIB}
     ${AT_PROTOBUFC_LIB} ${AT_PROTOBUF_LIB}
@@ -124,16 +157,17 @@ set_target_properties(agorad PROPERTIES
 
 # --- Relocatable rpath -------------------------------------------------------
 # When these artifacts are copied into the Flutter app bundle they sit in the
-# bundle's lib/ dir alongside libautonomous_trust.so, so `$ORIGIN` resolves the
-# AT core with no LD_LIBRARY_PATH. The build-tree at_core dir is also kept on the
-# rpath so the dev flow (running straight out of native/build/) still finds the
-# core without env setup; that absolute entry is simply inert in the bundle.
+# bundle's lib/ dir alongside libautonomous_trust.so and the libat_<name>
+# extension libraries, so `$ORIGIN` resolves them with no LD_LIBRARY_PATH. The
+# build-tree at_core dir and the libraries' at_core/extensions/<name>/ dirs are
+# also kept on the rpath so the dev flow (running straight out of native/build/)
+# finds them without env setup; those absolute entries are inert in the bundle.
 # BUILD_WITH_INSTALL_RPATH bakes this into the build-tree binaries themselves,
 # which is required because the Flutter bundle install copies the files verbatim
 # (install(FILES ...) does no rpath rewriting).
 set_target_properties(agora_shim agorad PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
-    INSTALL_RPATH "$ORIGIN;${CMAKE_CURRENT_BINARY_DIR}/at_core")
+    INSTALL_RPATH "$ORIGIN;${CMAKE_CURRENT_BINARY_DIR}/at_core;${AT_EXT_RPATH}")
 
 # --- Ethne C-FFI cdylib (Phase 3: businesses = Ethne polities) ---------------
 # ethne_ffi/ is a Rust cdylib exposing a C ABI over Ethne's Rust charter engine

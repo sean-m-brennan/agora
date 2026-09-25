@@ -43,23 +43,23 @@ extern "C" {
  * sync via the compile-time assertions in at_agora_shim.c. */
 #define AGORA_UUID_LEN 16
 #define AGORA_KEY_LEN  32
-/* Max geohash length. MUST match AT_APP_GEOHASH_LEN (app_events.h). */
+/* Max geohash length. MUST match AT_APP_GEOHASH_LEN (at_agora.h). */
 #define AGORA_GEOHASH_LEN 12
 /* Max compact-profile-JSON length. MUST match AT_APP_PROFILE_JSON_LEN
- * (app_events.h) / AT_PROFILE_JSON_LEN (msg_types.h). */
+ * (at_agora.h) / AT_PROFILE_JSON_LEN (social_msg_types.h). */
 #define AGORA_PROFILE_JSON_MAX 2560
-/* Max DM body length. MUST match AT_APP_DM_TEXT_LEN (app_events.h) /
- * AT_DM_TEXT_LEN (msg_types.h). */
+/* Max DM body length. MUST match AT_APP_DM_TEXT_LEN (at_agora.h) /
+ * AT_DM_TEXT_LEN (social_msg_types.h). */
 #define AGORA_DM_TEXT_MAX 1024
-/* Max feed-post body length. MUST match AT_APP_POST_BODY_LEN (app_events.h) /
- * AT_POST_BODY_LEN (msg_types.h). */
+/* Max feed-post body length. MUST match AT_APP_POST_BODY_LEN (at_agora.h) /
+ * AT_POST_BODY_LEN (social_msg_types.h). */
 #define AGORA_POST_BODY_MAX 4096
 /* Post content-id length (blake2b-256 lowercase hex). MUST match
- * AT_APP_POST_ID_LEN (app_events.h) / AT_POST_ID_LEN (msg_types.h). */
+ * AT_APP_POST_ID_LEN (at_agora.h) / AT_POST_ID_LEN (social_msg_types.h). */
 #define AGORA_POST_ID_MAX 64
 /* Max opaque Ethne page-bundle length on a business ad (Phase 3 P3.2). MUST
- * match AT_APP_BUSINESS_BUNDLE_LEN (app_events.h) / AT_BUSINESS_BUNDLE_LEN
- * (msg_types.h). */
+ * match AT_APP_BUSINESS_BUNDLE_LEN (at_agora.h) / AT_BUSINESS_BUNDLE_LEN
+ * (social_msg_types.h). */
 #define AGORA_BUSINESS_BUNDLE_MAX 3072
 /* Max polity DID length. MUST match AT_APP_BUSINESS_DID_LEN / AT_BUSINESS_DID_LEN. */
 #define AGORA_BUSINESS_DID_MAX 95
@@ -67,20 +67,20 @@ extern "C" {
  * AT_APP_BUSINESS_AD_ID_LEN / AT_BUSINESS_AD_ID_LEN. */
 #define AGORA_BUSINESS_AD_ID_MAX 64
 /* A business advertising its OWN page rather than a customer rating it. MUST
- * match AT_APP_BUSINESS_SAT_SELF (app_events.h) / AT_BUSINESS_SAT_SELF. */
+ * match AT_APP_BUSINESS_SAT_SELF (at_agora.h) / AT_BUSINESS_SAT_SELF. */
 #define AGORA_BUSINESS_SAT_SELF 0xFF
 /* Max opaque Ethne {post,delegation} bundle length on a business post (Phase 3
  * P3.4). Larger than the page bundle because the body rides inside it; the
  * measured worst case is 3550. MUST match AT_APP_BUSINESS_POST_BUNDLE_LEN
- * (app_events.h) / AT_BUSINESS_POST_BUNDLE_LEN (msg_types.h) /
- * AT_BUSINESS_POST_BUNDLE_MAX (identity/business_post.h). */
+ * (at_agora.h) / AT_BUSINESS_POST_BUNDLE_LEN (social_msg_types.h) /
+ * AT_BUSINESS_POST_BUNDLE_MAX (social/business_post.h). */
 #define AGORA_BUSINESS_POST_BUNDLE_MAX 4096
 /* Business-post content-id length (blake2b-256 lowercase hex). MUST match
  * AT_APP_BUSINESS_POST_ID_LEN / AT_BUSINESS_POST_ID_LEN. */
 #define AGORA_BUSINESS_POST_ID_MAX 64
 /* Max hex characters of a detached exchange's exported canonical bytes (Phase 3
- * P3.3). MUST match AT_APP_COSIGN_BYTES_LEN (app_events.h) /
- * AT_COSIGN_BYTES_LEN (msg_types.h) / AT_COSIGN_BYTES_MAX (identity/cosign.h) /
+ * P3.3). MUST match AT_APP_COSIGN_BYTES_LEN (at_agora.h) /
+ * AT_COSIGN_BYTES_LEN (social_msg_types.h) / AT_COSIGN_BYTES_MAX (social/cosign.h) /
  * COSIGN_BYTES_HEX_MAX (ethne_ffi). */
 #define AGORA_COSIGN_BYTES_MAX 6144
 /* Max polity DID or signer did:key length. MUST match AT_APP_COSIGN_DID_LEN. */

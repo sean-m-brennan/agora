@@ -29,6 +29,10 @@ constraints is **[`SOCIAL_APP_PLAN.md` §5.1](SOCIAL_APP_PLAN.md)**
   never `fork()`s.
 - **`native/libagora_shim`** — a flat, union-free FFI surface over AT's
   fork-free app-events client (`at_app_events_*`).
+- **`at-social/`** — AT's social extension (`libat_social`, the
+  `autonomous_trust.social` Python distribution, and the `social` conformance
+  protocol), which Agora owns. The native build hands it to AT as an external
+  extension; see [`at-social/README.md`](at-social/README.md).
 - **`lib/` (Dart)** — FFI bindings, the merged `AgoraPeer` model, the daemon
   supervisor, a poll loop, and the UI.
 
@@ -46,6 +50,8 @@ Windows, iOS, and Android are follow-on ports gated on AT-core changes
 
 ```
 native/          C: agorad daemon + libagora_shim (+ builds the AT C core)
+at-social/       AT's social extension: c/social (libat_social), python/,
+                 conformance/ (AT harness plug-in), test-conformance.sh
 lib/
   main.dart
   src/ffi/       dart:ffi bindings + AgoraPeer model
@@ -103,9 +109,11 @@ flutter pub get
 # 3. Pure-Dart tests need NO native build:
 flutter test                       # 4/4 pass
 
-# 4. Build the app. When the native layer (step 1) is already built, its three
-#    artifacts (agorad, libagora_shim, libautonomous_trust) are copied into the
-#    bundle's lib/ dir, so the built bundle runs self-contained.
+# 4. Build the app. When the native layer (step 1) is already built, its
+#    artifacts (agorad, libagora_shim, libautonomous_trust, and the extension
+#    libraries: the five libat_<layer> verification layers and libat_social)
+#    are copied into the bundle's lib/ dir, so the built bundle runs
+#    self-contained.
 flutter build linux --debug        # -> build/linux/x64/debug/bundle/agora
 
 # 5a. Run the packaged bundle directly — no env vars needed; the Dart layer
@@ -122,7 +130,7 @@ flutter run -d linux               # needs a display; -d macos on a Mac
 ```
 
 **Packaging note:** the self-contained bundle is Linux-only so far. The macOS
-`.app` bundling (an Xcode copy-files phase for the same three artifacts) is not
+`.app` bundling (an Xcode copy-files phase for the same artifacts) is not
 wired up yet — see `.claude/TODO.md`.
 
 ## License
