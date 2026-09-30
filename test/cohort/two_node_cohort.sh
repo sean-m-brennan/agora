@@ -299,8 +299,21 @@ class Ev(ctypes.Structure):
         ("label_ts", ctypes.c_double),
         ("label_hops", ctypes.c_int32),
         ("label_bundle", ctypes.c_char * (1536 + 1)),
+        # Proximity hubs (29200): the fc_* / area_* tail, appended last.
+        ("fc_kind", ctypes.c_int32),
+        ("fc_ref", ctypes.c_char * (63 + 1)),
+        ("fc_handle", ctypes.c_char * (128 + 1)),
+        ("fc_nickname", ctypes.c_char * (128 + 1)),
+        ("fc_relay", ctypes.c_char * (79 + 1)),
+        ("fc_reason", ctypes.c_char * (31 + 1)),
+        ("area", ctypes.c_char * (7 + 1)),
+        ("area_bucket", ctypes.c_char * (7 + 1)),
+        ("area_name", ctypes.c_char * (64 + 1)),
+        ("area_issuer", ctypes.c_char * (64 + 1)),
+        ("fc_seq", ctypes.c_int64),
+        ("fc_count", ctypes.c_int32),
     ]
-# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (28600 with
+# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (29200 with
 # the geohash + profile_json + connection_state + DM + POST + REACTION + in_group +
 # proximity_band + BUSINESS_AD tail; rtt@116, geohash@120, profile_json@133,
 # connection_state@2696, dm_seq@2704, post_id@3745, post_seq@3752, reaction tail after
@@ -308,7 +321,7 @@ class Ev(ctypes.Structure):
 # from 8024, co-signing tail from 11288, business-post tail from 17864, moderation
 # tail from 22149, communities tail from 22168). If the C struct grows and this is not updated in lockstep, poll() would
 # misread every field past the drift.
-assert ctypes.sizeof(Ev) == 28600, f"Ev size {ctypes.sizeof(Ev)} != 28600 (ABI drift)"
+assert ctypes.sizeof(Ev) == 29200, f"Ev size {ctypes.sizeof(Ev)} != 29200 (ABI drift)"
 
 lib = ctypes.CDLL(shim)
 lib.agora_set_root.argtypes = [ctypes.c_char_p]; lib.agora_set_root.restype = None

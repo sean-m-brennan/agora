@@ -642,11 +642,24 @@ class Ev(ctypes.Structure):
         ("label_ts", ctypes.c_double),
         ("label_hops", ctypes.c_int32),
         ("label_bundle", ctypes.c_char * (1536 + 1)),
+        # Proximity hubs (29200): the fc_* / area_* tail, appended last.
+        ("fc_kind", ctypes.c_int32),
+        ("fc_ref", ctypes.c_char * (63 + 1)),
+        ("fc_handle", ctypes.c_char * (128 + 1)),
+        ("fc_nickname", ctypes.c_char * (128 + 1)),
+        ("fc_relay", ctypes.c_char * (79 + 1)),
+        ("fc_reason", ctypes.c_char * (31 + 1)),
+        ("area", ctypes.c_char * (7 + 1)),
+        ("area_bucket", ctypes.c_char * (7 + 1)),
+        ("area_name", ctypes.c_char * (64 + 1)),
+        ("area_issuer", ctypes.c_char * (64 + 1)),
+        ("fc_seq", ctypes.c_int64),
+        ("fc_count", ctypes.c_int32),
     ]
 
 # ABI guard: MUST equal sizeof(agora_event_t) in at_agora_shim.h. A silent drift
 # here would decode every field past the drift point as garbage.
-assert ctypes.sizeof(Ev) == 28600, f"Ev size {ctypes.sizeof(Ev)} != 28600 (ABI drift)"
+assert ctypes.sizeof(Ev) == 29200, f"Ev size {ctypes.sizeof(Ev)} != 29200 (ABI drift)"
 
 EV_PEER = 1
 EV_COSIGN_REQUEST = 13

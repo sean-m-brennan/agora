@@ -26,6 +26,7 @@ import '../model/member_roll.dart';
 import '../model/moderation.dart';
 import '../model/moderation_store.dart';
 import '../model/feed_store.dart';
+import '../model/hub_directory.dart';
 import '../model/post.dart';
 import '../model/staff_identity.dart';
 import '../model/staff_roster.dart';
@@ -861,7 +862,12 @@ class PeerService extends ChangeNotifier {
     // Ensure the author is at least a known roster entry, so tie-strength ranking
     // can place their posts (the peer's other events fill in richer state).
     _peers.putIfAbsent(_hex(e.uuid), () => _newPeer(e.uuid));
-    _feed.add(Post.fromEvent(e));
+    final post = Post.fromEvent(e);
+    // Counted for its community's daily cap on arrival, so every verdict ranks
+    // it against the whole day received so far, whatever order the feed walks.
+    if (_feed.add(post) && post.community.isNotEmpty) {
+      communities.notePost(post);
+    }
     return true;
   }
 
@@ -1359,6 +1365,7 @@ class PeerService extends ChangeNotifier {
       _events?.followCommunity(
           _daemon.queues.appToAt, policy.communityDid, policy.bundle,
           seq: policy.seq);
+      _installHubRoster(policy);
     } else if (policy.communityDid == ownPolityDid &&
         !communities.followed.containsKey(policy.communityDid)) {
       followCommunity(policy.communityDid);
@@ -1424,16 +1431,120 @@ class PeerService extends ChangeNotifier {
     final p = communities.follow(did);
     if (p == null) return false;
     _events?.followCommunity(_daemon.queues.appToAt, did, p.bundle, seq: p.seq);
+    _installHubRoster(p);
     _saveCommunities();
     notifyListeners();
     return true;
   }
 
   void unfollowCommunity(String did) {
+    final held = communities.followed[did];
     communities.unfollow(did);
     _events?.unfollowCommunity(_daemon.queues.appToAt, did);
+    final issuer = held?.hubRoster == null ? null : _rosterIssuer(held!.hubRoster!);
+    if (issuer != null) {
+      _events?.relayRosterRemove(_daemon.queues.appToAt, 'roster', issuer);
+    }
     _saveCommunities();
     notifyListeners();
+  }
+
+  // --- proximity hubs (Phase 4, SOCIAL_APP_PLAN §4.1 band 2) -----------------
+
+  final HubDirectory hubs = HubDirectory();
+
+  /// What this reader lists under at hubs; empty lists no name.
+  String hubName = '';
+
+  static const int _hubLookupEveryTicks = 200; // ~60 s at the 300 ms default
+  int _ticksSinceHubLookup = 0;
+
+  /// The community's relay roster, trusted because it arrived inside a policy
+  /// this reader verified and follows: the node pins the community's key and
+  /// registers with its hubs.
+  void _installHubRoster(CommunityPolicy p) {
+    final roster = p.hubRoster;
+    if (roster == null || !communities.followed.containsKey(p.communityDid)) return;
+    _events?.relayRosterInstall(_daemon.queues.appToAt, 'roster', roster);
+  }
+
+  static String? _rosterIssuer(String roster) {
+    try {
+      final outer = jsonDecode(roster) as Map<String, dynamic>;
+      final body = jsonDecode(outer['body'] as String) as Map<String, dynamic>;
+      return body['issuer'] as String?;
+    } on Object {
+      return null;
+    }
+  }
+
+  /// Every area a followed community's hubs serve.
+  List<String> get hubAreas => ({
+        for (final p in communities.followed.values) ...p.areas,
+      }.toList()..sort());
+
+  /// The hub areas that hold this reader's own bucket: where it can be listed.
+  /// Empty with no shared bucket, since a card carries that bucket and nothing
+  /// finer.
+  List<String> get listableAreas => areasHolding(_ownGeohash, hubAreas);
+
+  bool get listedAtHubs => hubs.listed.isNotEmpty;
+
+  /// Opt in to (or out of) being findable at the hubs for our own area: a
+  /// separate choice from sharing a bucket with connected peers. On, each hub
+  /// area holding our bucket is sent a card with the bucket cut to five
+  /// characters and [name]; the node refreshes it while listed. Returns how
+  /// many areas were asked.
+  int setListedAtHubs(bool on, {String? name}) {
+    final ev = _events;
+    if (ev == null) return 0;
+    if (name != null) hubName = name;
+    final q = _daemon.queues.appToAt;
+    var n = 0;
+    if (on) {
+      final own = _ownGeohash;
+      if (own == null) return 0;
+      for (final a in listableAreas) {
+        if (ev.areaPublish(q, 'list', a, hubBucket(own), hubName) == 0) n++;
+      }
+    } else {
+      for (final a in {...hubs.listed, ...listableAreas}) {
+        if (ev.areaWithdraw(q, 'list', a) == 0) n++;
+      }
+    }
+    return n;
+  }
+
+  /// Ask the hubs who else is listed in each area we are. Runs on its own
+  /// about once a minute while listed. Returns how many lookups went out.
+  int lookupNearby() {
+    final ev = _events;
+    if (ev == null) return 0;
+    var n = 0;
+    for (final a in hubs.listed) {
+      if (ev.areaLookup(_daemon.queues.appToAt, 'look', a) == 0) n++;
+    }
+    return n;
+  }
+
+  /// Ask someone a lookup found to become a contact. They answer, or not.
+  int askToConnect(HubCard c) =>
+      _events?.areaRequest(_daemon.queues.appToAt, 'ask', c.area, c.uuid) ?? -1;
+
+  int acceptContact(IncomingContact c) =>
+      _events?.contactAccept(_daemon.queues.appToAt, c.ref) ?? -1;
+
+  int declineContact(IncomingContact c) {
+    final rc = _events?.contactDecline(_daemon.queues.appToAt, c.ref) ?? -1;
+    hubs.incoming.remove(c.ref);
+    notifyListeners();
+    return rc;
+  }
+
+  bool _ingestHubEvent(AtRawEvent e) {
+    if (e.kind != agoraEventArea && e.kind != agoraEventContact) return false;
+    if (hubs.ingest(e)) notifyListeners();
+    return true;
   }
 
   /// Apply [did]'s policy to this reader's own feed, or set it aside. Local:
@@ -1951,6 +2062,10 @@ class PeerService extends ChangeNotifier {
       _ticksSinceRoster = 0;
       ev.requestRoster(_daemon.queues.appToAt);
     }
+    if (hubs.listed.isNotEmpty && ++_ticksSinceHubLookup >= _hubLookupEveryTicks) {
+      _ticksSinceHubLookup = 0;
+      lookupNearby();
+    }
     ingestEvents(ev.poll());
   }
 
@@ -1976,6 +2091,7 @@ class PeerService extends ChangeNotifier {
       // A community's policy, and a moderator's label (Phase 4).
       if (_ingestCommunityPolicy(e)) continue;
       if (_ingestPostLabel(e)) continue;
+      if (_ingestHubEvent(e)) continue;
       // A co-signature ask, and a signature coming back — a live exchange.
       if (_ingestCosignRequest(e)) continue;
       if (_ingestCosignSignature(e)) continue;
@@ -2183,7 +2299,9 @@ class _ArchiveCommunityGovernance implements CommunityGovernance {
   String? mintPolicy(String polityDid) {
     final root = _root;
     if (root == null) return null;
-    return _arc.signContentPolicy(polityDid: polityDid, root: root);
+    // Always with the roster, empty or not: a newer policy's empty roster is
+    // how followers learn the community's last hub is gone.
+    return _arc.signContentPolicy(polityDid: polityDid, root: root, hubs: true);
   }
 
   @override

@@ -22,6 +22,11 @@
 
 #include "social/at_agora.h"   /* + app_events.h */
 #include "social/at_social.h"  /* at_social_link */
+#include "at_first_contact.h"    /* proximity hubs, and the contact flow */
+/* first_contact_app.c's link anchor (declared in AT's internal
+ * identity/first_contact.h): referencing it keeps the first-contact event
+ * decoders in a static link, as at_social_link does social's. */
+void at_first_contact_app_link(void);
 
 void agora_set_root(const char *root)
 {
@@ -133,7 +138,18 @@ _Static_assert(AGORA_POST_LABEL_BUNDLE_MAX == AT_APP_POST_LABEL_BUNDLE_LEN,
  * NOT grow: at_app_community_policy_t (~4.3 KB) stays under
  * at_app_cosign_request_t's 6145, so the batch budget is untouched. Measured,
  * not assumed. */
-_Static_assert(sizeof(agora_event_t) == 28600,
+_Static_assert(AGORA_FC_REF_MAX + 1 == AT_FC_REF_LEN
+               && AGORA_FC_HANDLE_MAX + 1 == AT_FC_HANDLE_LEN
+               && AGORA_FC_NICKNAME_MAX + 1 == AT_FC_NICKNAME_LEN
+               && AGORA_FC_RELAY_MAX + 1 == AT_FC_RELAY_LEN
+               && AGORA_FC_REASON_MAX + 1 == AT_FC_REASON_LEN
+               && AGORA_AREA_MAX + 1 == AT_FC_AREA_LEN
+               && AGORA_AREA_NAME_MAX + 1 == AT_FC_AREA_NAME_LEN
+               && AGORA_FC_ISSUER_MAX + 1 == AT_FC_ISSUER_LEN,
+               "the first-contact bounds are out of sync with at_first_contact.h");
+/* 28600 -> 29200 at proximity hubs (the fc_* / area_* tail: fc_kind at 28600,
+ * fc_count at 29192); every prior offset is unchanged. */
+_Static_assert(sizeof(agora_event_t) == 29200,
                "agora_event_t size changed — update the Dart struct and ALL "
                "SEVEN cohort ctypes Ev asserts in lockstep");
 
@@ -153,6 +169,8 @@ void *agora_events_open(const char *recv_queue)
      * the decoders this shim reads through, in the link. Present means on, so
      * a shim without it would silently lose every social event. */
     at_social_link();
+    /* The first-contact decoders (area and contact events) likewise. */
+    at_first_contact_app_link();
     return (void *)at_app_events_open(recv_queue);
 }
 
@@ -300,6 +318,52 @@ int agora_publish_post_label(void *handle, const char *send_queue,
 {
     return at_app_events_publish_post_label((at_app_events_t *)handle, send_queue,
                                             community, post_id, bundle, seq);
+}
+
+int agora_area_publish(void *handle, const char *send_queue, const char *ref,
+                       const char *area, const char *bucket, const char *name)
+{
+    return at_app_area_publish((at_app_events_t *)handle, send_queue, ref, area, bucket, name);
+}
+
+int agora_area_withdraw(void *handle, const char *send_queue, const char *ref,
+                        const char *area)
+{
+    return at_app_area_withdraw((at_app_events_t *)handle, send_queue, ref, area);
+}
+
+int agora_area_lookup(void *handle, const char *send_queue, const char *ref,
+                      const char *area)
+{
+    return at_app_area_lookup((at_app_events_t *)handle, send_queue, ref, area);
+}
+
+int agora_area_request(void *handle, const char *send_queue, const char *ref,
+                       const char *area, const uint8_t *peer_uuid)
+{
+    return at_app_area_request((at_app_events_t *)handle, send_queue, ref, area, peer_uuid);
+}
+
+int agora_contact_accept(void *handle, const char *send_queue, const char *request_ref)
+{
+    return at_app_first_contact_accept((at_app_events_t *)handle, send_queue, request_ref);
+}
+
+int agora_contact_decline(void *handle, const char *send_queue, const char *request_ref)
+{
+    return at_app_first_contact_decline((at_app_events_t *)handle, send_queue, request_ref);
+}
+
+int agora_relay_roster_install(void *handle, const char *send_queue, const char *ref,
+                               const char *roster)
+{
+    return at_app_relay_roster_install((at_app_events_t *)handle, send_queue, ref, roster);
+}
+
+int agora_relay_roster_remove(void *handle, const char *send_queue, const char *ref,
+                              const char *issuer)
+{
+    return at_app_relay_roster_remove((at_app_events_t *)handle, send_queue, ref, issuer);
 }
 
 int agora_set_exact_position(void *handle, const char *send_queue, int opt_in,
@@ -598,6 +662,62 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
                    AGORA_BUSINESS_POST_BUNDLE_MAX);
             e->business_post_bundle[AGORA_BUSINESS_POST_BUNDLE_MAX] = '\0';
             w++;
+            break;
+        }
+        case AT_APP_EVENT_AREA_PUBLISHED: case AT_APP_EVENT_AREA_REFUSED:
+        case AT_APP_EVENT_AREA_WITHDRAWN: case AT_APP_EVENT_AREA_CARD:
+        case AT_APP_EVENT_AREA_DONE: case AT_APP_EVENT_ROSTER_INSTALLED:
+        case AT_APP_EVENT_ROSTER_REFUSED: case AT_APP_EVENT_ROSTER_REMOVED: {
+            const at_app_area_t *a = at_first_contact_area_event(&raw[i]);
+            if (a != NULL) {
+                e->kind = AGORA_EVENT_AREA;
+                e->fc_kind = raw[i].kind;
+                memcpy(e->peer_uuid, a->peer_uuid, 16);
+                memcpy(e->fc_ref, a->ref, sizeof(e->fc_ref));
+                memcpy(e->fc_relay, a->relay, sizeof(e->fc_relay));
+                memcpy(e->fc_reason, a->reason, sizeof(e->fc_reason));
+                memcpy(e->area, a->area, sizeof(e->area));
+                memcpy(e->area_bucket, a->bucket, sizeof(e->area_bucket));
+                memcpy(e->area_name, a->name, sizeof(e->area_name));
+                memcpy(e->area_issuer, a->issuer, sizeof(e->area_issuer));
+                e->fc_seq = a->seq;
+                e->fc_count = a->count;
+                w++;
+            }
+            break;
+        }
+        case AT_APP_EVENT_DIR_PUBLISHED: case AT_APP_EVENT_DIR_REFUSED:
+        case AT_APP_EVENT_DIR_WITHDRAWN: case AT_APP_EVENT_DIR_FOUND:
+        case AT_APP_EVENT_DIR_NOT_FOUND: case AT_APP_EVENT_DIR_REQUEST_SENT:
+        case AT_APP_EVENT_DIR_CONTACT_REQUEST: case AT_APP_EVENT_DIR_ACCEPTED:
+        case AT_APP_EVENT_DIR_DECLINED: {
+            const at_app_directory_t *d = at_first_contact_directory_event(&raw[i]);
+            if (d != NULL) {
+                e->kind = AGORA_EVENT_CONTACT;
+                e->fc_kind = raw[i].kind;
+                memcpy(e->peer_uuid, d->peer_uuid, 16);
+                memcpy(e->fc_ref, d->ref, sizeof(e->fc_ref));
+                memcpy(e->fc_handle, d->handle, sizeof(e->fc_handle));
+                memcpy(e->fc_nickname, d->nickname, sizeof(e->fc_nickname));
+                memcpy(e->fc_relay, d->relay, sizeof(e->fc_relay));
+                memcpy(e->fc_reason, d->reason, sizeof(e->fc_reason));
+                e->fc_seq = d->seq;
+                w++;
+            }
+            break;
+        }
+        case AT_APP_EVENT_FC_INVITATION: case AT_APP_EVENT_FC_HELLO_SENT:
+        case AT_APP_EVENT_FC_REFUSED: case AT_APP_EVENT_FC_ESTABLISHED: {
+            const at_app_first_contact_t *f = at_first_contact_event(&raw[i]);
+            if (f != NULL) {
+                e->kind = AGORA_EVENT_CONTACT;
+                e->fc_kind = raw[i].kind;
+                memcpy(e->peer_uuid, f->peer_uuid, 16);
+                memcpy(e->fc_ref, f->ref, sizeof(e->fc_ref));
+                memcpy(e->fc_nickname, f->nickname, sizeof(e->fc_nickname));
+                e->fc_count = f->reason;    /* at_fc_reason_t on a REFUSED event */
+                w++;
+            }
             break;
         }
         case AT_APP_EVENT_BUSINESS_AD: {

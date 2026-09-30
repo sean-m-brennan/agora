@@ -120,6 +120,20 @@ extern "C" {
 #define AGORA_EVENT_BUSINESS_POST      15
 #define AGORA_EVENT_COMMUNITY_POLICY   16
 #define AGORA_EVENT_POST_LABEL         17
+/* Proximity hubs (Phase 4, SOCIAL_APP_PLAN §4.1). fc_kind is the AT
+ * first-contact kind (at_first_contact.h) the event came from. */
+#define AGORA_EVENT_AREA               18  /* fc_kind 1023..1030: listings, cards, rosters */
+#define AGORA_EVENT_CONTACT            19  /* fc_kind 1000..1003, 1009..1017: asking, answering */
+
+/* First-contact field bounds; MUST match at_first_contact.h. */
+#define AGORA_FC_REF_MAX      63
+#define AGORA_FC_HANDLE_MAX   128
+#define AGORA_FC_NICKNAME_MAX 128
+#define AGORA_FC_RELAY_MAX    79
+#define AGORA_FC_REASON_MAX   31
+#define AGORA_AREA_MAX        7
+#define AGORA_AREA_NAME_MAX   64
+#define AGORA_FC_ISSUER_MAX   64
 
 /**
  * One flattened app event. Field order is ABI-significant: the Dart
@@ -335,7 +349,57 @@ typedef struct {
     double  label_ts;
     int32_t label_hops;
     char    label_bundle[AGORA_POST_LABEL_BUNDLE_MAX + 1];
+    /* Proximity hubs (Phase 4, §4.1). Appended LAST after label_bundle, so every
+     * prior offset is unchanged; the Dart AgoraEvent and the cohort ctypes Ev
+     * mirror this order and re-check the new sizeof.
+     *
+     * AGORA_EVENT_AREA: fc_kind is AT_APP_EVENT_AREA_* / _ROSTER_*. On a CARD,
+     * peer_uuid is the person found, area_bucket their coarse bucket, area_name
+     * what they list under, fc_relay the hub; ask them with agora_area_request.
+     * On DONE, fc_count is how many CARDs the lookup sent and fc_reason
+     * "limited" when a hub rate-limited it. On ROSTER_*, area_issuer is the
+     * community key.
+     *
+     * AGORA_EVENT_CONTACT: fc_kind is AT_APP_EVENT_DIR_* (a request sent, a
+     * CONTACT_REQUEST to answer with agora_contact_accept / _decline by fc_ref,
+     * accepted, declined, refused) or AT_APP_EVENT_FC_* (hello sent,
+     * ESTABLISHED: the two are now direct peers, never group members).
+     * fc_handle is where the requester found us, "area:<area>" for a hub. */
+    int32_t fc_kind;
+    char    fc_ref[AGORA_FC_REF_MAX + 1];
+    char    fc_handle[AGORA_FC_HANDLE_MAX + 1];
+    char    fc_nickname[AGORA_FC_NICKNAME_MAX + 1];
+    char    fc_relay[AGORA_FC_RELAY_MAX + 1];
+    char    fc_reason[AGORA_FC_REASON_MAX + 1];
+    char    area[AGORA_AREA_MAX + 1];
+    char    area_bucket[AGORA_AREA_MAX + 1];
+    char    area_name[AGORA_AREA_NAME_MAX + 1];
+    char    area_issuer[AGORA_FC_ISSUER_MAX + 1];
+    int64_t fc_seq;
+    int32_t fc_count;
 } agora_event_t;
+
+/* ---- Proximity hubs (Phase 4, §4.1). Each needs first contact on in the
+ * daemon (AT_FIRST_CONTACT=1) and answers with AGORA_EVENT_AREA / _CONTACT. */
+/** List us in @p area at its hubs, under @p bucket (inside it) and @p name. */
+int agora_area_publish(void *handle, const char *send_queue, const char *ref,
+                       const char *area, const char *bucket, const char *name);
+int agora_area_withdraw(void *handle, const char *send_queue, const char *ref,
+                        const char *area);
+/** Who else is listed in @p area (only while we are). */
+int agora_area_lookup(void *handle, const char *send_queue, const char *ref,
+                      const char *area);
+/** Ask @p peer_uuid (16 bytes), found in @p area, to become a contact. */
+int agora_area_request(void *handle, const char *send_queue, const char *ref,
+                       const char *area, const uint8_t *peer_uuid);
+/** Answer a CONTACT_REQUEST, by the fc_ref it carried. */
+int agora_contact_accept(void *handle, const char *send_queue, const char *request_ref);
+int agora_contact_decline(void *handle, const char *send_queue, const char *request_ref);
+/** Trust a community's relay roster (the file text a verified policy carries). */
+int agora_relay_roster_install(void *handle, const char *send_queue, const char *ref,
+                               const char *roster);
+int agora_relay_roster_remove(void *handle, const char *send_queue, const char *ref,
+                              const char *issuer);
 
 /** Set $AUTONOMOUS_TRUST_ROOT for THIS process, so the app-events client below
  *  resolves its queue sockets under the same $root/var/at/ as the `agorad`

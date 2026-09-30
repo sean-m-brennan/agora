@@ -307,11 +307,24 @@ class Ev(ctypes.Structure):
         ("label_ts", ctypes.c_double),
         ("label_hops", ctypes.c_int32),
         ("label_bundle", ctypes.c_char * (1536 + 1)),
+        # Proximity hubs (29200): the fc_* / area_* tail, appended last.
+        ("fc_kind", ctypes.c_int32),
+        ("fc_ref", ctypes.c_char * (63 + 1)),
+        ("fc_handle", ctypes.c_char * (128 + 1)),
+        ("fc_nickname", ctypes.c_char * (128 + 1)),
+        ("fc_relay", ctypes.c_char * (79 + 1)),
+        ("fc_reason", ctypes.c_char * (31 + 1)),
+        ("area", ctypes.c_char * (7 + 1)),
+        ("area_bucket", ctypes.c_char * (7 + 1)),
+        ("area_name", ctypes.c_char * (64 + 1)),
+        ("area_issuer", ctypes.c_char * (64 + 1)),
+        ("fc_seq", ctypes.c_int64),
+        ("fc_count", ctypes.c_int32),
     ]
 
 # ABI guard: MUST equal sizeof(agora_event_t) in at_agora_shim.h. A silent drift
 # here would decode every field past the drift point as garbage.
-assert ctypes.sizeof(Ev) == 28600, f"Ev size {ctypes.sizeof(Ev)} != 28600 (ABI drift)"
+assert ctypes.sizeof(Ev) == 29200, f"Ev size {ctypes.sizeof(Ev)} != 29200 (ABI drift)"
 
 EV_PEER, EV_POST, EV_POLICY, EV_LABEL = 1, 9, 16, 17
 
@@ -689,21 +702,24 @@ def cmd_label(state, shim, root, post_id, labels, seq, timeout):
 
 def cmd_verdicts(policy_path, posts_path, labels_path, out_path):
     """The verdict for each received post under a policy, computed exactly as
-    the app computes it: the reader's own count of each author's posts today,
-    and every label received for the post."""
+    the app computes it: each author's place among their posts in the community
+    that UTC day, by the posts' own timestamps (post id breaks ties) and not by
+    the order received, and every label received for the post."""
     e = Ethne()
     policy = open(policy_path).read()
     posts = json.load(open(posts_path))
     labels = json.load(open(labels_path)) if labels_path != "-" and os.path.exists(labels_path) else []
-    counts, out = {}, []
+    days, out = {}, []
     for p in posts:
-        day = time.strftime("%Y-%m-%d", time.gmtime(p["ts"]))
-        key = (p["community"], p["author"], day)
-        counts[key] = counts.get(key, 0) + 1
+        key = (p["community"], p["author"], time.strftime("%Y-%m-%d", time.gmtime(p["ts"])))
+        days.setdefault(key, []).append((p["ts"], p["post_id"]))
+    for p in posts:
+        key = (p["community"], p["author"], time.strftime("%Y-%m-%d", time.gmtime(p["ts"])))
+        index = sorted(days[key]).index((p["ts"], p["post_id"])) + 1
         v = json.loads(e.call_out("ethne_content_policy_verdict", json.dumps({
             "policy": policy, "post_id": p["post_id"], "author_labels": p["labels"],
             "labels": labels, "author_tier": 0, "author_operator_bound": False,
-            "author_post_index_today": counts[key]}).encode()))
+            "author_post_index_today": index}).encode()))
         out.append({"body": p["body"], "action": v["action"], "reasons": v["reasons"],
                     "refused": v["labels_refused"]})
         print(f"  {p['body']!r}: {v['action']} "

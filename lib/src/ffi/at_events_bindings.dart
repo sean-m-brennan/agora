@@ -108,6 +108,43 @@ const int agoraEventCommunityPolicy = 16;
 /// only if `EthneFfi.verifyPostLabel` accepts it against the policy you hold.
 const int agoraEventPostLabel = 17;
 
+/// Proximity hubs (Phase 4, SOCIAL_APP_PLAN §4.1): a listing, a card, the end
+/// of a lookup, or a roster installed. [AtRawEvent.fcKind] says which
+/// (the `atArea*` / `atRoster*` kinds below).
+const int agoraEventArea = 18;
+
+/// The contact flow: a request sent, one to answer, accepted, declined, or the
+/// handshake done ([AtRawEvent.fcKind] is one of the `atDir*` / `atFc*` kinds).
+const int agoraEventContact = 19;
+
+/// AT first-contact kinds (at_first_contact.h) carried in [AtRawEvent.fcKind].
+const int atFcHelloSent = 1001;
+const int atFcRefused = 1002;
+const int atFcEstablished = 1003;
+const int atDirRefused = 1010;
+const int atDirRequestSent = 1014;
+const int atDirContactRequest = 1015;
+const int atDirAccepted = 1016;
+const int atDirDeclined = 1017;
+const int atAreaPublished = 1023;
+const int atAreaRefused = 1024;
+const int atAreaWithdrawn = 1025;
+const int atAreaCard = 1026;
+const int atAreaDone = 1027;
+const int atRosterInstalled = 1028;
+const int atRosterRefused = 1029;
+const int atRosterRemoved = 1030;
+
+/// First-contact field bounds. MUST match AGORA_FC_* / AGORA_AREA_*.
+const int agoraFcRefMax = 63;
+const int agoraFcHandleMax = 128;
+const int agoraFcNicknameMax = 128;
+const int agoraFcRelayMax = 79;
+const int agoraFcReasonMax = 31;
+const int agoraAreaMax = 7;
+const int agoraAreaNameMax = 64;
+const int agoraFcIssuerMax = 64;
+
 /// A post's labels joined with ','. MUST match AGORA_POST_LABELS_MAX.
 const int agoraPostLabelsMax = 263;
 
@@ -418,6 +455,45 @@ final class AgoraEvent extends Struct {
 
   @Array(agoraPostLabelBundleMax + 1)
   external Array<Uint8> labelBundle;
+
+  /// Proximity hubs (Phase 4, §4.1). Appended LAST, so every prior offset is
+  /// unchanged (the struct grew 28600 -> 29200). Rides [agoraEventArea] and
+  /// [agoraEventContact]; [fcKind] is the AT first-contact kind.
+  @Int32()
+  external int fcKind;
+
+  @Array(agoraFcRefMax + 1)
+  external Array<Uint8> fcRef;
+
+  @Array(agoraFcHandleMax + 1)
+  external Array<Uint8> fcHandle;
+
+  @Array(agoraFcNicknameMax + 1)
+  external Array<Uint8> fcNickname;
+
+  @Array(agoraFcRelayMax + 1)
+  external Array<Uint8> fcRelay;
+
+  @Array(agoraFcReasonMax + 1)
+  external Array<Uint8> fcReason;
+
+  @Array(agoraAreaMax + 1)
+  external Array<Uint8> area;
+
+  @Array(agoraAreaMax + 1)
+  external Array<Uint8> areaBucket;
+
+  @Array(agoraAreaNameMax + 1)
+  external Array<Uint8> areaName;
+
+  @Array(agoraFcIssuerMax + 1)
+  external Array<Uint8> areaIssuer;
+
+  @Int64()
+  external int fcSeq;
+
+  @Int32()
+  external int fcCount;
 }
 
 /// A pure-Dart copy of one decoded event. Decoupled from native memory so it
@@ -488,6 +564,18 @@ class AtRawEvent {
     this.labelTs = 0,
     this.labelHops = 0,
     this.labelBundle = '',
+    this.fcKind = 0,
+    this.fcRef = '',
+    this.fcHandle = '',
+    this.fcNickname = '',
+    this.fcRelay = '',
+    this.fcReason = '',
+    this.area = '',
+    this.areaBucket = '',
+    this.areaName = '',
+    this.areaIssuer = '',
+    this.fcSeq = 0,
+    this.fcCount = 0,
   });
 
   final int kind;
@@ -664,6 +752,25 @@ class AtRawEvent {
   final double labelTs;
   final int labelHops;
   final String labelBundle;
+
+  /// [agoraEventArea] / [agoraEventContact] (proximity hubs). [fcKind] is the
+  /// AT kind. On an area CARD, [uuid] is the person found, [areaBucket] their
+  /// coarse bucket, [areaName] what they list under, [fcRelay] the hub. On a
+  /// CONTACT_REQUEST, [fcRef] is what to answer with and [fcHandle] where they
+  /// found us ("area:<area>" for a hub). On ESTABLISHED the two are direct
+  /// peers, never group members.
+  final int fcKind;
+  final String fcRef;
+  final String fcHandle;
+  final String fcNickname;
+  final String fcRelay;
+  final String fcReason;
+  final String area;
+  final String areaBucket;
+  final String areaName;
+  final String areaIssuer;
+  final int fcSeq;
+  final int fcCount;
 }
 
 typedef _SetRootC = Void Function(Pointer<Utf8>);
@@ -754,6 +861,22 @@ typedef _UnfollowCommunityC = Int32 Function(
     Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
 typedef _UnfollowCommunityDart = int Function(
     Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
+
+/// Senders taking the send queue and two / three / four strings.
+typedef _Str2C = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _Str2Dart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _Str3C = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _Str3Dart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _Str5C = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>,
+    Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _Str5Dart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>,
+    Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _AreaRequestC = Int32 Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Utf8>, Pointer<Utf8>, Pointer<Uint8>);
+typedef _AreaRequestDart = int Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Utf8>, Pointer<Utf8>, Pointer<Uint8>);
 
 typedef _PublishPostLabelC = Int32 Function(Pointer<Void>, Pointer<Utf8>,
     Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Int64);
@@ -979,6 +1102,22 @@ class AtEvents {
   static final _UnfollowCommunityDart _unfollowCommunity =
       _lib.lookupFunction<_UnfollowCommunityC, _UnfollowCommunityDart>(
           'agora_unfollow_community');
+  static final _Str5Dart _areaPublish =
+      _lib.lookupFunction<_Str5C, _Str5Dart>('agora_area_publish');
+  static final _Str3Dart _areaWithdraw =
+      _lib.lookupFunction<_Str3C, _Str3Dart>('agora_area_withdraw');
+  static final _Str3Dart _areaLookup =
+      _lib.lookupFunction<_Str3C, _Str3Dart>('agora_area_lookup');
+  static final _AreaRequestDart _areaRequest =
+      _lib.lookupFunction<_AreaRequestC, _AreaRequestDart>('agora_area_request');
+  static final _Str2Dart _contactAccept =
+      _lib.lookupFunction<_Str2C, _Str2Dart>('agora_contact_accept');
+  static final _Str2Dart _contactDecline =
+      _lib.lookupFunction<_Str2C, _Str2Dart>('agora_contact_decline');
+  static final _Str3Dart _rosterInstall =
+      _lib.lookupFunction<_Str3C, _Str3Dart>('agora_relay_roster_install');
+  static final _Str3Dart _rosterRemove =
+      _lib.lookupFunction<_Str3C, _Str3Dart>('agora_relay_roster_remove');
   static final _PublishPostLabelDart _publishPostLabel =
       _lib.lookupFunction<_PublishPostLabelC, _PublishPostLabelDart>(
           'agora_publish_post_label');
@@ -1243,6 +1382,69 @@ class AtEvents {
       calloc.free(b);
     }
   }
+
+  /// Run [f] over native copies of [strs], freeing them after.
+  int _withStrs(List<String> strs, int Function(List<Pointer<Utf8>>) f) {
+    final ps = [for (final s in strs) s.toNativeUtf8()];
+    try {
+      return f(ps);
+    } finally {
+      for (final p in ps) {
+        calloc.free(p);
+      }
+    }
+  }
+
+  /// List us in [area] at its hubs, under our coarse [bucket] (inside it) and
+  /// [name]. Needs first contact on in the daemon. Answered per hub with an
+  /// [agoraEventArea] PUBLISHED or REFUSED; refreshed while listed.
+  int areaPublish(String sendQueue, String ref, String area, String bucket,
+          String name) =>
+      _withStrs([sendQueue, ref, area, bucket, name],
+          (p) => _areaPublish(_handle, p[0], p[1], p[2], p[3], p[4]));
+
+  /// Stop listing us in [area].
+  int areaWithdraw(String sendQueue, String ref, String area) =>
+      _withStrs([sendQueue, ref, area],
+          (p) => _areaWithdraw(_handle, p[0], p[1], p[2]));
+
+  /// Who else is listed in [area]: one CARD per person, then DONE. A hub answers
+  /// only while we are listed there ourselves.
+  int areaLookup(String sendQueue, String ref, String area) =>
+      _withStrs([sendQueue, ref, area],
+          (p) => _areaLookup(_handle, p[0], p[1], p[2]));
+
+  /// Ask [peerUuid] (16 bytes), found by a lookup of [area], to become a
+  /// contact. Answered with [agoraEventContact] events.
+  int areaRequest(String sendQueue, String ref, String area, List<int> peerUuid) {
+    final u = calloc<Uint8>(16);
+    try {
+      for (var i = 0; i < 16; i++) {
+        u[i] = i < peerUuid.length ? peerUuid[i] : 0;
+      }
+      return _withStrs(
+          [sendQueue, ref, area], (p) => _areaRequest(_handle, p[0], p[1], p[2], u));
+    } finally {
+      calloc.free(u);
+    }
+  }
+
+  /// Accept / decline a CONTACT_REQUEST, by the [AtRawEvent.fcRef] it carried.
+  int contactAccept(String sendQueue, String requestRef) =>
+      _withStrs([sendQueue, requestRef], (p) => _contactAccept(_handle, p[0], p[1]));
+  int contactDecline(String sendQueue, String requestRef) =>
+      _withStrs([sendQueue, requestRef], (p) => _contactDecline(_handle, p[0], p[1]));
+
+  /// Trust a community's relay [roster] (the file text a VERIFIED policy
+  /// carries): the node pins its issuer and registers with its hubs.
+  int relayRosterInstall(String sendQueue, String ref, String roster) =>
+      _withStrs([sendQueue, ref, roster],
+          (p) => _rosterInstall(_handle, p[0], p[1], p[2]));
+
+  /// Stop trusting [issuer]'s roster (hex key).
+  int relayRosterRemove(String sendQueue, String ref, String issuer) =>
+      _withStrs([sendQueue, ref, issuer],
+          (p) => _rosterRemove(_handle, p[0], p[1], p[2]));
 
   /// Stop following [community]. Returns 0, negative on error.
   int unfollowCommunity(String sendQueue, String community) {
@@ -1575,6 +1777,18 @@ class AtEvents {
           labelTs: e.labelTs,
           labelHops: e.labelHops,
           labelBundle: _boundedString(e.labelBundle, agoraPostLabelBundleMax),
+          fcKind: e.fcKind,
+          fcRef: _boundedString(e.fcRef, agoraFcRefMax),
+          fcHandle: _boundedString(e.fcHandle, agoraFcHandleMax),
+          fcNickname: _boundedString(e.fcNickname, agoraFcNicknameMax),
+          fcRelay: _boundedString(e.fcRelay, agoraFcRelayMax),
+          fcReason: _boundedString(e.fcReason, agoraFcReasonMax),
+          area: _boundedString(e.area, agoraAreaMax),
+          areaBucket: _boundedString(e.areaBucket, agoraAreaMax),
+          areaName: _boundedString(e.areaName, agoraAreaNameMax),
+          areaIssuer: _boundedString(e.areaIssuer, agoraFcIssuerMax),
+          fcSeq: e.fcSeq,
+          fcCount: e.fcCount,
         );
       }, growable: false);
     } finally {

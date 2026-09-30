@@ -50,10 +50,12 @@ class CommunityPolicy {
     required this.labels,
     required this.moderators,
     required this.bundle,
+    this.hubRoster,
+    this.hubAreas = const {},
   });
 
   /// From what `EthneFfi.verifyContentPolicy` returned for [bundle]:
-  /// `{community_did, seq, policy, moderators}`.
+  /// `{community_did, seq, policy, moderators, hubs, hub_areas}`.
   factory CommunityPolicy.fromVerified(
       Map<String, dynamic> read, String bundle) {
     final p = (read['policy'] as Map?)?.cast<String, dynamic>() ?? const {};
@@ -75,6 +77,11 @@ class CommunityPolicy {
           .whereType<String>()
           .toList(growable: false),
       bundle: bundle,
+      hubRoster: read['hubs'] as String?,
+      hubAreas: {
+        for (final e in ((read['hub_areas'] as Map?) ?? const {}).entries)
+          '${e.key}': [for (final a in (e.value as List? ?? const [])) '$a'],
+      },
     );
   }
 
@@ -94,6 +101,19 @@ class CommunityPolicy {
   /// The signed artifact itself, exactly as it verified. What the verdict and
   /// label checks are run against, and what this node carries if it follows.
   final String bundle;
+
+  /// The community's relay roster (Ethne D36/D38), AT's signed file text, when
+  /// the policy carries one: installed into the node when this reader follows,
+  /// so it registers with the community's area hubs. Verified with the policy.
+  final String? hubRoster;
+
+  /// Each area hub the roster names (its relay hint) and the geohash areas it
+  /// serves. Empty when the community runs none.
+  final Map<String, List<String>> hubAreas;
+
+  /// Every area any of the community's hubs serves, sorted, without repeats.
+  List<String> get areas =>
+      ({for (final l in hubAreas.values) ...l}.toList()..sort());
 
   /// The policy as Ethne's `ContentPolicy` JSON, for an amendment.
   Map<String, dynamic> get rules => {
@@ -224,8 +244,8 @@ class CommunityBook {
 
   final Map<String, Map<String, HeldLabel>> _labelsByPost = {};
 
-  /// (community, author, UTC day) -> the post ids in the order received.
-  final Map<String, List<String>> _postsByAuthorDay = {};
+  /// (community, author, UTC day) -> post id -> the post's own timestamp.
+  final Map<String, Map<String, double>> _postsByAuthorDay = {};
 
   /// Take in a verified policy. Returns true when it is NEWER than the one
   /// followed for its community — the caller then hands the newer bundle to the
@@ -270,20 +290,39 @@ class CommunityBook {
           if (l.communityDid == communityDid) l.bundle,
       ];
 
+  /// Count [post] among its author's posts in its community on its UTC day.
+  /// Called as each post is received — before any verdict — so a verdict never
+  /// ranks a post against a partial day. Idempotent.
+  void notePost(Post post) {
+    _postsByAuthorDay
+        .putIfAbsent(_dayKey(post), () => {})
+        .putIfAbsent(post.postId, () => post.ts);
+  }
+
   /// The 1-based place of [post] among its author's posts in its community on
-  /// the UTC day it was made, as this reader received them. Idempotent: a post
-  /// keeps the place it got first.
+  /// the UTC day it was made, ordered by each post's own timestamp (post id
+  /// breaks ties) — never by arrival, which relay and backfill reorder, so
+  /// every follower ranks the same posts the same way. A post that arrives late
+  /// but was made earlier takes its place and moves the later ones down.
   int indexToday(Post post) {
+    notePost(post);
+    final posts = _postsByAuthorDay[_dayKey(post)]!;
+    final ts = posts[post.postId]!;
+    var before = 0;
+    for (final e in posts.entries) {
+      if (e.value < ts || (e.value == ts && e.key.compareTo(post.postId) < 0)) {
+        before++;
+      }
+    }
+    return before + 1;
+  }
+
+  static String _dayKey(Post post) {
     final day = DateTime.fromMillisecondsSinceEpoch((post.ts * 1000).round(),
             isUtc: true)
         .toIso8601String()
         .substring(0, 10);
-    final key = '${post.community}|${post.authorHex}|$day';
-    final ids = _postsByAuthorDay.putIfAbsent(key, () => []);
-    final at = ids.indexOf(post.postId);
-    if (at >= 0) return at + 1;
-    ids.add(post.postId);
-    return ids.length;
+    return '${post.community}|${post.authorHex}|$day';
   }
 
   /// The policy to apply to a post made in [did], or null when this reader

@@ -73,11 +73,11 @@ void main() {
   test('AgoraEvent matches sizeof(agora_event_t)', () {
     // Grew 8024 -> 11288 with the P3.2 business tail, 11288 -> 17872 with the
     // P3.3 co-signing tail, 17872 -> 22152 with the P3.4 business-post tail,
-    // 22152 -> 22168 with the P4.1 moderation tail, and 22168 -> 28600 with
-    // the Phase 4 communities tail. When this fails, the C struct moved:
+    // 22152 -> 22168 with the P4.1 moderation tail, 22168 -> 28600 with the
+    // Phase 4 communities tail, and 28600 -> 29200 with the proximity-hub tail. When this fails, the C struct moved:
     // update at_agora_shim.c's _Static_assert, ALL SEVEN cohort ctypes Ev
     // asserts, and this one TOGETHER, and check that only the tail grew.
-    expect(sizeOf<AgoraEvent>(), 28600,
+    expect(sizeOf<AgoraEvent>(), 29200,
         reason: 'agora_event_t drift — poll() would misread every field '
             'past the drift point');
   });
@@ -94,6 +94,8 @@ void main() {
     const blockedOffset = 22149; // P4.1, measured from the C compiler
     const postCommunityOffset = 22168; // Phase 4 communities, measured
     const labelBundleOffset = 27060; // Phase 4 communities, measured
+    const areaNameOffset = 29054; // proximity hubs, measured
+    const fcCountOffset = 29192; // proximity hubs, measured
     final mem = calloc<Uint8>(sizeOf<AgoraEvent>());
     try {
       mem[businessBundleOffset] = 0x41; // 'A'
@@ -107,6 +109,9 @@ void main() {
       mem[postCommunityOffset + 1] = 0x00;
       mem[labelBundleOffset] = 0x65; // 'e'
       mem[labelBundleOffset + 1] = 0x00;
+      mem[areaNameOffset] = 0x66; // 'f'
+      mem[areaNameOffset + 1] = 0x00;
+      mem[fcCountOffset] = 0x07;
       final ev = mem.cast<AgoraEvent>().ref;
       expect(ev.businessBundle[0], 0x41,
           reason: 'business_bundle moved — a later tail was not appended');
@@ -120,6 +125,9 @@ void main() {
           reason: 'post_community is not where the C struct puts it');
       expect(ev.labelBundle[0], 0x65,
           reason: 'label_bundle is not where the C struct puts it');
+      expect(ev.areaName[0], 0x66,
+          reason: 'area_name is not where the C struct puts it');
+      expect(ev.fcCount, 7, reason: 'fc_count is not where the C struct puts it');
     } finally {
       calloc.free(mem);
     }

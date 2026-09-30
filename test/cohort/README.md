@@ -45,6 +45,7 @@ Exit status is 0 on PASS and non-zero on the first failed phase, except for
 | `moderation_cohort.sh` | 3 | — | P4.1: block, report and the expulsion ceiling between real nodes |
 | `partition_cohort.sh` | 7 | — | Phase 4 DDIL: a 3+2 split keeps both islands working, only the majority admits or finalizes, and the heal loses no post (store-and-forward) and no transaction (re-proposal) |
 | `community_policy_cohort.sh` | 4 | Ethne | Phase 4 communities: a policy the roll set is carried by members, verified on arrival, and applied only by a follower; a moderator's label reaches followers only; loosening needs more than a majority; an unseated moderator stops counting |
+| `hub_cohort.sh` | 5, two segments | Ethne | Phase 4 proximity hubs: two islands with no route between them meet at their community's area hub. The roll seats the hub, its roster rides inside the policy, only people listed in the area see who is, a listing outside the hub's area is refused, a request becomes a direct peer only on the other's yes, and withdrawing takes effect at once |
 
 ### `two_node_cohort.sh`
 
@@ -265,9 +266,9 @@ All options are environment variables.
 | `SUBNET` | per script, below | all but `drive_ethne_half` | First three octets of the /24. Each script has its own subnet and bridge name. |
 | `GEO` | `u4pruy` | 3-node cohorts | The shared coarse geohash bucket the nodes advertise |
 | `AGORA_DIR` | the script's `../..` | all | The agora checkout to test |
-| `AGORA_ETHNE_PATH` | `native/build/libethne_agora.so` | business, business_post, staff, drive_ethne_half, community_policy | The Ethne cdylib |
+| `AGORA_ETHNE_PATH` | `native/build/libethne_agora.so` | business, business_post, staff, drive_ethne_half, community_policy, hub | The Ethne cdylib |
 | `DOCKER_IMAGE` | `ubuntu:26.04` | 3-node cohorts | Image for the docker backend. The host-built `agorad` is bind-mounted and its non-base libraries are staged beside it, so a stock image works. `Dockerfile.node` builds an alternative with those libraries installed. Either way, the base must match the host's Ubuntu release. |
-| `AGORA_COHORT_RUN` | see below | business_post, reputation, moderation, partition, staff, community_policy | Run directory. Set a short path (e.g. `/tmp/ag-$$`) when a deep checkout makes the node socket paths exceed 108 bytes; the preflight refuses and says so. netns only: docker can bind-mount only paths it shares with the daemon. |
+| `AGORA_COHORT_RUN` | see below | business_post, reputation, moderation, partition, staff, community_policy, hub | Run directory. Set a short path (e.g. `/tmp/ag-$$`) when a deep checkout makes the node socket paths exceed 108 bytes; the preflight refuses and says so. netns only: docker can bind-mount only paths it shares with the daemon. |
 
 ### Per script
 
@@ -281,6 +282,7 @@ All options are environment variables.
 | `reputation_cohort.sh` | 90 | `10.9.4` | `CHECKPOINT_SEC` (the nodes' `AT_REP_CHECKPOINT_SEC`, default 20; production is 300) |
 | `partition_cohort.sh` | 120 | `10.9.6` | `GATE_WINDOW` (default 20); `DIGEST_SEC` (the nodes' `AT_SOCIAL_DIGEST_SEC`, default 10; the digest rides identity's ~20 s sweep, so ~20 s is the real floor); `NEUTRAL`, `RESCORE_SEC`, `CHECKPOINT_SEC` (as moderation) |
 | `community_policy_cohort.sh` | 120 | `10.9.7` | `GATE_WINDOW` (how long `dee` must see no label, default 30); `POLICY_SEC` (the nodes' `AT_SOCIAL_POLICY_SEC`, how often a follower re-carries its policy, default 10); `LOG_LEVEL` (default 2) |
+| `hub_cohort.sh` | 120 | `10.9.8` + `10.9.9` (`SUBNET_A`, `SUBNET_B`) | `POLICY_SEC` (as community_policy, default 10); `LOG_LEVEL` (default 2). Bridges `agbr8` + `agbr9`; the hub has a leg on each with `ip_forward=0` |
 | `moderation_cohort.sh` | 90 | `10.9.5` | `GATE_WINDOW` (how long a negative waits, default 20); `NEUTRAL` (`AT_REP_NEUTRAL`, default 0.70); `RESCORE_SEC` (`AT_REP_RESCORE_SEC`, default 5); `CHECKPOINT_SEC` (default 20) |
 
 ## Where the evidence goes

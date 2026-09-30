@@ -32,16 +32,17 @@ use en_charter::{
     affirmation_state, assemble, charter_state, check_authority, describe_guardian_change,
     didkey_resolver, envoy_state, guardian_state,
     majority, pending,
-    check_label, content_policy_state, verify_all, Affirmation, AffirmationKind, CharterEntry,
+    check_label, content_policy_state, is_geohash_area, rendezvous_state, verify_all,
+    RELAY_AREAS_MAX, Affirmation, AffirmationKind, CharterEntry,
     Commitment, ContentPolicy, ContentPolicyAmendment, Derivation, LabelAction, Office,
     OfficeChange, OfficeKind,
     EnvoyAuthorization,
     EnvoyKind, FoundingProposal, GuardianChange, GuardianEvidence, GuardianKind, MemberReading,
-    MembershipChange, MembershipKind, Movement, Observation, PolityCharter,
+    MembershipChange, MembershipKind, Movement, Observation, PolityCharter, RelayEndpoint,
     RiteMovement, Substrate,
 };
 use en_core::{keys, time, Alg, Cid, DidKey, PrivKey, PubKey, Signed, Timestamp};
-use en_uplift::{community_identity, envoy_delegation, member_roll};
+use en_uplift::{community_identity, envoy_delegation, member_roll, rendezvous_roster};
 use kc_core::canonical;
 use kc_identity::{MemberRoll, SpeakerDelegation};
 use serde::{Deserialize, Serialize};
@@ -193,6 +194,38 @@ fn gen_keypair() -> Result<String, String> {
 #[no_mangle]
 pub unsafe extern "C" fn ethne_keypair_generate(out: *mut *mut c_char) -> i32 {
     match gen_keypair().and_then(|s| set_out(out, s)) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+/// The Ethne keypair of an AT node: its own ed25519 signing seed (64 hex, as
+/// AT's identity file holds it). A rendezvous operator's member key IS its
+/// node's AT key (Ethne D36), so the relay a roster pins is the one that proves
+/// itself with that key. Writes `{"did","priv","pub"}` as `ethne_keypair_generate`.
+///
+/// # Safety
+/// `seed_hex`/`out` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_keypair_from_seed(seed_hex: *const c_char, out: *mut *mut c_char) -> i32 {
+    let run = || -> Result<(), String> {
+        let seed = hex::decode(arg_str(seed_hex)?).map_err(|_| "seed is not hex")?;
+        if seed.len() != 32 {
+            return Err("an ed25519 seed is 32 bytes".into());
+        }
+        let sk = PrivKey { alg: Alg::Ed25519, bytes: seed };
+        let pk = keys::public_of(&sk).map_err(|e| e.to_string())?;
+        let did = DidKey::from_pubkey(&pk).map_err(|e| e.to_string())?;
+        set_out(out, serde_json::to_string(&serde_json::json!({
+            "did": did.as_str(),
+            "priv": serde_json::to_value(&sk).map_err(|e| e.to_string())?,
+            "pub": serde_json::to_value(&pk).map_err(|e| e.to_string())?,
+        })).map_err(|e| e.to_string())?)
+    };
+    match run() {
         Ok(()) => 0,
         Err(e) => {
             set_err(e);
@@ -2875,6 +2908,67 @@ struct CommunityPolicy {
     policy: ContentPolicy,
     /// Inducted holders of `Moderator` at minting, sorted by DID.
     moderators: Vec<DidKey>,
+    /// The community's relay roster (Ethne D36/D38), AT's own signed
+    /// `at-relay-roster` file text, when the polity runs relays: how a follower
+    /// learns its community's area hubs. Absent serializes as before, so a policy
+    /// minted without one keeps its bytes and its signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hubs: Option<String>,
+}
+
+/// AT's roster signature domain and body typename (AT relay_rosters.py).
+const ROSTER_DOMAIN: &str = "at-relay-roster-v1|";
+const ROSTER_TYPENAME: &str = "at-relay-roster";
+/// The most relays AT accepts in one roster (en_uplift ROSTER_MAX).
+const ROSTER_RELAYS_MAX: usize = 64;
+
+/// Verify a roster carried inside a policy: signed by the community's own root key
+/// under AT's domain, and shaped as AT will accept it. Returns each hub's areas,
+/// keyed by its relay hint. AT verifies the file again when a follower installs
+/// it; this is the reader's own check, so a bad roster never reaches that far.
+fn read_hub_roster(community: &DidKey, text: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let outer: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("bad hub roster: {e}"))?;
+    let body_str = outer["body"].as_str().ok_or("hub roster has no body")?;
+    let sig_hex = outer["sig"].as_str().ok_or("hub roster has no sig")?;
+    let root = community.to_pubkey().map_err(|e| e.to_string())?;
+    let mut msg = ROSTER_DOMAIN.as_bytes().to_vec();
+    msg.extend_from_slice(body_str.as_bytes());
+    let sig = en_core::Signature {
+        alg: Alg::Ed25519,
+        bytes: hex::decode(sig_hex).map_err(|_| "hub roster sig is not hex")?,
+    };
+    keys::verify(&root, &msg, &sig).map_err(|_| "hub roster is not signed by its community")?;
+    let body: serde_json::Value =
+        serde_json::from_str(body_str).map_err(|e| format!("bad hub roster body: {e}"))?;
+    if body["typename"] != ROSTER_TYPENAME || body["v"] != 1 || !body["seq"].is_u64()
+        || body["issuer"] != hex::encode(&root.bytes)
+    {
+        return Err("hub roster is not this community's AT relay roster".into());
+    }
+    let relays: Vec<&str> = body["relays"]
+        .as_array()
+        .ok_or("hub roster has no relays")?
+        .iter()
+        .map(|r| r.as_str().ok_or("a roster relay is not a string"))
+        .collect::<Result<_, _>>()?;
+    if relays.len() > ROSTER_RELAYS_MAX {
+        return Err("hub roster lists more relays than AT accepts".into());
+    }
+    let mut out = serde_json::Map::new();
+    if let Some(areas) = body.get("areas") {
+        let areas = areas.as_object().ok_or("hub roster areas is not an object")?;
+        for (hint, listed) in areas {
+            let listed = listed.as_array().ok_or("hub areas is not a list")?;
+            if !relays.contains(&hint.as_str()) || listed.is_empty() || listed.len() > RELAY_AREAS_MAX
+                || !listed.iter().all(|a| a.as_str().is_some_and(is_geohash_area))
+            {
+                return Err(format!("hub roster names bad areas for {hint}"));
+            }
+            out.insert(hint.clone(), serde_json::Value::Array(listed.clone()));
+        }
+    }
+    Ok(out)
 }
 
 /// A moderator's labels on one post, in one community.
@@ -3085,6 +3179,71 @@ pub unsafe extern "C" fn ethne_confer_office(a: *mut EthneArchive, spec: *const 
     }
 }
 
+#[derive(Deserialize)]
+struct RelaySpec {
+    polity_did: String,
+    /// The operator, and the declaration's sole signer.
+    member: SignerSpec,
+    at_uuid: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    port: u16,
+    /// Geohash areas the relay is a hub for (D38); empty for a plain relay.
+    #[serde(default)]
+    areas: Vec<String>,
+    #[serde(default)]
+    withdrawn: bool,
+}
+
+fn relay_impl(a: &EthneArchive, spec: &str) -> Result<(), String> {
+    let s: RelaySpec = serde_json::from_str(spec).map_err(|e| format!("bad relay spec: {e}"))?;
+    let record = RelayEndpoint {
+        polity: DidKey::from_str(&s.polity_did).map_err(|e| e.to_string())?,
+        member: DidKey::from_str(&s.member.did).map_err(|e| e.to_string())?,
+        at_uuid: s.at_uuid,
+        host: s.host,
+        port: s.port,
+        declared_at: time::now(),
+        withdrawn: s.withdrawn,
+        areas: s.areas,
+    };
+    // Refused here rather than by the authority pass alone: a declaration AT
+    // could never read would sit in the log doing nothing.
+    record.check_shape()?;
+    let signed = Signed::build(record, &[(s.member.did.as_str(), &s.member.priv_key)])
+        .map_err(|e| e.to_string())?;
+    a.0.lock()
+        .unwrap()
+        .append(CharterEntry::RelayEndpointDeclared(signed))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// A rendezvous operator declares where its relay listens, and which geohash
+/// areas it is a hub for (Ethne D36/D38). `spec` is `{"polity_did","member":
+/// {"did","priv"},"at_uuid","host","port","areas"?,"withdrawn"?}`, signed by the
+/// member alone; the authority pass refuses it unless the member holds
+/// `RendezvousOperator`. A policy minted with `"hubs":true` then carries the
+/// polity's roster to every follower.
+///
+/// # Safety
+/// `a`/`spec` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_declare_relay_endpoint(a: *mut EthneArchive, spec: *const c_char) -> i32 {
+    let run = || -> Result<(), String> {
+        let a = a.as_ref().ok_or("null archive handle")?;
+        relay_impl(a, arg_str(spec)?)
+    };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
 /// Revoke an office. `spec` is `{"polity_did","office","holder_did","rationale"?,
 /// "deciders":[{"did","priv"}…]}`: a majority, the holder excluded.
 ///
@@ -3264,6 +3423,10 @@ struct PolicySignSpec {
     polity_did: String,
     /// The polity's OWN key: the policy is the polity speaking, like its roll.
     root_priv: PrivKey,
+    /// Carry the polity's relay roster (its rendezvous operators and area hubs,
+    /// D36/D38) inside the policy, so followers learn their community's hubs.
+    #[serde(default)]
+    hubs: bool,
 }
 
 fn policy_sign_impl(a: &EthneArchive, spec: &str) -> Result<String, String> {
@@ -3281,11 +3444,23 @@ fn policy_sign_impl(a: &EthneArchive, spec: &str) -> Result<String, String> {
             st.moderators.len()
         ));
     }
+    let seq = guard.iter().count() as u64;
+    // The roster's seq is the log's length too: AT keeps the highest per issuer,
+    // and the log only grows.
+    let hubs = if s.hubs {
+        let charter = find_charter(&guard, &polity).ok_or("no charter")?;
+        let relays = rendezvous_state(&guard, &polity, time::now());
+        let root_pub = keys::public_of(&s.root_priv).map_err(|e| e.to_string())?;
+        Some(rendezvous_roster(charter, &relays, &s.root_priv, &root_pub, seq).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
     let artifact = CommunityPolicy {
         community_did: polity.clone(),
-        seq: guard.iter().count() as u64,
+        seq,
         policy: st.policy,
         moderators: st.moderators,
+        hubs,
     };
     drop(guard);
     let signed = Signed::build(artifact, &[(polity.as_str(), &s.root_priv)]).map_err(|e| e.to_string())?;
@@ -3347,16 +3522,25 @@ fn read_policy(json: &str) -> Result<CommunityPolicy, String> {
     if p.moderators.len() > POLICY_MODERATORS_MAX {
         return Err("policy lists too many moderators".into());
     }
+    if let Some(roster) = &p.hubs {
+        read_hub_roster(&p.community_did, roster)?;
+    }
     Ok(p)
 }
 
 fn policy_verify_impl(json: &str) -> Result<String, String> {
     let p = read_policy(json)?;
+    let hub_areas = match &p.hubs {
+        Some(r) => serde_json::Value::Object(read_hub_roster(&p.community_did, r)?),
+        None => serde_json::json!({}),
+    };
     serde_json::to_string(&serde_json::json!({
         "community_did": p.community_did.as_str(),
         "seq": p.seq,
         "policy": p.policy,
         "moderators": p.moderators.iter().map(DidKey::as_str).collect::<Vec<_>>(),
+        "hubs": p.hubs,
+        "hub_areas": hub_areas,
     }))
     .map_err(|e| e.to_string())
 }
@@ -5171,6 +5355,73 @@ mod tests {
         assert!(policy_verify_impl(&tampered).is_err(), "a reader cannot be handed a looser policy");
     }
 
+    const HUB_UUID: &str = "0f1e2d3c-4b5a-4968-8776-655443322110";
+
+    /// f[3] seated as a rendezvous operator and declared a hub for u4pr.
+    fn seat_hub(a: &EthneArchive, polity: &str, f: &[Ident]) {
+        office_impl(a, &serde_json::json!({
+            "polity_did": polity, "office": "RendezvousOperator", "holder_did": f[3].did,
+            "holder_priv": serde_json::to_value(&f[3].priv_key).unwrap(),
+            "deciders": [signer_json(&f[0]), signer_json(&f[1]), signer_json(&f[2])],
+        }).to_string(), OfficeKind::Confer).expect("confer");
+        relay_impl(a, &serde_json::json!({
+            "polity_did": polity, "member": signer_json(&f[3]), "at_uuid": HUB_UUID,
+            "host": "hub.example.org", "port": 27790, "areas": ["u4pr"],
+        }).to_string()).expect("declare");
+        verify_impl(a).expect("an operator declares its hub");
+    }
+
+    fn policy_with_hubs(a: &EthneArchive, polity: &str, root: &PrivKey) -> String {
+        policy_sign_impl(a, &serde_json::json!({
+            "polity_did": polity, "root_priv": serde_json::to_value(root).unwrap(), "hubs": true,
+        }).to_string()).expect("policy sign")
+    }
+
+    #[test]
+    fn a_policy_carries_the_communitys_hub_roster_to_its_followers() {
+        let (a, polity, root, f) = five_seasoned();
+        seat_hub(&a, &polity, &f);
+        let bundle = policy_with_hubs(&a, &polity, &root);
+        let read: serde_json::Value = serde_json::from_str(&policy_verify_impl(&bundle).unwrap()).unwrap();
+        let roster = read["hubs"].as_str().expect("the roster rides inside");
+        let body: serde_json::Value =
+            serde_json::from_str(serde_json::from_str::<serde_json::Value>(roster).unwrap()["body"]
+                .as_str().unwrap()).unwrap();
+        assert_eq!(body["seq"], read["seq"], "the roster's seq is the log's length too");
+        let (hint, areas) = read["hub_areas"].as_object().unwrap().iter().next().unwrap();
+        assert!(hint.contains(HUB_UUID) && hint.ends_with("@hub.example.org:27790"), "{hint}");
+        assert_eq!(areas, &serde_json::json!(["u4pr"]));
+        // Without asking for hubs the bundle is exactly the D37 one.
+        let plain = policy_now(&a, &polity, &root);
+        assert!(!plain.contains("hubs"));
+        let read: serde_json::Value = serde_json::from_str(&policy_verify_impl(&plain).unwrap()).unwrap();
+        assert!(read["hubs"].is_null() && read["hub_areas"] == serde_json::json!({}));
+    }
+
+    #[test]
+    fn a_policy_carrying_a_roster_it_did_not_sign_is_refused() {
+        let (a, polity, root, f) = five_seasoned();
+        seat_hub(&a, &polity, &f);
+        let bundle = policy_with_hubs(&a, &polity, &root);
+        // Another polity's roster, re-signed into this policy under this root: the
+        // roster's own signature is by the other root, so a reader refuses it.
+        let (b, other, other_root, g) = five_seasoned();
+        seat_hub(&b, &other, &g);
+        let foreign: serde_json::Value = serde_json::from_str(&policy_verify_impl(
+            &policy_with_hubs(&b, &other, &other_root)).unwrap()).unwrap();
+        let mut signed: Signed<CommunityPolicy> = serde_json::from_str(&bundle).unwrap();
+        signed.payload.hubs = Some(foreign["hubs"].as_str().unwrap().to_string());
+        let forged = Signed::build(signed.payload, &[(polity.as_str(), &root)]).unwrap();
+        let e = policy_verify_impl(&serde_json::to_string(&forged).unwrap()).expect_err("foreign roster");
+        assert!(e.contains("not signed by its community"), "{e}");
+        // And a hub whose areas no hub could serve is refused at declaration.
+        let e = relay_impl(&a, &serde_json::json!({
+            "polity_did": polity, "member": signer_json(&f[3]), "at_uuid": HUB_UUID,
+            "host": "hub.example.org", "port": 27790, "areas": ["u4pa"],
+        }).to_string()).expect_err("bad area");
+        assert!(e.contains("geohash"), "{e}");
+    }
+
     #[test]
     fn only_a_listed_moderator_labels() {
         let (a, polity, root, f) = five_seasoned();
@@ -5276,6 +5527,7 @@ mod tests {
                 labels,
             },
             moderators,
+            hubs: None,
         };
         let signed = Signed::build(artifact, &[(polity_did.as_str(), &root)]).unwrap();
         let n = serde_json::to_string(&signed).unwrap().len();

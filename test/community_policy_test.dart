@@ -243,6 +243,29 @@ void main() {
           reason: 'counted per community');
     });
 
+    test('a post is placed by when it was made, not when it arrived', () {
+      final b = CommunityBook();
+      Post post(String id, double ts) => Post(
+          authorUuid: _author,
+          postId: id,
+          seq: 1,
+          ts: ts,
+          requiredTier: 0,
+          body: '',
+          outgoing: false,
+          community: _garden);
+      // Received b, c, then a (a backfilled late), made a, b, c.
+      expect(b.indexToday(post('pb', 1750000001)), 1);
+      expect(b.indexToday(post('pc', 1750000002)), 2);
+      expect(b.indexToday(post('pa', 1750000000)), 1);
+      expect(b.indexToday(post('pb', 1750000001)), 2,
+          reason: 'the earlier post moved b down');
+      expect(b.indexToday(post('pc', 1750000002)), 3);
+      expect(b.indexToday(post('z', 1750000002)), 4,
+          reason: 'post id breaks a timestamp tie');
+      expect(b.indexToday(post('pc', 1750000002)), 3);
+    });
+
     test('restoring re-verifies every bundle', () {
       final b = CommunityBook()
         ..hear(p(3))
@@ -301,7 +324,7 @@ void main() {
       expect(_shown(s), isEmpty);
     });
 
-    test('the daily cap counts this reader\'s arrivals', () {
+    test('the daily cap counts posts by when they were made', () {
       final s = _svc(_FakeCrypto());
       s.ingestEvents([_policyEvent(_bundle(_garden, 3, cap: 2))]);
       s.followCommunity(_garden);
@@ -311,6 +334,20 @@ void main() {
         _postEvent('p3', ts: 1750000003),
       ]);
       expect(_shown(s).toSet(), {'p1', 'p2'});
+    });
+
+    test('a first post that arrives last is still within the cap', () {
+      final s = _svc(_FakeCrypto());
+      s.ingestEvents([_policyEvent(_bundle(_garden, 3, cap: 2))]);
+      s.followCommunity(_garden);
+      s.ingestEvents([
+        _postEvent('p2', ts: 1750000002),
+        _postEvent('p3', ts: 1750000003),
+      ]);
+      expect(_shown(s).toSet(), {'p2', 'p3'});
+      s.ingestEvents([_postEvent('p1', ts: 1750000001)]);
+      expect(_shown(s).toSet(), {'p1', 'p2'},
+          reason: 'the late first post moves p3 over the cap');
     });
 
     test('a warn label shows the post behind its verdict', () {

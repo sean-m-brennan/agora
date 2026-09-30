@@ -7,6 +7,7 @@
 // Hide Flutter's own ConnectionState (FutureBuilder/StreamBuilder) — this file
 // uses the peer-edge ConnectionState from at_peer.dart (Increment 5), and does
 // not use async builders.
+import 'nearby_hubs_page.dart';
 import 'package:flutter/material.dart' hide ConnectionState;
 
 import '../node/peer_stream.dart';
@@ -100,6 +101,23 @@ class _PeopleNearMePageState extends State<PeopleNearMePage> {
             onPressed: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
                 builder: (_) => CommunitiesPage(service: service),
+              ),
+            ),
+          ),
+          ListenableBuilder(
+            listenable: service,
+            builder: (context, _) => IconButton(
+              key: const Key('open-nearby-hubs'),
+              icon: Badge(
+                isLabelVisible: service.hubs.incoming.isNotEmpty,
+                label: Text('${service.hubs.incoming.length}'),
+                child: const Icon(Icons.location_city_outlined),
+              ),
+              tooltip: 'In your city (via hubs)',
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => NearbyHubsPage(service: service),
+                ),
               ),
             ),
           ),

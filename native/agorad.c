@@ -132,6 +132,13 @@ static int ensure_config(void)
                 getenv("AUTONOMOUS_TRUST_ROOT"));
         return 1;
     }
+    /* First contact on by default (an explicit AT_FIRST_CONTACT wins): Agora
+     * finds people nearby at its communities' area hubs and connects through
+     * it (SOCIAL_APP_PLAN Phase 4, §4.1). It registers with no relay until the
+     * app installs a followed community's roster, and AT's own seed list
+     * trusts no release key, so a node that follows no hub community reaches
+     * nobody new. */
+    (void)setenv("AT_FIRST_CONTACT", "1", 0);
     if (makedirs(cfg_dir, 0755) != 0) {
         fprintf(stderr, "agorad: makedirs %s failed: %s\n", cfg_dir, strerror(errno));
         return 1;

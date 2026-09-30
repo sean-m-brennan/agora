@@ -171,6 +171,8 @@ class EthneFfi {
             .lookupFunction<_HandleSpecC, _HandleSpecDart>('ethne_confer_office'),
         _revokeOffice = lib
             .lookupFunction<_HandleSpecC, _HandleSpecDart>('ethne_revoke_office'),
+        _declareRelayEndpoint = lib.lookupFunction<_HandleSpecC, _HandleSpecDart>(
+            'ethne_declare_relay_endpoint'),
         _contentPolicyState = lib
             .lookupFunction<_StateC, _StateDart>('ethne_content_policy_state'),
         _contentPolicySign = lib
@@ -225,6 +227,7 @@ class EthneFfi {
   final _HandleSpecDart _amendContentPolicy;
   final _HandleSpecDart _conferOffice;
   final _HandleSpecDart _revokeOffice;
+  final _HandleSpecDart _declareRelayEndpoint;
   final _StateDart _contentPolicyState;
   final _StateDart _contentPolicySign;
   final _SpecOutDart _contentPolicyVerify;
@@ -1195,11 +1198,36 @@ class EthneArchive {
   String signContentPolicy({
     required String polityDid,
     required EthneKeypair root,
+    bool hubs = false,
   }) =>
       _callSpecOut(_ffi._contentPolicySign, {
         'polity_did': polityDid,
         'root_priv': root.priv,
+        // Carry the polity's relay roster (its area hubs, Ethne D38) inside,
+        // so a follower learns where its community's hubs are.
+        if (hubs) 'hubs': true,
       });
+
+  /// A rendezvous operator ([member], holding `RendezvousOperator`) declares
+  /// where its relay listens and the geohash [areas] it is a hub for (Ethne
+  /// D36/D38). Signed by the member alone.
+  void declareRelayEndpoint({
+    required String polityDid,
+    required EthneKeypair member,
+    required String atUuid,
+    required String host,
+    required int port,
+    List<String> areas = const [],
+  }) {
+    _callSpec(_ffi._declareRelayEndpoint, {
+      'polity_did': polityDid,
+      'member': {'did': member.did, 'priv': member.priv},
+      'at_uuid': atUuid,
+      'host': host,
+      'port': port,
+      'areas': areas,
+    });
+  }
 
   /// The current charter state: `{polity_did, chartered, dissolved, substrate,
   /// commitments, members:[did…]}`.
