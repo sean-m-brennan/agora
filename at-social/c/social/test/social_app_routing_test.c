@@ -45,6 +45,8 @@ DEFINE_TEST(test_every_social_app_verb_is_allowlisted_for_routing)
         AT_APP_REQUEST_COSIGN, AT_APP_RETURN_COSIGN,
         AT_APP_PUBLISH_BUSINESS_POST,
         AT_APP_UNBLOCK, AT_APP_REPORT_PEER,     /* Phase 4 P4.1 */
+        AT_APP_FOLLOW_COMMUNITY, AT_APP_UNFOLLOW_COMMUNITY,
+        AT_APP_PUBLISH_POST_LABEL,              /* Phase 4 communities */
     };
 
     for (size_t i = 0; i < sizeof(app_verbs) / sizeof(app_verbs[0]); i++) {
@@ -81,6 +83,7 @@ DEFINE_TEST(test_every_social_app_event_type_forwards_to_the_app_queue)
         PEER_PROXIMITY_OBSERVED, PEER_BUSINESS_AD_OBSERVED,
         PEER_COSIGN_REQUEST_OBSERVED, PEER_COSIGN_SIG_OBSERVED,
         PEER_BUSINESS_POST_OBSERVED,
+        PEER_COMMUNITY_POLICY_OBSERVED, PEER_POST_LABEL_OBSERVED,
     };
     const size_t n = sizeof(app_types) / sizeof(app_types[0]);
 

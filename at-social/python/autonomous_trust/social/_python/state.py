@@ -135,6 +135,20 @@ class SocialState:
         state.feed_store = OrderedDict()
         state.biz_store = OrderedDict()
         state.last_digest_at: float = 0.0
+        # Communities (Phase 4). communities is what THIS node follows, did ->
+        # {'bundle','seq'} (the policy the app verified and handed us, carried and
+        # persisted; never replaced from the wire). last_policy / last_label are
+        # the observability surfaces for what we HEARD (keyed by DID, and by the
+        # LABELLED post's id). label_store keeps labels for backfill. Twins of C
+        # social_state.communities / last_policy_map / last_label_map /
+        # label_store / seen_policy_ads / seen_post_labels / last_policy_ad_at.
+        state.communities: dict = {}
+        state.last_policy: dict = {}
+        state.last_label: dict = {}
+        state.label_store = OrderedDict()
+        state._seen_policy_ad_ids: list = []
+        state._seen_post_label_ids: list = []
+        state.last_policy_ad_at: float = 0.0
         state.want_sent_at: dict = {}
         state.want_served_at: dict = {}
         # Detached co-signing (Phase 3 P3.3). The most recent ask received from

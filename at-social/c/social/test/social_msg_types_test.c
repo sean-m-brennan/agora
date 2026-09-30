@@ -45,6 +45,8 @@ DEFINE_TEST(test_social_types_are_registered)
         { PEER_COSIGN_REQUEST_OBSERVED, "PEER_COSIGN_REQUEST_OBSERVED" },
         { PEER_COSIGN_SIG_OBSERVED, "PEER_COSIGN_SIG_OBSERVED" },
         { PEER_BUSINESS_POST_OBSERVED, "PEER_BUSINESS_POST_OBSERVED" },
+        { PEER_COMMUNITY_POLICY_OBSERVED, "PEER_COMMUNITY_POLICY_OBSERVED" },
+        { PEER_POST_LABEL_OBSERVED, "PEER_POST_LABEL_OBSERVED" },
     };
     for (size_t i = 0; i < sizeof(social) / sizeof(*social); i++)
     {

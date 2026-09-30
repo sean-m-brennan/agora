@@ -161,7 +161,28 @@ class EthneFfi {
         _rollVerify =
             lib.lookupFunction<_StrC, _StrDart>('ethne_member_roll_verify'),
         _rollVerifyFull = lib.lookupFunction<_HandleSpecC, _HandleSpecDart>(
-            'ethne_member_roll_verify_full');
+            'ethne_member_roll_verify_full'),
+        // Phase 4 — per-community content policy (Ethne D37). The roll sets the
+        // policy; a Moderator labels alone; the verdict is computed here so the
+        // app and the live cohort run the same code.
+        _amendContentPolicy = lib.lookupFunction<_HandleSpecC, _HandleSpecDart>(
+            'ethne_amend_content_policy'),
+        _conferOffice = lib
+            .lookupFunction<_HandleSpecC, _HandleSpecDart>('ethne_confer_office'),
+        _revokeOffice = lib
+            .lookupFunction<_HandleSpecC, _HandleSpecDart>('ethne_revoke_office'),
+        _contentPolicyState = lib
+            .lookupFunction<_StateC, _StateDart>('ethne_content_policy_state'),
+        _contentPolicySign = lib
+            .lookupFunction<_StateC, _StateDart>('ethne_content_policy_sign'),
+        _contentPolicyVerify = lib.lookupFunction<_SpecOutC, _SpecOutDart>(
+            'ethne_content_policy_verify'),
+        _postLabelSign =
+            lib.lookupFunction<_SpecOutC, _SpecOutDart>('ethne_post_label_sign'),
+        _postLabelVerify = lib
+            .lookupFunction<_SpecOutC, _SpecOutDart>('ethne_post_label_verify'),
+        _contentPolicyVerdict = lib.lookupFunction<_SpecOutC, _SpecOutDart>(
+            'ethne_content_policy_verdict');
 
   final _LastErrorC _lastError;
   final _StringFreeDart _stringFree;
@@ -201,6 +222,29 @@ class EthneFfi {
   final _StateDart _rollSign;
   final _StrDart _rollVerify;
   final _HandleSpecDart _rollVerifyFull;
+  final _HandleSpecDart _amendContentPolicy;
+  final _HandleSpecDart _conferOffice;
+  final _HandleSpecDart _revokeOffice;
+  final _StateDart _contentPolicyState;
+  final _StateDart _contentPolicySign;
+  final _SpecOutDart _contentPolicyVerify;
+  final _SpecOutDart _postLabelSign;
+  final _SpecOutDart _postLabelVerify;
+  final _SpecOutDart _contentPolicyVerdict;
+
+  /// A `(spec-string, out-string)` call: encode [spec], run [fn], and return the
+  /// JSON string it emitted.
+  String _specOut(_SpecOutDart fn, String spec) {
+    final s = spec.toNativeUtf8();
+    final out = calloc<Pointer<Utf8>>();
+    try {
+      if (fn(s, out) != 0) throw EthneException(_err());
+      return _takeString(out);
+    } finally {
+      calloc.free(s);
+      calloc.free(out);
+    }
+  }
 
   /// Resolve the library path, or null if not wired (caller then skips).
   static String? resolveLibraryPath() {
@@ -434,6 +478,88 @@ class EthneFfi {
     }
   }
 
+  /// Verify a community's policy artifact (a `Signed<CommunityPolicy>`) and say
+  /// what it holds: `{community_did, seq, policy, moderators}`. Needs no log: the
+  /// community's DID is its root key. Null when it does not verify — the reason
+  /// is in [lastError]. Keep the highest `seq` per community; a newer policy
+  /// replaces an older one whole (Ethne D37).
+  Map<String, dynamic>? verifyContentPolicy(String policyJson) {
+    try {
+      return jsonDecode(_specOut(_contentPolicyVerify, policyJson))
+          as Map<String, dynamic>;
+    } on EthneException {
+      return null;
+    }
+  }
+
+  /// Label post [postId] in [communityDid] as [moderator], returning the
+  /// `Signed<PostLabel>` JSON. An empty [labels] retracts this moderator's
+  /// earlier labels on the post; [seq] must exceed their last label on it.
+  /// Whether the label counts is each reader's call, against the policy they
+  /// hold: it counts only while that policy lists [moderator].
+  String signPostLabel({
+    required String communityDid,
+    required String postId,
+    required List<String> labels,
+    required int seq,
+    required EthneKeypair moderator,
+  }) =>
+      _specOut(
+          _postLabelSign,
+          jsonEncode({
+            'community_did': communityDid,
+            'post_id': postId,
+            'labels': labels,
+            'seq': seq,
+            'moderator': {'did': moderator.did, 'priv': moderator.priv},
+          }));
+
+  /// Verify [labelJson] against [policyJson]: `{moderator_did, community_did,
+  /// post_id, labels, seq, ts}`, or null when it does not verify or its signer
+  /// is not a moderator the policy lists.
+  Map<String, dynamic>? verifyPostLabel({
+    required String labelJson,
+    required String policyJson,
+  }) {
+    try {
+      return jsonDecode(_specOut(_postLabelVerify,
+              jsonEncode({'label': labelJson, 'policy': policyJson})))
+          as Map<String, dynamic>;
+    } on EthneException {
+      return null;
+    }
+  }
+
+  /// How this reader shows one post made in a community it follows:
+  /// `{community_did, seq, action: show|warn|hide, reasons, tags,
+  /// labels_refused}`. Each reason is `{code, …}` with code `operator_unbound`,
+  /// `below_min_tier`, `over_daily_cap` or `label` (with `label`, `action`,
+  /// `by`). [labels] are the moderator labels held for the post, as received;
+  /// ones that do not verify are skipped and counted. The author measures are
+  /// this reader's own: its tier for the author, whether the author is
+  /// operator-bound, and this post's 1-based place among the author's posts in
+  /// the community today (UTC).
+  Map<String, dynamic> contentPolicyVerdict({
+    required String policyJson,
+    required String postId,
+    List<String> authorLabels = const [],
+    List<String> labels = const [],
+    required int authorTier,
+    required bool authorOperatorBound,
+    required int authorPostIndexToday,
+  }) =>
+      jsonDecode(_specOut(
+          _contentPolicyVerdict,
+          jsonEncode({
+            'policy': policyJson,
+            'post_id': postId,
+            'author_labels': authorLabels,
+            'labels': labels,
+            'author_tier': authorTier,
+            'author_operator_bound': authorOperatorBound,
+            'author_post_index_today': authorPostIndexToday,
+          }))) as Map<String, dynamic>;
+
   /// Last native error message (shared across all ethne_agora calls).
   String lastError() => _err();
 }
@@ -517,9 +643,12 @@ class EthneArchive {
   /// person and needs no exchange. [deciderDids] are DIDs **only** — the whole
   /// point is that no private key crosses this boundary.
   ///
-  /// [record] is `'membership'` (`op`: `admit`/`expel`) or `'guardian'`
+  /// [record] is `'membership'` (`op`: `admit`/`expel`), `'guardian'`
   /// (`op`: `designate`/`rotate`/`release`, with [guardianDid] and either
-  /// [evidenceCid] or [unbackedReason] as that op requires). A guardian
+  /// [evidenceCid] or [unbackedReason] as that op requires), `'content_policy'`
+  /// (`op`: `amend`, with [policy]; [memberDid] is unused) or `'office'` (`op`:
+  /// `confer`/`revoke`, with [office]; [memberDid] is the holder, who co-signs a
+  /// conferral). A guardian
   /// exchange reads the log: the evidence must already be in it, and a release
   /// on the guardian's own signature resolves the outgoing guardian from it
   /// rather than taking the caller's word.
@@ -542,6 +671,8 @@ class EthneArchive {
     String? guardianDid,
     String? evidenceCid,
     String? unbackedReason,
+    Map<String, dynamic>? policy,
+    String? office,
   }) =>
       jsonDecode(_callSpecOut(_ffi._pending, {
         'record': record,
@@ -553,6 +684,8 @@ class EthneArchive {
         if (guardianDid != null) 'guardian_did': guardianDid,
         if (evidenceCid != null) 'evidence_cid': evidenceCid,
         if (unbackedReason != null) 'unbacked_reason': unbackedReason,
+        if (policy != null) 'policy': policy,
+        if (office != null) 'office': office,
       })) as Map<String, dynamic>;
 
   /// Close a detached exchange: attach [signatures] and append.
@@ -981,6 +1114,92 @@ class EthneArchive {
       calloc.free(s);
     }
   }
+
+  /// Replace the polity's content policy (Ethne D37), with every decider's key
+  /// in this process — tools and tests; a live roll uses [pendingChange] with
+  /// `record: 'content_policy'`. [policy] is `{operator_bound_required,
+  /// min_tier, daily_post_cap, labels: {label: Allow|Warn|Hide}}`. A majority
+  /// tightens; loosening anything needs a majority + 1, which [verify] decides.
+  void amendContentPolicy({
+    required String polityDid,
+    required Map<String, dynamic> policy,
+    String rationale = '',
+    required List<EthneKeypair> deciders,
+  }) {
+    _callSpec(_ffi._amendContentPolicy, {
+      'polity_did': polityDid,
+      'policy': policy,
+      'rationale': rationale,
+      'deciders': deciders.map((d) => {'did': d.did, 'priv': d.priv}).toList(),
+    });
+  }
+
+  /// Confer [office] (e.g. `'Moderator'`) on [holder]: [deciders] a majority,
+  /// the holder consenting with their own key.
+  void conferOffice({
+    required String polityDid,
+    required String office,
+    required EthneKeypair holder,
+    String rationale = '',
+    required List<EthneKeypair> deciders,
+  }) {
+    _callSpec(_ffi._conferOffice, {
+      'polity_did': polityDid,
+      'office': office,
+      'holder_did': holder.did,
+      'holder_priv': holder.priv,
+      'rationale': rationale,
+      'deciders': deciders.map((d) => {'did': d.did, 'priv': d.priv}).toList(),
+    });
+  }
+
+  /// Revoke [office] from [holderDid]: [deciders] a majority, holder excluded.
+  void revokeOffice({
+    required String polityDid,
+    required String office,
+    required String holderDid,
+    String rationale = '',
+    required List<EthneKeypair> deciders,
+  }) {
+    _callSpec(_ffi._revokeOffice, {
+      'polity_did': polityDid,
+      'office': office,
+      'holder_did': holderDid,
+      'rationale': rationale,
+      'deciders': deciders.map((d) => {'did': d.did, 'priv': d.priv}).toList(),
+    });
+  }
+
+  /// The content policy this log says is in force now: `{policy, set_by,
+  /// moderators}`. Only accepted amendments are read; moderators are inducted
+  /// holders of `Moderator`.
+  Map<String, dynamic> contentPolicyState(String polityDid) {
+    _check();
+    final did = polityDid.toNativeUtf8();
+    final out = calloc<Pointer<Utf8>>();
+    try {
+      if (_ffi._contentPolicyState(_handle, did, out) != 0) {
+        throw EthneException(_ffi._err());
+      }
+      return jsonDecode(_ffi._takeString(out)) as Map<String, dynamic>;
+    } finally {
+      calloc.free(did);
+      calloc.free(out);
+    }
+  }
+
+  /// Mint the polity's policy artifact from this log, now, under [root] — the
+  /// POLITY's own keypair, as for [signMemberRoll]. Its `seq` is the log's
+  /// length, so every later artifact is newer, including one that only changes
+  /// who moderates.
+  String signContentPolicy({
+    required String polityDid,
+    required EthneKeypair root,
+  }) =>
+      _callSpecOut(_ffi._contentPolicySign, {
+        'polity_did': polityDid,
+        'root_priv': root.priv,
+      });
 
   /// The current charter state: `{polity_did, chartered, dissolved, substrate,
   /// commitments, members:[did…]}`.

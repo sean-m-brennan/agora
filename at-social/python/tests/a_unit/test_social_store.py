@@ -40,7 +40,7 @@ import pytest
 
 from autonomous_trust.social._python.social_store import (
     SOCIAL_FILENAME, SOCIAL_STORE_VERSION,
-    social_store_load, social_store_save)
+    social_store_load, social_store_load_communities, social_store_save)
 
 # Deliberately NOT in sorted order: the writer must sort them, and seeding them
 # already-sorted would let an unsorted writer pass. The timestamps differ in
@@ -142,3 +142,48 @@ def test_an_entry_missing_its_timestamp_still_blocks(tmp_path):
     back = social_store_load(str(tmp_path))
     assert UUID_A in back
     assert back[UUID_A] == 0.0
+
+
+# Phase 4: the followed communities, beside the blocks. The same golden C
+# test/social_store_test.c pins as GOLDEN_WITH_COMMUNITY.
+DID_A = 'did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ'
+GOLDEN_WITH_COMMUNITY = (
+    '{\n'
+    '  "blocks": {\n'
+    '    "' + UUID_A + '": {\n'
+    '      "at": 1750000001.5,\n'
+    '      "reason": ""\n'
+    '    },\n'
+    '    "' + UUID_B + '": {\n'
+    '      "at": 1750000000.0,\n'
+    '      "reason": ""\n'
+    '    }\n'
+    '  },\n'
+    '  "communities": {\n'
+    '    "' + DID_A + '": {\n'
+    '      "bundle": "{\\"p\\":1}",\n'
+    '      "seq": 7\n'
+    '    }\n'
+    '  },\n'
+    '  "version": 1\n'
+    '}'
+)
+
+
+def test_followed_communities_are_written_and_read_back(tmp_path):
+    communities = {DID_A: {'bundle': '{"p":1}', 'seq': 7}}
+    social_store_save(_seed(), str(tmp_path), communities=communities)
+    raw = (tmp_path / SOCIAL_FILENAME).read_bytes()
+    assert raw.decode('utf-8') == GOLDEN_WITH_COMMUNITY
+    assert social_store_load_communities(str(tmp_path)) == communities
+    assert len(social_store_load(str(tmp_path))) == 2
+    # Following nothing writes the old document exactly.
+    social_store_save(_seed(), str(tmp_path), communities={})
+    assert (tmp_path / SOCIAL_FILENAME).read_bytes().decode('utf-8') == GOLDEN
+
+
+def test_a_malformed_communities_key_is_refused(tmp_path):
+    (tmp_path / SOCIAL_FILENAME).write_text(
+        '{"version": 1, "blocks": {}, "communities": {"x": {"seq": "7"}}}')
+    with pytest.raises(ValueError):
+        social_store_load_communities(str(tmp_path))

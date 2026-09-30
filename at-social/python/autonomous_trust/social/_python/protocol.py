@@ -135,6 +135,15 @@ class SocialProtocol(Protocol):
     post_digest = 'peer_post_digest'      # msg.obj <- json {'feed': [ids], 'biz': [ids]}
     post_want = 'peer_post_want'          # msg.obj <- json {'feed': [ids], 'biz': [ids]}
     post_backfill = 'peer_post_backfill'  # msg.obj <- json {'kind': 'feed'|'biz', 'post': {...}}
+    # COMMUNITIES (Phase 4, Ethne D37). A community's root-signed content
+    # policy, CARRIED IN THE FIRST PERSON by a node that follows it (never
+    # relayed, like a business ad), and a moderator's member-signed labels on
+    # one post (relayed a bounded number of hops by followers, like a business
+    # post). Both bundles are opaque to this runtime; the app verifies them and
+    # decides what a label does. Group-encrypted, so NOT in UNENCRYPTED_VERBS.
+    # Twins of C ID_COMMUNITY_POLICY / ID_POST_LABEL.
+    community_policy = 'peer_community_policy'  # msg.obj <- json {carrier,carrier_pk,community,seq,ts,bundle,sig}
+    post_label = 'peer_post_label'  # msg.obj <- json {author,author_pk,community,post_id,seq,ts,bundle,sig,hops}
     proximity_probe = 'peer_proximity_probe'      # msg.obj <- json {'salt','tags'}
     proximity_reply = 'peer_proximity_reply'      # msg.obj <- json {'salt','tags'}
     proximity_trigger = 'peer_proximity_trigger'  # local IPC: {'target': uuid_str}

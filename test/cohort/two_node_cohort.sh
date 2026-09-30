@@ -281,15 +281,34 @@ class Ev(ctypes.Structure):
         ("blocked", ctypes.c_uint8),
         ("rep_tier", ctypes.c_int32),
         ("rep_ceiling", ctypes.c_double),
+        # Communities (Phase 4), appended LAST so every prior offset is
+        # unchanged. post_community/post_labels ride the POST event;
+        # policy_* the COMMUNITY_POLICY event (16); label_* the POST_LABEL
+        # event (17). Both bundles are OPAQUE: only the app verifies them.
+        ("post_community", ctypes.c_char * (BDID + 1)),
+        ("post_labels", ctypes.c_char * (263 + 1)),
+        ("policy_community", ctypes.c_char * (BDID + 1)),
+        ("policy_id", ctypes.c_char * (64 + 1)),
+        ("policy_seq", ctypes.c_int64),
+        ("policy_ts", ctypes.c_double),
+        ("policy_bundle", ctypes.c_char * (4096 + 1)),
+        ("label_community", ctypes.c_char * (BDID + 1)),
+        ("label_post_id", ctypes.c_char * (64 + 1)),
+        ("label_id", ctypes.c_char * (64 + 1)),
+        ("label_seq", ctypes.c_int64),
+        ("label_ts", ctypes.c_double),
+        ("label_hops", ctypes.c_int32),
+        ("label_bundle", ctypes.c_char * (1536 + 1)),
     ]
-# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (22168 with
+# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (28600 with
 # the geohash + profile_json + connection_state + DM + POST + REACTION + in_group +
 # proximity_band + BUSINESS_AD tail; rtt@116, geohash@120, profile_json@133,
 # connection_state@2696, dm_seq@2704, post_id@3745, post_seq@3752, reaction tail after
 # post_body, in_group@8016 + proximity_band@8020 in the tail padding, business tail
-# from 8024, co-signing tail from 11288, business-post tail from 17864). If the C struct grows and this is not updated in lockstep, poll() would
+# from 8024, co-signing tail from 11288, business-post tail from 17864, moderation
+# tail from 22149, communities tail from 22168). If the C struct grows and this is not updated in lockstep, poll() would
 # misread every field past the drift.
-assert ctypes.sizeof(Ev) == 22168, f"Ev size {ctypes.sizeof(Ev)} != 22168 (ABI drift)"
+assert ctypes.sizeof(Ev) == 28600, f"Ev size {ctypes.sizeof(Ev)} != 28600 (ABI drift)"
 
 lib = ctypes.CDLL(shim)
 lib.agora_set_root.argtypes = [ctypes.c_char_p]; lib.agora_set_root.restype = None

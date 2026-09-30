@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: cosign-ask-office-conferral-delivered
+byte_pinning: false
+description: |
+    An ask to co-sign conferring an office (the Moderator, Phase 4) is carried
+    like any other roll act.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_cosign_request
+    payload:
+      record: office
+      op: confer
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      cid: "b3:7d3f1c9a2b4e6f80112233445566778899aabbccddeeff00123456789abcdef0"
+      bytes: "a3011a0066"
+      seq: 1
+      ts: 0
+    description: |
+        bg's co-signing ask, carrying the exported canonical bytes of the
+        admission newcomer is being asked to sign.
+
+expected_state:
+  newcomer:
+    cosign_request_last:
+      bg:
+        record: office
+        op: confer
+        cid: "b3:7d3f1c9a2b4e6f80112233445566778899aabbccddeeff00123456789abcdef0"
+        bytes: "a3011a0066"
+        seq: 1

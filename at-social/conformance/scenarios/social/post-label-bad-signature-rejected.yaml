@@ -1,0 +1,31 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-label-bad-signature-rejected
+byte_pinning: false
+description: |
+    The publisher's signature binds it to these label bytes; a bad one is
+    refused before the follow gate is even asked.
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+steps:
+  - id: 1
+    from: newcomer
+    to: newcomer
+    function: trigger_follow_community
+    payload: {"community": "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ", "bundle": "{\"policy\":\"stub\",\"seq\":3}", "seq": 3}
+    description: |
+        newcomer follows community A, holding the policy its app verified.
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_post_label
+    payload: {"community": "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ", "post_id": "1111111111111111111111111111111111111111111111111111111111111111", "seq": 1, "ts": 0, "bundle": "{\"label\":\"stub\",\"labels\":[\"nsfw\"]}", "hops": 0, "sig": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}
+expected_state:
+  newcomer:
+    post_label_last:
+      "1111111111111111111111111111111111111111111111111111111111111111": {}
+    post_labels_emitted: 0

@@ -32,7 +32,9 @@ use en_charter::{
     affirmation_state, assemble, charter_state, check_authority, describe_guardian_change,
     didkey_resolver, envoy_state, guardian_state,
     majority, pending,
-    verify_all, Affirmation, AffirmationKind, CharterEntry, Commitment, Derivation,
+    check_label, content_policy_state, verify_all, Affirmation, AffirmationKind, CharterEntry,
+    Commitment, ContentPolicy, ContentPolicyAmendment, Derivation, LabelAction, Office,
+    OfficeChange, OfficeKind,
     EnvoyAuthorization,
     EnvoyKind, FoundingProposal, GuardianChange, GuardianEvidence, GuardianKind, MemberReading,
     MembershipChange, MembershipKind, Movement, Observation, PolityCharter,
@@ -448,6 +450,12 @@ struct PendingSpec {
     evidence_cid: Option<String>,
     #[serde(default)]
     unbacked_reason: Option<String>,
+    /// content_policy exchanges: the policy the deciders will sign (D37).
+    #[serde(default)]
+    policy: Option<ContentPolicy>,
+    /// office exchanges: which office ("Moderator", …). `member_did` is the holder.
+    #[serde(default)]
+    office: Option<String>,
 }
 
 fn pending_impl(a: &EthneArchive, spec: &str) -> Result<String, String> {
@@ -458,8 +466,11 @@ fn pending_impl(a: &EthneArchive, spec: &str) -> Result<String, String> {
         // must already be in the log, and a release on the guardian's own
         // signature needs the outgoing guardian looked up rather than asserted.
         "guardian" => pending_guardian(a, &s),
+        "content_policy" => pending_content_policy(&s),
+        "office" => pending_office(&s),
         other => Err(format!(
-            "unknown record class '{other}': detached signing covers 'membership' and 'guardian'"
+            "unknown record class '{other}': detached signing covers 'membership', 'guardian', \
+             'content_policy' and 'office'"
         )),
     }
 }
@@ -747,6 +758,16 @@ fn assemble_impl(a: &EthneArchive, spec: &str) -> Result<(), String> {
                 .map_err(|e| format!("payload is not a guardian change: {e}"))?;
             CharterEntry::GuardianChanged(assemble(payload, &sigs).map_err(|e| e.to_string())?)
         }
+        "content_policy" => {
+            let payload: ContentPolicyAmendment = serde_json::from_value(s.payload)
+                .map_err(|e| format!("payload is not a content policy amendment: {e}"))?;
+            CharterEntry::ContentPolicyAmended(assemble(payload, &sigs).map_err(|e| e.to_string())?)
+        }
+        "office" => {
+            let payload: OfficeChange = serde_json::from_value(s.payload)
+                .map_err(|e| format!("payload is not an office change: {e}"))?;
+            CharterEntry::OfficeChanged(assemble(payload, &sigs).map_err(|e| e.to_string())?)
+        }
         other => return Err(format!("unknown record class '{other}'")),
     };
     a.0.lock().unwrap().append(entry).map_err(|e| e.to_string())?;
@@ -860,6 +881,8 @@ fn describe_impl(spec: &str) -> Result<String, String> {
             });
             out.insert("description".into(), serde_json::json!(describe_guardian_change(&gc)));
         }
+        "content_policy" => describe_content_policy_bytes(&bytes, &mut out)?,
+        "office" => describe_office_bytes(&bytes, &mut out)?,
         other => return Err(format!("unknown record class '{other}'")),
     }
     serde_json::to_string(&serde_json::Value::Object(out)).map_err(|e| e.to_string())
@@ -2794,6 +2817,843 @@ pub unsafe extern "C" fn ethne_member_roll_verify_full(
 // Rust-side round-trip tests (cargo test) — no FFI, exercise the composition.
 // ---------------------------------------------------------------------------
 
+// ===========================================================================
+// Phase 4 — per-community content policy (Ethne D37)
+// ===========================================================================
+//
+// A community is a polity, and how content posted in its name is moderated is
+// the roll's decision (`ContentPolicy`, tightened at a majority and loosened only
+// above one). Ethne keeps the RULE; this file keeps the three things the rule is
+// FOR, which are Agora's and not Ethne's:
+//
+//   * the POLICY ARTIFACT — `Signed<CommunityPolicy>` under the polity's ROOT key,
+//     naming the policy in force and the members who may label under it. It is
+//     what a reader follows. A higher `seq` replaces it whole, so a revoked
+//     moderator drops out of the next one with no further act (D36's rule, not
+//     D26's union).
+//   * the MODERATOR LABEL — `Signed<PostLabel>` under the moderator's OWN member
+//     key, honoured only where the policy it is read against lists that member.
+//     Per (moderator, post) the highest seq wins; an empty label set retracts.
+//   * the VERDICT — show, warn or hide, with the reasons. It lives here, as a pure
+//     function, so the app and the live cohort's ctypes driver run the SAME code
+//     over the same received bytes, and the cohort proves the hiding itself.
+//
+// None of this crosses into the AT core as anything but opaque bytes: the core
+// carries a policy and a label, and never parses either (business_post.h).
+
+/// The policy artifact's wire cap, mirrored by AT_COMMUNITY_POLICY_BUNDLE_LEN in
+/// at-social (social_msg_types.h, at_agora.h, the shim and the cohort ctypes).
+/// `the_worst_case_policy_fits_the_wire_bound` measures it on every run.
+const COMMUNITY_POLICY_BUNDLE_MAX: usize = 4096;
+
+/// The most moderators one policy artifact lists. Chosen against the wire cap:
+/// MEASURED with every bound at its maximum (32 labels of 32 bytes, 16 moderators,
+/// the largest cap and seq) a policy is 2980 bytes, of which the moderators are
+/// ~60 bytes each, leaving 1116 bytes of headroom under the cap.
+const POLICY_MODERATORS_MAX: usize = 16;
+
+/// The moderator label's wire cap, mirrored by AT_POST_LABEL_BUNDLE_LEN. The
+/// worst case (eight 32-byte labels, the largest seq) MEASURES 969 bytes;
+/// `the_worst_case_label_fits_the_wire_bound` re-measures it on every run.
+const POST_LABEL_BUNDLE_MAX: usize = 1536;
+
+/// The most labels one post, or one moderator label, carries. A post's canonical
+/// form counts them in one byte (at-social post.h); eight is the product bound.
+const POST_LABELS_MAX: usize = 8;
+
+/// A post's content id: blake2b-256, lowercase hex (at-social AT_POST_ID_HEX_LEN).
+const POST_ID_HEX_LEN: usize = 64;
+
+/// The artifact a reader follows: the policy in force, and who may label.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CommunityPolicy {
+    community_did: DidKey,
+    /// The charter log's length when this was minted. The log is append-only, so a
+    /// later artifact always carries a larger seq, and a change of moderators with
+    /// no change of policy still produces a newer one.
+    seq: u64,
+    policy: ContentPolicy,
+    /// Inducted holders of `Moderator` at minting, sorted by DID.
+    moderators: Vec<DidKey>,
+}
+
+/// A moderator's labels on one post, in one community.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PostLabel {
+    community_did: DidKey,
+    post_id: String,
+    /// Empty retracts this moderator's earlier labels on the post.
+    labels: Vec<String>,
+    /// Orders one moderator's labels on one post; the highest wins.
+    seq: u64,
+    ts: i64,
+}
+
+fn parse_office(s: &str) -> Office {
+    match s {
+        "Convener" => Office::Convener,
+        "Inductor" => Office::Inductor,
+        "EnvoyAuthorizer" => Office::EnvoyAuthorizer,
+        "CharterKeeper" => Office::CharterKeeper,
+        "RendezvousOperator" => Office::RendezvousOperator,
+        "Moderator" => Office::Moderator,
+        other => Office::Other(other.to_string()),
+    }
+}
+
+fn office_name(o: &Office) -> String {
+    match o {
+        Office::Convener => "Convener".into(),
+        Office::Inductor => "Inductor".into(),
+        Office::EnvoyAuthorizer => "EnvoyAuthorizer".into(),
+        Office::CharterKeeper => "CharterKeeper".into(),
+        Office::RendezvousOperator => "RendezvousOperator".into(),
+        Office::Moderator => "Moderator".into(),
+        Office::Other(s) => s.clone(),
+    }
+}
+
+fn dids_of(v: &[String]) -> Result<Vec<DidKey>, String> {
+    v.iter()
+        .map(|d| DidKey::from_str(d))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+fn check_labels(labels: &[String]) -> Result<(), String> {
+    if labels.len() > POST_LABELS_MAX {
+        return Err(format!("{} labels exceed the {POST_LABELS_MAX} one post carries", labels.len()));
+    }
+    for l in labels {
+        check_label(l)?;
+    }
+    Ok(())
+}
+
+fn describe_policy_amendment(a: &ContentPolicyAmendment) -> String {
+    let p = &a.policy;
+    let mut rules = vec![format!("minimum tier {}", p.min_tier)];
+    if p.operator_bound_required {
+        rules.push("operator-bound authors only".into());
+    }
+    match p.daily_post_cap {
+        Some(n) => rules.push(format!("at most {n} posts per author per day")),
+        None => rules.push("no daily cap".into()),
+    }
+    for (l, act) in &p.labels {
+        rules.push(format!("'{l}' {}", match act {
+            LabelAction::Allow => "allowed",
+            LabelAction::Warn => "behind a warning",
+            LabelAction::Hide => "hidden",
+        }));
+    }
+    format!(
+        "Set the content policy of {} to: {}. Decided by {} member(s).",
+        a.polity,
+        rules.join("; "),
+        a.deciders.len()
+    )
+}
+
+fn describe_office_change(o: &OfficeChange) -> String {
+    let what = match o.kind {
+        OfficeKind::Confer => "Confer",
+        OfficeKind::Resign => "Resign",
+        OfficeKind::Revoke => "Revoke",
+    };
+    format!(
+        "{what} the office {} {} {} in {}. Decided by {} member(s).",
+        office_name(&o.office),
+        if o.kind == OfficeKind::Confer { "on" } else { "held by" },
+        o.holder,
+        o.polity,
+        o.deciders.len()
+    )
+}
+
+// --- Charter acts, all keys in one process (tools, tests) --------------------
+
+#[derive(Deserialize)]
+struct AmendPolicySpec {
+    polity_did: String,
+    policy: ContentPolicy,
+    #[serde(default)]
+    rationale: String,
+    deciders: Vec<SignerSpec>,
+}
+
+fn amend_policy_impl(a: &EthneArchive, spec: &str) -> Result<(), String> {
+    let s: AmendPolicySpec =
+        serde_json::from_str(spec).map_err(|e| format!("bad policy spec: {e}"))?;
+    s.policy.check_shape()?;
+    let record = ContentPolicyAmendment {
+        polity: DidKey::from_str(&s.polity_did).map_err(|e| e.to_string())?,
+        policy: s.policy,
+        rationale: s.rationale,
+        deciders: dids_of(&s.deciders.iter().map(|d| d.did.clone()).collect::<Vec<_>>())?,
+        decided_at: time::now(),
+    };
+    let signers: Vec<(&str, &PrivKey)> =
+        s.deciders.iter().map(|d| (d.did.as_str(), &d.priv_key)).collect();
+    let signed = Signed::build(record, &signers).map_err(|e| e.to_string())?;
+    a.0.lock()
+        .unwrap()
+        .append(CharterEntry::ContentPolicyAmended(signed))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Replace the polity's content policy. `spec` is `{"polity_did","policy":
+/// {"operator_bound_required","min_tier","daily_post_cap","labels":{label:
+/// "Allow"|"Warn"|"Hide"}},"rationale"?,"deciders":[{"did","priv"}…]}`. A majority
+/// of the seasoned roll tightens; loosening anything needs a majority + 1, which
+/// the authority pass decides (`ethne_verify`).
+///
+/// # Safety
+/// `a`/`spec` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_amend_content_policy(a: *mut EthneArchive, spec: *const c_char) -> i32 {
+    let run = || -> Result<(), String> {
+        let a = a.as_ref().ok_or("null archive handle")?;
+        amend_policy_impl(a, arg_str(spec)?)
+    };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OfficeSpec {
+    polity_did: String,
+    office: String,
+    /// Confer: the holder with key (they consent). Revoke: the DID is enough.
+    holder_did: String,
+    #[serde(default)]
+    holder_priv: Option<PrivKey>,
+    #[serde(default)]
+    rationale: String,
+    deciders: Vec<SignerSpec>,
+}
+
+fn office_impl(a: &EthneArchive, spec: &str, kind: OfficeKind) -> Result<(), String> {
+    let s: OfficeSpec = serde_json::from_str(spec).map_err(|e| format!("bad office spec: {e}"))?;
+    let record = OfficeChange {
+        polity: DidKey::from_str(&s.polity_did).map_err(|e| e.to_string())?,
+        kind,
+        office: parse_office(&s.office),
+        holder: DidKey::from_str(&s.holder_did).map_err(|e| e.to_string())?,
+        rationale: s.rationale,
+        deciders: dids_of(&s.deciders.iter().map(|d| d.did.clone()).collect::<Vec<_>>())?,
+        decided_at: time::now(),
+    };
+    let mut signers: Vec<(&str, &PrivKey)> =
+        s.deciders.iter().map(|d| (d.did.as_str(), &d.priv_key)).collect();
+    if kind == OfficeKind::Confer && !s.deciders.iter().any(|d| d.did == s.holder_did) {
+        let k = s.holder_priv.as_ref().ok_or("a conferral needs the holder's consent (holder_priv)")?;
+        signers.push((s.holder_did.as_str(), k));
+    }
+    let signed = Signed::build(record, &signers).map_err(|e| e.to_string())?;
+    a.0.lock()
+        .unwrap()
+        .append(CharterEntry::OfficeChanged(signed))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Confer an office. `spec` is `{"polity_did","office","holder_did","holder_priv",
+/// "rationale"?,"deciders":[{"did","priv"}…]}`: a majority decides, the holder
+/// consents. `office` is a named office ("Moderator", …) or any other string.
+///
+/// # Safety
+/// `a`/`spec` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_confer_office(a: *mut EthneArchive, spec: *const c_char) -> i32 {
+    let run = || -> Result<(), String> {
+        let a = a.as_ref().ok_or("null archive handle")?;
+        office_impl(a, arg_str(spec)?, OfficeKind::Confer)
+    };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+/// Revoke an office. `spec` is `{"polity_did","office","holder_did","rationale"?,
+/// "deciders":[{"did","priv"}…]}`: a majority, the holder excluded.
+///
+/// # Safety
+/// `a`/`spec` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_revoke_office(a: *mut EthneArchive, spec: *const c_char) -> i32 {
+    let run = || -> Result<(), String> {
+        let a = a.as_ref().ok_or("null archive handle")?;
+        office_impl(a, arg_str(spec)?, OfficeKind::Revoke)
+    };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+fn policy_state_impl(a: &EthneArchive, polity_did: &str) -> Result<String, String> {
+    let polity = DidKey::from_str(polity_did).map_err(|e| e.to_string())?;
+    let guard = a.0.lock().unwrap();
+    let st = content_policy_state(&guard, &polity, time::now());
+    serde_json::to_string(&serde_json::json!({
+        "policy": st.policy,
+        "set_by": st.set_by.map(|c| c.to_string()),
+        "moderators": st.moderators.iter().map(DidKey::as_str).collect::<Vec<_>>(),
+    }))
+    .map_err(|e| e.to_string())
+}
+
+/// The polity's content policy as this log says it is now: `{"policy",
+/// "set_by","moderators"}`. Only accepted amendments are read, and moderators are
+/// inducted holders of `Moderator` (D37).
+///
+/// # Safety
+/// `a`/`polity_did`/`out` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_content_policy_state(
+    a: *mut EthneArchive,
+    polity_did: *const c_char,
+    out: *mut *mut c_char,
+) -> i32 {
+    let run = || -> Result<(), String> {
+        let a = a.as_ref().ok_or("null archive handle")?;
+        set_out(out, policy_state_impl(a, arg_str(polity_did)?)?)
+    };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+// --- Detached co-signing: the policy and office classes ----------------------
+
+fn pending_content_policy(s: &PendingSpec) -> Result<String, String> {
+    if s.op != "amend" {
+        return Err(format!("unknown content_policy op '{}': the one op is 'amend'", s.op));
+    }
+    let policy = s.policy.clone().ok_or("a content_policy exchange needs `policy`")?;
+    policy.check_shape()?;
+    let polity = DidKey::from_str(&s.polity_did).map_err(|e| e.to_string())?;
+    let polity_did = polity.as_str().to_string();
+    let record = ContentPolicyAmendment {
+        polity,
+        policy,
+        rationale: s.rationale.clone(),
+        deciders: dids_of(&s.deciders)?,
+        decided_at: time::now(),
+    };
+    let description = describe_policy_amendment(&record);
+    let p = pending(record, description).map_err(|e| e.to_string())?;
+    let bytes = hex::encode(&p.bytes);
+    check_wire_bound(&bytes)?;
+    serde_json::to_string(&serde_json::json!({
+        "record": "content_policy",
+        "op": s.op,
+        "polity_did": polity_did,
+        "payload": p.payload,
+        "bytes": bytes,
+        "cid": p.cid.to_string(),
+        "description": p.description,
+        "signers_required": s.deciders,
+    }))
+    .map_err(|e| e.to_string())
+}
+
+fn pending_office(s: &PendingSpec) -> Result<String, String> {
+    let kind = match s.op.as_str() {
+        "confer" => OfficeKind::Confer,
+        "revoke" => OfficeKind::Revoke,
+        other => {
+            return Err(format!(
+                "unknown office op '{other}': 'confer' or 'revoke' (a resignation is self-signed)"
+            ))
+        }
+    };
+    let office = parse_office(s.office.as_deref().ok_or("an office exchange needs `office`")?);
+    let polity = DidKey::from_str(&s.polity_did).map_err(|e| e.to_string())?;
+    let polity_did = polity.as_str().to_string();
+    // A conferral needs the holder's consent; a revocation excludes them.
+    let mut required = s.deciders.clone();
+    if kind == OfficeKind::Confer && !required.contains(&s.member_did) {
+        required.push(s.member_did.clone());
+    }
+    let record = OfficeChange {
+        polity,
+        kind,
+        office,
+        holder: DidKey::from_str(&s.member_did).map_err(|e| e.to_string())?,
+        rationale: s.rationale.clone(),
+        deciders: dids_of(&s.deciders)?,
+        decided_at: time::now(),
+    };
+    let description = describe_office_change(&record);
+    let p = pending(record, description).map_err(|e| e.to_string())?;
+    let bytes = hex::encode(&p.bytes);
+    check_wire_bound(&bytes)?;
+    serde_json::to_string(&serde_json::json!({
+        "record": "office",
+        "op": s.op,
+        "polity_did": polity_did,
+        "payload": p.payload,
+        "bytes": bytes,
+        "cid": p.cid.to_string(),
+        "description": p.description,
+        "signers_required": required,
+    }))
+    .map_err(|e| e.to_string())
+}
+
+fn describe_content_policy_bytes(
+    bytes: &[u8],
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let a: ContentPolicyAmendment = canonical::from_canonical_cbor(bytes)
+        .map_err(|e| format!("these bytes are not a content policy amendment: {e}"))?;
+    out.insert("op".into(), serde_json::json!("amend"));
+    out.insert("polity_did".into(), serde_json::json!(a.polity.as_str()));
+    out.insert("policy".into(), serde_json::to_value(&a.policy).map_err(|e| e.to_string())?);
+    out.insert("deciders".into(), serde_json::json!(
+        a.deciders.iter().map(DidKey::as_str).collect::<Vec<_>>()
+    ));
+    out.insert("description".into(), serde_json::json!(describe_policy_amendment(&a)));
+    Ok(())
+}
+
+fn describe_office_bytes(
+    bytes: &[u8],
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let o: OfficeChange = canonical::from_canonical_cbor(bytes)
+        .map_err(|e| format!("these bytes are not an office change: {e}"))?;
+    out.insert("op".into(), serde_json::json!(match o.kind {
+        OfficeKind::Confer => "confer",
+        OfficeKind::Resign => "resign",
+        OfficeKind::Revoke => "revoke",
+    }));
+    out.insert("polity_did".into(), serde_json::json!(o.polity.as_str()));
+    out.insert("office".into(), serde_json::json!(office_name(&o.office)));
+    out.insert("member_did".into(), serde_json::json!(o.holder.as_str()));
+    out.insert("deciders".into(), serde_json::json!(
+        o.deciders.iter().map(DidKey::as_str).collect::<Vec<_>>()
+    ));
+    out.insert("description".into(), serde_json::json!(describe_office_change(&o)));
+    Ok(())
+}
+
+// --- The policy artifact -------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PolicySignSpec {
+    polity_did: String,
+    /// The polity's OWN key: the policy is the polity speaking, like its roll.
+    root_priv: PrivKey,
+}
+
+fn policy_sign_impl(a: &EthneArchive, spec: &str) -> Result<String, String> {
+    let s: PolicySignSpec =
+        serde_json::from_str(spec).map_err(|e| format!("bad policy sign spec: {e}"))?;
+    let polity = DidKey::from_str(&s.polity_did).map_err(|e| e.to_string())?;
+    let guard = a.0.lock().unwrap();
+    if find_charter(&guard, &polity).is_none() {
+        return Err(format!("no charter for {polity} in this log"));
+    }
+    let st = content_policy_state(&guard, &polity, time::now());
+    if st.moderators.len() > POLICY_MODERATORS_MAX {
+        return Err(format!(
+            "{} moderators exceed the {POLICY_MODERATORS_MAX} one policy lists",
+            st.moderators.len()
+        ));
+    }
+    let artifact = CommunityPolicy {
+        community_did: polity.clone(),
+        seq: guard.iter().count() as u64,
+        policy: st.policy,
+        moderators: st.moderators,
+    };
+    drop(guard);
+    let signed = Signed::build(artifact, &[(polity.as_str(), &s.root_priv)]).map_err(|e| e.to_string())?;
+    // Signing under the wrong key still builds; only verification can tell.
+    signed
+        .verify(didkey_resolver)
+        .map_err(|_| "root_priv is not the polity's own key".to_string())?;
+    let json = serde_json::to_string(&signed).map_err(|e| e.to_string())?;
+    if json.len() > COMMUNITY_POLICY_BUNDLE_MAX {
+        return Err(format!(
+            "this policy is {} bytes, over the {COMMUNITY_POLICY_BUNDLE_MAX} the wire carries",
+            json.len()
+        ));
+    }
+    Ok(json)
+}
+
+/// Mint the polity's policy artifact from this log, now. `spec` is
+/// `{"polity_did","root_priv"}`. Writes the `Signed<CommunityPolicy>` JSON to
+/// `*out`: the policy in force, the moderators, and `seq` = the log's length.
+///
+/// # Safety
+/// `a`/`spec`/`out` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_content_policy_sign(
+    a: *mut EthneArchive,
+    spec: *const c_char,
+    out: *mut *mut c_char,
+) -> i32 {
+    let run = || -> Result<(), String> {
+        let a = a.as_ref().ok_or("null archive handle")?;
+        set_out(out, policy_sign_impl(a, arg_str(spec)?)?)
+    };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+/// Parse and verify a policy artifact: signed by the community it names, and
+/// well-shaped. What a reader trusts is exactly this, so every check is here.
+fn read_policy(json: &str) -> Result<CommunityPolicy, String> {
+    if json.len() > COMMUNITY_POLICY_BUNDLE_MAX {
+        return Err("policy is over the wire bound".into());
+    }
+    let signed: Signed<CommunityPolicy> =
+        serde_json::from_str(json).map_err(|e| format!("bad policy: {e}"))?;
+    signed.verify(didkey_resolver).map_err(|e| format!("policy signature invalid: {e}"))?;
+    if signed.signatures.len() != 1
+        || signer_of(&signed)? != signed.payload.community_did.as_str()
+    {
+        return Err("a policy must be signed by its community alone".into());
+    }
+    let p = signed.payload;
+    p.policy.check_shape()?;
+    if p.moderators.len() > POLICY_MODERATORS_MAX {
+        return Err("policy lists too many moderators".into());
+    }
+    Ok(p)
+}
+
+fn policy_verify_impl(json: &str) -> Result<String, String> {
+    let p = read_policy(json)?;
+    serde_json::to_string(&serde_json::json!({
+        "community_did": p.community_did.as_str(),
+        "seq": p.seq,
+        "policy": p.policy,
+        "moderators": p.moderators.iter().map(DidKey::as_str).collect::<Vec<_>>(),
+    }))
+    .map_err(|e| e.to_string())
+}
+
+/// Verify a policy artifact and say what it holds: writes `{"community_did","seq",
+/// "policy","moderators"}` to `*out`. Needs no log: the community's DID is its
+/// root key. A reader keeps the highest `seq` per community.
+///
+/// # Safety
+/// `json`/`out` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_content_policy_verify(json: *const c_char, out: *mut *mut c_char) -> i32 {
+    let run = || -> Result<(), String> { set_out(out, policy_verify_impl(arg_str(json)?)?) };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+// --- Moderator labels -----------------------------------------------------------
+
+#[derive(Deserialize)]
+struct LabelSignSpec {
+    community_did: String,
+    post_id: String,
+    #[serde(default)]
+    labels: Vec<String>,
+    seq: u64,
+    moderator: SignerSpec,
+}
+
+fn check_post_id(id: &str) -> Result<(), String> {
+    if id.len() != POST_ID_HEX_LEN || !id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+        return Err(format!("post id {id:?} is not {POST_ID_HEX_LEN} lowercase hex"));
+    }
+    Ok(())
+}
+
+fn label_sign_impl(spec: &str) -> Result<String, String> {
+    let s: LabelSignSpec =
+        serde_json::from_str(spec).map_err(|e| format!("bad label spec: {e}"))?;
+    check_post_id(&s.post_id)?;
+    check_labels(&s.labels)?;
+    let mut labels = s.labels;
+    labels.sort();
+    labels.dedup();
+    let label = PostLabel {
+        community_did: DidKey::from_str(&s.community_did).map_err(|e| e.to_string())?,
+        post_id: s.post_id,
+        labels,
+        seq: s.seq,
+        ts: time::now().as_second(),
+    };
+    let signed = Signed::build(label, &[(s.moderator.did.as_str(), &s.moderator.priv_key)])
+        .map_err(|e| e.to_string())?;
+    signed
+        .verify(didkey_resolver)
+        .map_err(|_| "the moderator's key does not match their DID".to_string())?;
+    let json = serde_json::to_string(&signed).map_err(|e| e.to_string())?;
+    if json.len() > POST_LABEL_BUNDLE_MAX {
+        return Err(format!("this label is {} bytes, over the {POST_LABEL_BUNDLE_MAX} the wire carries", json.len()));
+    }
+    Ok(json)
+}
+
+/// Label a post as a moderator. `spec` is `{"community_did","post_id","labels":
+/// […],"seq","moderator":{"did","priv"}}`; an empty `labels` retracts this
+/// moderator's earlier labels on the post. Writes the `Signed<PostLabel>` JSON.
+/// Whether the label COUNTS is decided by the reader, against the policy it holds.
+///
+/// # Safety
+/// `spec`/`out` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_post_label_sign(spec: *const c_char, out: *mut *mut c_char) -> i32 {
+    let run = || -> Result<(), String> { set_out(out, label_sign_impl(arg_str(spec)?)?) };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+/// A label checked against the policy it is read under.
+struct ReadLabel {
+    moderator: String,
+    label: PostLabel,
+}
+
+fn read_label(json: &str, policy: &CommunityPolicy) -> Result<ReadLabel, String> {
+    if json.len() > POST_LABEL_BUNDLE_MAX {
+        return Err("label is over the wire bound".into());
+    }
+    let signed: Signed<PostLabel> =
+        serde_json::from_str(json).map_err(|e| format!("bad label: {e}"))?;
+    signed.verify(didkey_resolver).map_err(|e| format!("label signature invalid: {e}"))?;
+    if signed.signatures.len() != 1 {
+        return Err("a label is signed by one moderator".into());
+    }
+    let moderator = signer_of(&signed)?.to_string();
+    if signed.payload.community_did != policy.community_did {
+        return Err("label is for a different community than the policy".into());
+    }
+    if !policy.moderators.iter().any(|m| m.as_str() == moderator) {
+        return Err(format!("{moderator} is not a moderator under this policy"));
+    }
+    check_post_id(&signed.payload.post_id)?;
+    check_labels(&signed.payload.labels)?;
+    Ok(ReadLabel { moderator, label: signed.payload })
+}
+
+#[derive(Deserialize)]
+struct LabelVerifySpec {
+    label: String,
+    policy: String,
+}
+
+fn label_verify_impl(spec: &str) -> Result<String, String> {
+    let s: LabelVerifySpec =
+        serde_json::from_str(spec).map_err(|e| format!("bad label verify spec: {e}"))?;
+    let policy = read_policy(&s.policy)?;
+    let r = read_label(&s.label, &policy)?;
+    serde_json::to_string(&serde_json::json!({
+        "moderator_did": r.moderator,
+        "community_did": r.label.community_did.as_str(),
+        "post_id": r.label.post_id,
+        "labels": r.label.labels,
+        "seq": r.label.seq,
+        "ts": r.label.ts,
+    }))
+    .map_err(|e| e.to_string())
+}
+
+/// Verify a moderator label against a policy artifact. `spec` is `{"label":
+/// "<Signed<PostLabel> JSON>","policy":"<Signed<CommunityPolicy> JSON>"}`; writes
+/// `{"moderator_did","community_did","post_id","labels","seq","ts"}`. Refused
+/// unless the signer is a moderator the policy lists.
+///
+/// # Safety
+/// `spec`/`out` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_post_label_verify(spec: *const c_char, out: *mut *mut c_char) -> i32 {
+    let run = || -> Result<(), String> { set_out(out, label_verify_impl(arg_str(spec)?)?) };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
+// --- The verdict ------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct VerdictSpec {
+    /// The `Signed<CommunityPolicy>` JSON the reader follows.
+    policy: String,
+    /// The post's content id; moderator labels for any other post are ignored.
+    post_id: String,
+    /// The labels the author put in the post's signed canonical form.
+    #[serde(default)]
+    author_labels: Vec<String>,
+    /// Every moderator label the reader holds for this post, as received. Ones
+    /// that do not verify under `policy` are skipped and counted, never trusted.
+    #[serde(default)]
+    labels: Vec<String>,
+    /// The reader's own view of the author.
+    author_tier: u8,
+    author_operator_bound: bool,
+    /// This post's 1-based position among the author's posts in this community
+    /// today (UTC), as this reader received them.
+    author_post_index_today: u32,
+}
+
+fn action_name(a: LabelAction) -> &'static str {
+    match a {
+        LabelAction::Allow => "show",
+        LabelAction::Warn => "warn",
+        LabelAction::Hide => "hide",
+    }
+}
+
+fn verdict_impl(spec: &str) -> Result<String, String> {
+    let s: VerdictSpec = serde_json::from_str(spec).map_err(|e| format!("bad verdict spec: {e}"))?;
+    let policy = read_policy(&s.policy)?;
+    let rules = &policy.policy;
+    let mut action = LabelAction::Allow;
+    let mut reasons: Vec<serde_json::Value> = Vec::new();
+
+    // The requirements: failing any one hides the post.
+    if rules.operator_bound_required && !s.author_operator_bound {
+        action = LabelAction::Hide;
+        reasons.push(serde_json::json!({"code": "operator_unbound"}));
+    }
+    if s.author_tier < rules.min_tier {
+        action = LabelAction::Hide;
+        reasons.push(serde_json::json!({
+            "code": "below_min_tier", "min_tier": rules.min_tier, "tier": s.author_tier,
+        }));
+    }
+    if let Some(cap) = rules.daily_post_cap {
+        if s.author_post_index_today > cap {
+            action = LabelAction::Hide;
+            reasons.push(serde_json::json!({
+                "code": "over_daily_cap", "cap": cap, "index": s.author_post_index_today,
+            }));
+        }
+    }
+
+    // Moderator labels: per moderator, only the highest seq for THIS post counts.
+    let mut latest: std::collections::BTreeMap<String, PostLabel> = std::collections::BTreeMap::new();
+    let mut refused = 0usize;
+    for json in &s.labels {
+        match read_label(json, &policy) {
+            Ok(r) if r.label.post_id == s.post_id => {
+                let newer = latest.get(&r.moderator).is_none_or(|prev| r.label.seq > prev.seq);
+                if newer {
+                    latest.insert(r.moderator, r.label);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => refused += 1,
+        }
+    }
+
+    // Every label that applies, and who applied it. An author's own label counts
+    // exactly like a moderator's: the policy says what a label does, not who may
+    // say it.
+    let mut applied: Vec<(String, String)> = Vec::new();
+    for l in &s.author_labels {
+        if check_label(l).is_ok() {
+            applied.push((l.clone(), "author".into()));
+        }
+    }
+    for (m, lab) in &latest {
+        for l in &lab.labels {
+            applied.push((l.clone(), m.clone()));
+        }
+    }
+    applied.sort();
+    applied.dedup();
+    let mut tags: BTreeSet<String> = BTreeSet::new();
+    for (label, by) in &applied {
+        tags.insert(label.clone());
+        let a = rules.labels.get(label).copied().unwrap_or(LabelAction::Allow);
+        if a == LabelAction::Allow {
+            continue;
+        }
+        if a > action {
+            action = a;
+        }
+        reasons.push(serde_json::json!({
+            "code": "label", "label": label, "action": action_name(a), "by": by,
+        }));
+    }
+
+    serde_json::to_string(&serde_json::json!({
+        "community_did": policy.community_did.as_str(),
+        "seq": policy.seq,
+        "action": action_name(action),
+        "reasons": reasons,
+        "tags": tags,
+        "labels_refused": refused,
+    }))
+    .map_err(|e| e.to_string())
+}
+
+/// Decide how a reader shows one post made in a community it follows. `spec` is
+/// `{"policy","post_id","author_labels":[…],"labels":["<Signed<PostLabel>>"…],
+/// "author_tier","author_operator_bound","author_post_index_today"}`. Writes
+/// `{"community_did","seq","action":"show"|"warn"|"hide","reasons":[…],"tags":[…],
+/// "labels_refused"}`.
+///
+/// A failed requirement hides. Each label applied by the author or by a listed
+/// moderator does what the policy says, a label the policy does not name is shown
+/// as a tag, and the strictest action wins. Pure: the same inputs give the same
+/// verdict on every node, which is what lets the cohort check it.
+///
+/// # Safety
+/// `spec`/`out` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn ethne_content_policy_verdict(spec: *const c_char, out: *mut *mut c_char) -> i32 {
+    let run = || -> Result<(), String> { set_out(out, verdict_impl(arg_str(spec)?)?) };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(e);
+            -1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4138,5 +4998,299 @@ mod tests {
         let e = member_roll_verify_full_impl(&a, &roll)
             .expect_err("the log does not agree with the claim");
         assert!(e.contains("does not match the log"), "{e}");
+    }
+
+    // --- Phase 4: content policy (D37) ----------------------------------------
+
+    /// Five founders, ALL ratifying, so all five carry weight: a majority is 3 and
+    /// more than a majority is 4.
+    fn five_seasoned() -> (EthneArchive, String, PrivKey, Vec<Ident>) {
+        let a = EthneArchive(Mutex::new(Archive::new()));
+        let (polity_did, root_priv, _root_pub) = keypair();
+        let f: Vec<Ident> = (0..5).map(|_| ident()).collect();
+        let found = serde_json::json!({
+            "polity_did": polity_did,
+            "name": "Riverside Commons",
+            "statement": "Neighbours who garden.",
+            "members": f.iter().map(|m| m.did.clone()).collect::<Vec<_>>(),
+            "ratifiers": f.iter().map(signer_json).collect::<Vec<_>>(),
+        });
+        found_impl(&a, &found.to_string()).unwrap();
+        (a, polity_did, root_priv, f)
+    }
+
+    fn strict_policy() -> serde_json::Value {
+        serde_json::json!({
+            "operator_bound_required": true, "min_tier": 2, "daily_post_cap": 3,
+            "labels": {"nsfw": "Hide", "spoiler": "Warn", "promo": "Allow"},
+        })
+    }
+
+    fn amend(a: &EthneArchive, polity: &str, policy: serde_json::Value, by: &[&Ident]) {
+        amend_policy_impl(a, &serde_json::json!({
+            "polity_did": polity, "policy": policy,
+            "deciders": by.iter().map(|i| signer_json(i)).collect::<Vec<_>>(),
+        }).to_string()).expect("append");
+    }
+
+    fn confer_moderator(a: &EthneArchive, polity: &str, holder: &Ident, by: &[&Ident]) {
+        office_impl(a, &serde_json::json!({
+            "polity_did": polity, "office": "Moderator", "holder_did": holder.did,
+            "holder_priv": serde_json::to_value(&holder.priv_key).unwrap(),
+            "deciders": by.iter().map(|i| signer_json(i)).collect::<Vec<_>>(),
+        }).to_string(), OfficeKind::Confer).expect("confer");
+    }
+
+    fn policy_now(a: &EthneArchive, polity: &str, root: &PrivKey) -> String {
+        policy_sign_impl(a, &serde_json::json!({
+            "polity_did": polity, "root_priv": serde_json::to_value(root).unwrap(),
+        }).to_string()).expect("policy sign")
+    }
+
+    fn label(polity: &str, post: &str, labels: &[&str], seq: u64, m: &Ident) -> String {
+        label_sign_impl(&serde_json::json!({
+            "community_did": polity, "post_id": post, "labels": labels, "seq": seq,
+            "moderator": signer_json(m),
+        }).to_string()).expect("label sign")
+    }
+
+    const POST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_POST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn verdict(policy: &str, author_labels: &[&str], labels: &[String], tier: u8, bound: bool, idx: u32) -> serde_json::Value {
+        let out = verdict_impl(&serde_json::json!({
+            "policy": policy, "post_id": POST, "author_labels": author_labels, "labels": labels,
+            "author_tier": tier, "author_operator_bound": bound, "author_post_index_today": idx,
+        }).to_string()).expect("verdict");
+        serde_json::from_str(&out).unwrap()
+    }
+
+    fn codes(v: &serde_json::Value) -> Vec<String> {
+        v["reasons"].as_array().unwrap().iter().map(|r| r["code"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn a_majority_sets_a_policy_and_a_loosening_needs_more() {
+        let (a, polity, _root, f) = five_seasoned();
+        amend(&a, &polity, strict_policy(), &[&f[0], &f[1], &f[2]]);
+        verify_impl(&a).expect("a first policy is a tightening");
+        let st: serde_json::Value = serde_json::from_str(&policy_state_impl(&a, &polity).unwrap()).unwrap();
+        assert_eq!(st["policy"], strict_policy());
+
+        let mut looser = strict_policy();
+        looser["min_tier"] = serde_json::json!(1);
+        amend(&a, &polity, looser.clone(), &[&f[0], &f[1], &f[2]]);
+        let e = verify_impl(&a).expect_err("a loosening at a bare majority");
+        assert!(e.contains("more than a majority"), "{e}");
+        let st: serde_json::Value = serde_json::from_str(&policy_state_impl(&a, &polity).unwrap()).unwrap();
+        assert_eq!(st["policy"], strict_policy(), "the refused loosening is not in force");
+    }
+
+    #[test]
+    fn a_policy_and_a_moderator_travel_through_detached_signing() {
+        let (a, polity, _root, f) = five_seasoned();
+        let deciders: Vec<String> = f[..3].iter().map(|i| i.did.clone()).collect();
+
+        // The policy: the deciders sign in their own processes.
+        let p: serde_json::Value = serde_json::from_str(&pending_impl(&a, &serde_json::json!({
+            "record": "content_policy", "op": "amend", "polity_did": polity, "member_did": "",
+            "deciders": deciders, "policy": strict_policy(),
+        }).to_string()).expect("pending")).unwrap();
+        let described: serde_json::Value = serde_json::from_str(&describe_impl(&serde_json::json!({
+            "record": "content_policy", "bytes": p["bytes"],
+        }).to_string()).unwrap()).unwrap();
+        assert_eq!(described["policy"], strict_policy(), "a signer is shown what they sign");
+        assert_eq!(described["cid"], p["cid"]);
+        assert!(described["description"].as_str().unwrap().contains("'nsfw' hidden"));
+        let sigs: Vec<serde_json::Value> = f[..3].iter().map(|i| serde_json::json!({
+            "did": i.did,
+            "sig": sign_detached_impl(&serde_json::json!({
+                "priv": serde_json::to_value(&i.priv_key).unwrap(), "bytes": p["bytes"],
+            }).to_string()).unwrap(),
+        })).collect();
+        assemble_impl(&a, &serde_json::json!({
+            "record": "content_policy", "payload": p["payload"], "signatures": sigs,
+        }).to_string()).expect("assemble policy");
+
+        // The office: a conferral needs the holder's consent too.
+        let o: serde_json::Value = serde_json::from_str(&pending_impl(&a, &serde_json::json!({
+            "record": "office", "op": "confer", "office": "Moderator", "polity_did": polity,
+            "member_did": f[4].did, "deciders": deciders,
+        }).to_string()).expect("pending office")).unwrap();
+        let required: Vec<String> = serde_json::from_value(o["signers_required"].clone()).unwrap();
+        assert!(required.contains(&f[4].did), "the holder consents");
+        let signers: Vec<&Ident> = vec![&f[0], &f[1], &f[2], &f[4]];
+        let sigs: Vec<serde_json::Value> = signers.iter().map(|i| serde_json::json!({
+            "did": i.did,
+            "sig": sign_detached_impl(&serde_json::json!({
+                "priv": serde_json::to_value(&i.priv_key).unwrap(), "bytes": o["bytes"],
+            }).to_string()).unwrap(),
+        })).collect();
+        assemble_impl(&a, &serde_json::json!({
+            "record": "office", "payload": o["payload"], "signatures": sigs,
+        }).to_string()).expect("assemble office");
+
+        verify_impl(&a).expect("both acts are authorized");
+        let st: serde_json::Value = serde_json::from_str(&policy_state_impl(&a, &polity).unwrap()).unwrap();
+        assert_eq!(st["policy"], strict_policy());
+        assert_eq!(st["moderators"], serde_json::json!([f[4].did]));
+    }
+
+    #[test]
+    fn the_policy_artifact_verifies_and_a_newer_one_has_a_larger_seq() {
+        let (a, polity, root, f) = five_seasoned();
+        amend(&a, &polity, strict_policy(), &[&f[0], &f[1], &f[2]]);
+        let first = policy_now(&a, &polity, &root);
+        let read: serde_json::Value = serde_json::from_str(&policy_verify_impl(&first).unwrap()).unwrap();
+        assert_eq!(read["community_did"], serde_json::json!(polity));
+        assert_eq!(read["policy"], strict_policy());
+        assert_eq!(read["moderators"], serde_json::json!([]));
+
+        confer_moderator(&a, &polity, &f[4], &[&f[0], &f[1], &f[2]]);
+        let second = policy_now(&a, &polity, &root);
+        let read2: serde_json::Value = serde_json::from_str(&policy_verify_impl(&second).unwrap()).unwrap();
+        assert!(read2["seq"].as_u64() > read["seq"].as_u64(), "a moderator change alone mints a newer policy");
+        assert_eq!(read2["moderators"], serde_json::json!([f[4].did]));
+    }
+
+    #[test]
+    fn a_policy_under_any_other_key_or_tampered_is_refused() {
+        let (a, polity, _root, f) = five_seasoned();
+        amend(&a, &polity, strict_policy(), &[&f[0], &f[1], &f[2]]);
+        let (_, wrong, _) = keypair();
+        let e = policy_sign_impl(&a, &serde_json::json!({
+            "polity_did": polity, "root_priv": serde_json::to_value(&wrong).unwrap(),
+        }).to_string()).expect_err("not the polity's key");
+        assert!(e.contains("not the polity's own key"), "{e}");
+
+        let (a, polity, root, f) = five_seasoned();
+        amend(&a, &polity, strict_policy(), &[&f[0], &f[1], &f[2]]);
+        let good = policy_now(&a, &polity, &root);
+        let tampered = good.replace("\"min_tier\":2", "\"min_tier\":0");
+        assert_ne!(good, tampered);
+        assert!(policy_verify_impl(&tampered).is_err(), "a reader cannot be handed a looser policy");
+    }
+
+    #[test]
+    fn only_a_listed_moderator_labels() {
+        let (a, polity, root, f) = five_seasoned();
+        amend(&a, &polity, strict_policy(), &[&f[0], &f[1], &f[2]]);
+        confer_moderator(&a, &polity, &f[4], &[&f[0], &f[1], &f[2]]);
+        let policy = policy_now(&a, &polity, &root);
+
+        let ok = label(&polity, POST, &["nsfw"], 1, &f[4]);
+        let read: serde_json::Value = serde_json::from_str(&label_verify_impl(&serde_json::json!({
+            "label": ok, "policy": policy,
+        }).to_string()).unwrap()).unwrap();
+        assert_eq!(read["moderator_did"], serde_json::json!(f[4].did));
+        assert_eq!(read["labels"], serde_json::json!(["nsfw"]));
+
+        let member = label(&polity, POST, &["nsfw"], 1, &f[0]);
+        let e = label_verify_impl(&serde_json::json!({"label": member, "policy": policy}).to_string())
+            .expect_err("a member without the office");
+        assert!(e.contains("not a moderator"), "{e}");
+
+        let (_, other_polity, _, g) = five_seasoned();
+        let elsewhere = label(&other_polity, POST, &["nsfw"], 1, &g[0]);
+        assert!(label_verify_impl(&serde_json::json!({"label": elsewhere, "policy": policy}).to_string()).is_err());
+
+        assert!(label_sign_impl(&serde_json::json!({
+            "community_did": polity, "post_id": "not-a-post-id", "labels": ["nsfw"], "seq": 1,
+            "moderator": signer_json(&f[4]),
+        }).to_string()).is_err());
+    }
+
+    #[test]
+    fn the_verdict_reads_every_requirement() {
+        let (a, polity, root, f) = five_seasoned();
+        amend(&a, &polity, strict_policy(), &[&f[0], &f[1], &f[2]]);
+        let policy = policy_now(&a, &polity, &root);
+
+        let v = verdict(&policy, &[], &[], 2, true, 1);
+        assert_eq!(v["action"], "show");
+        assert!(codes(&v).is_empty());
+
+        let v = verdict(&policy, &[], &[], 2, false, 1);
+        assert_eq!((v["action"].as_str(), codes(&v)), (Some("hide"), vec!["operator_unbound".to_string()]));
+        let v = verdict(&policy, &[], &[], 1, true, 1);
+        assert_eq!((v["action"].as_str(), codes(&v)), (Some("hide"), vec!["below_min_tier".to_string()]));
+        let v = verdict(&policy, &[], &[], 2, true, 3);
+        assert_eq!(v["action"], "show", "the cap's last post is still in");
+        let v = verdict(&policy, &[], &[], 2, true, 4);
+        assert_eq!((v["action"].as_str(), codes(&v)), (Some("hide"), vec!["over_daily_cap".to_string()]));
+        let v = verdict(&policy, &[], &[], 0, false, 9);
+        assert_eq!(codes(&v).len(), 3, "every failed requirement is named");
+    }
+
+    #[test]
+    fn the_verdict_applies_labels_by_the_strictest_action() {
+        let (a, polity, root, f) = five_seasoned();
+        amend(&a, &polity, strict_policy(), &[&f[0], &f[1], &f[2]]);
+        confer_moderator(&a, &polity, &f[4], &[&f[0], &f[1], &f[2]]);
+        let policy = policy_now(&a, &polity, &root);
+
+        let v = verdict(&policy, &["spoiler"], &[], 2, true, 1);
+        assert_eq!(v["action"], "warn", "an author's own label does what the policy says");
+        let v = verdict(&policy, &["promo", "cats"], &[], 2, true, 1);
+        assert_eq!(v["action"], "show");
+        assert_eq!(v["tags"], serde_json::json!(["cats", "promo"]), "unnamed labels are tags");
+
+        let hide = label(&polity, POST, &["nsfw"], 1, &f[4]);
+        let v = verdict(&policy, &["spoiler"], std::slice::from_ref(&hide), 2, true, 1);
+        assert_eq!(v["action"], "hide", "hide beats warn");
+        let by: Vec<&str> = v["reasons"].as_array().unwrap().iter().map(|r| r["by"].as_str().unwrap()).collect();
+        assert!(by.contains(&f[4].did.as_str()) && by.contains(&"author"));
+
+        // A retraction at a higher seq wins, whatever order the two arrived in.
+        let retract = label(&polity, POST, &[], 2, &f[4]);
+        let v = verdict(&policy, &[], &[retract.clone(), hide.clone()], 2, true, 1);
+        assert_eq!(v["action"], "show");
+
+        // A label for another post, or by a non-moderator, does nothing.
+        let other = label(&polity, OTHER_POST, &["nsfw"], 3, &f[4]);
+        let forged = label(&polity, POST, &["nsfw"], 3, &f[0]);
+        let v = verdict(&policy, &[], &[other, forged], 2, true, 1);
+        assert_eq!(v["action"], "show");
+        assert_eq!(v["labels_refused"], 1);
+    }
+
+    #[test]
+    fn the_worst_case_policy_fits_the_wire_bound() {
+        // Every bound at its maximum: 32 labels of 32 bytes, 16 moderators, the
+        // largest cap. Built directly, since a log with 16 inducted moderators
+        // measures nothing more than this does.
+        let (polity_did, root, _) = keypair();
+        let labels = (0..en_charter::CONTENT_LABELS_MAX)
+            .map(|i| (format!("{i:0>32}"), LabelAction::Hide))
+            .collect();
+        let moderators = (0..POLICY_MODERATORS_MAX)
+            .map(|_| DidKey::from_str(&ident().did).unwrap())
+            .collect();
+        let artifact = CommunityPolicy {
+            community_did: DidKey::from_str(&polity_did).unwrap(),
+            seq: u64::MAX,
+            policy: ContentPolicy {
+                operator_bound_required: true,
+                min_tier: 4,
+                daily_post_cap: Some(u32::MAX),
+                labels,
+            },
+            moderators,
+        };
+        let signed = Signed::build(artifact, &[(polity_did.as_str(), &root)]).unwrap();
+        let n = serde_json::to_string(&signed).unwrap().len();
+        assert!(n <= COMMUNITY_POLICY_BUNDLE_MAX, "worst-case policy is {n} bytes");
+    }
+
+    #[test]
+    fn the_worst_case_label_fits_the_wire_bound() {
+        let (polity_did, _, _) = keypair();
+        let m = ident();
+        let labels: Vec<String> = (0..POST_LABELS_MAX).map(|i| format!("{i:0>32}")).collect();
+        let l = label_sign_impl(&serde_json::json!({
+            "community_did": polity_did, "post_id": POST, "labels": labels, "seq": u64::MAX,
+            "moderator": signer_json(&m),
+        }).to_string()).expect("the worst case signs");
+        assert!(l.len() <= POST_LABEL_BUNDLE_MAX, "worst-case label is {} bytes", l.len());
     }
 }

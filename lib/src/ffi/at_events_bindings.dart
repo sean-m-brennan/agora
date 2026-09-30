@@ -99,6 +99,24 @@ const int agoraEventCosignSignature = 14;
 /// [AtRawEvent.businessPostBundle] is, and only this side can check it.
 const int agoraEventBusinessPost = 15;
 
+/// A community's content policy, carried by a node that follows it (Phase 4).
+/// [AtRawEvent.policyBundle] is OPAQUE: verify it with
+/// `EthneFfi.verifyContentPolicy` before following or trusting it.
+const int agoraEventCommunityPolicy = 16;
+
+/// A moderator's labels on one post (Phase 4). [AtRawEvent.labelBundle] counts
+/// only if `EthneFfi.verifyPostLabel` accepts it against the policy you hold.
+const int agoraEventPostLabel = 17;
+
+/// A post's labels joined with ','. MUST match AGORA_POST_LABELS_MAX.
+const int agoraPostLabelsMax = 263;
+
+/// A community's policy artifact. MUST match AGORA_COMMUNITY_POLICY_BUNDLE_MAX.
+const int agoraCommunityPolicyBundleMax = 4096;
+
+/// A moderator's label. MUST match AGORA_POST_LABEL_BUNDLE_MAX.
+const int agoraPostLabelBundleMax = 1536;
+
 /// [AtRawEvent.repCeiling] when no authority bounds the peer (Phase 4 P4.1).
 /// Mirrors the C `AGORA_NO_CEILING`. Any negative value means the same; this
 /// is the one the shim writes.
@@ -354,6 +372,52 @@ final class AgoraEvent extends Struct {
   /// other kind it is 0.0 — which would read as "floored at zero".
   @Double()
   external double repCeiling;
+
+  /// Communities (Phase 4). Appended LAST, so every prior offset is unchanged
+  /// (the struct grew 22168 -> 28600). [postCommunity] and [postLabels] ride
+  /// [agoraEventPost]; the policy tail rides [agoraEventCommunityPolicy]; the
+  /// label tail rides [agoraEventPostLabel]. Both bundles are OPAQUE.
+  @Array(agoraBusinessDidMax + 1)
+  external Array<Uint8> postCommunity;
+
+  @Array(agoraPostLabelsMax + 1)
+  external Array<Uint8> postLabels;
+
+  @Array(agoraBusinessDidMax + 1)
+  external Array<Uint8> policyCommunity;
+
+  @Array(agoraPostIdMax + 1)
+  external Array<Uint8> policyId;
+
+  @Int64()
+  external int policySeq;
+
+  @Double()
+  external double policyTs;
+
+  @Array(agoraCommunityPolicyBundleMax + 1)
+  external Array<Uint8> policyBundle;
+
+  @Array(agoraBusinessDidMax + 1)
+  external Array<Uint8> labelCommunity;
+
+  @Array(agoraPostIdMax + 1)
+  external Array<Uint8> labelPostId;
+
+  @Array(agoraPostIdMax + 1)
+  external Array<Uint8> labelId;
+
+  @Int64()
+  external int labelSeq;
+
+  @Double()
+  external double labelTs;
+
+  @Int32()
+  external int labelHops;
+
+  @Array(agoraPostLabelBundleMax + 1)
+  external Array<Uint8> labelBundle;
 }
 
 /// A pure-Dart copy of one decoded event. Decoupled from native memory so it
@@ -410,6 +474,20 @@ class AtRawEvent {
     this.blocked = false,
     this.repTier = agoraTierUnknown,
     this.repCeiling = agoraNoCeiling,
+    this.postCommunity = '',
+    this.postLabels = const [],
+    this.policyCommunity = '',
+    this.policyId = '',
+    this.policySeq = 0,
+    this.policyTs = 0,
+    this.policyBundle = '',
+    this.labelCommunity = '',
+    this.labelPostId = '',
+    this.labelId = '',
+    this.labelSeq = 0,
+    this.labelTs = 0,
+    this.labelHops = 0,
+    this.labelBundle = '',
   });
 
   final int kind;
@@ -560,6 +638,32 @@ class AtRawEvent {
   /// Lets the app tell "low because they have earned little" from "bounded by
   /// a community decision" — different things to show a person.
   final double repCeiling;
+
+  /// [agoraEventPost] (Phase 4): the community the post was made in ("" for
+  /// none) and the author's own labels, both SIGNED with the post. The core
+  /// applied no policy; this app does, for communities it follows.
+  final String postCommunity;
+  final List<String> postLabels;
+
+  /// [agoraEventCommunityPolicy] (Phase 4). [uuid] is the CARRIER. [policySeq]
+  /// is the carrier's claim; the version that counts is the one inside the
+  /// verified [policyBundle].
+  final String policyCommunity;
+  final String policyId;
+  final int policySeq;
+  final double policyTs;
+  final String policyBundle;
+
+  /// [agoraEventPostLabel] (Phase 4). [uuid] is the PUBLISHER, not the
+  /// authority: the moderator's signature inside [labelBundle] is, and it
+  /// counts only against a policy that lists that moderator.
+  final String labelCommunity;
+  final String labelPostId;
+  final String labelId;
+  final int labelSeq;
+  final double labelTs;
+  final int labelHops;
+  final String labelBundle;
 }
 
 typedef _SetRootC = Void Function(Pointer<Utf8>);
@@ -635,6 +739,26 @@ typedef _AdvertiseBusinessC = Int32 Function(
     Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Int64);
 typedef _AdvertiseBusinessDart = int Function(
     Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, int);
+
+typedef _PublishPostScopedC = Int32 Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Utf8>, Int32, Pointer<Utf8>, Pointer<Utf8>);
+typedef _PublishPostScopedDart = int Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Utf8>, int, Pointer<Utf8>, Pointer<Utf8>);
+
+typedef _FollowCommunityC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Int64);
+typedef _FollowCommunityDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, int);
+
+typedef _UnfollowCommunityC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _UnfollowCommunityDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
+
+typedef _PublishPostLabelC = Int32 Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Int64);
+typedef _PublishPostLabelDart = int Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, int);
 
 typedef _PublishBusinessPostC = Int32 Function(
     Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Int64);
@@ -789,6 +913,10 @@ String _businessPostBundleString(Array<Uint8> src) {
   return utf8.decode(bytes, allowMalformed: true);
 }
 
+/// The ','-joined labels of a post as a list ('' -> none).
+List<String> _labelsList(String joined) =>
+    joined.isEmpty ? const [] : joined.split(',');
+
 /// Thin, fork-free client over the AutonomousTrust app-events queue.
 class AtEvents {
   AtEvents._(this._handle);
@@ -842,6 +970,18 @@ class AtEvents {
   static final _PublishBusinessPostDart _publishBusinessPost =
       _lib.lookupFunction<_PublishBusinessPostC, _PublishBusinessPostDart>(
           'agora_publish_business_post');
+  static final _PublishPostScopedDart _publishPostScoped =
+      _lib.lookupFunction<_PublishPostScopedC, _PublishPostScopedDart>(
+          'agora_publish_post_scoped');
+  static final _FollowCommunityDart _followCommunity =
+      _lib.lookupFunction<_FollowCommunityC, _FollowCommunityDart>(
+          'agora_follow_community');
+  static final _UnfollowCommunityDart _unfollowCommunity =
+      _lib.lookupFunction<_UnfollowCommunityC, _UnfollowCommunityDart>(
+          'agora_unfollow_community');
+  static final _PublishPostLabelDart _publishPostLabel =
+      _lib.lookupFunction<_PublishPostLabelC, _PublishPostLabelDart>(
+          'agora_publish_post_label');
   static final _PollDart _poll =
       _lib.lookupFunction<_PollC, _PollDart>('agora_events_poll');
   static final _CloseDart _close =
@@ -1063,6 +1203,74 @@ class AtEvents {
       return _publishPost(_handle, q, b, requiredTier);
     } finally {
       calloc.free(q);
+      calloc.free(b);
+    }
+  }
+
+  /// Publish a post in [community]'s name with the author's own [labels]
+  /// (Phase 4). Labels need a community and are 1..32 of [a-z0-9_-], at most
+  /// eight; a malformed scope publishes nothing. Returns 0, negative on error.
+  int publishPostScoped(String sendQueue, String body, int requiredTier,
+      {required String community, List<String> labels = const []}) {
+    final q = sendQueue.toNativeUtf8();
+    final b = body.toNativeUtf8();
+    final c = community.toNativeUtf8();
+    final l = labels.join(',').toNativeUtf8();
+    try {
+      return _publishPostScoped(_handle, q, b, requiredTier, c, l);
+    } finally {
+      calloc.free(q);
+      calloc.free(b);
+      calloc.free(c);
+      calloc.free(l);
+    }
+  }
+
+  /// Follow [community], holding [bundle] — its root-signed policy, which the
+  /// caller has ALREADY VERIFIED — at [seq]. Call again with a newer bundle to
+  /// replace it. The node then carries the policy and relays the community's
+  /// labels. Returns 0, negative on error.
+  int followCommunity(String sendQueue, String community, String bundle,
+      {int seq = 0}) {
+    final q = sendQueue.toNativeUtf8();
+    final c = community.toNativeUtf8();
+    final b = bundle.toNativeUtf8();
+    try {
+      return _followCommunity(_handle, q, c, b, seq);
+    } finally {
+      calloc.free(q);
+      calloc.free(c);
+      calloc.free(b);
+    }
+  }
+
+  /// Stop following [community]. Returns 0, negative on error.
+  int unfollowCommunity(String sendQueue, String community) {
+    final q = sendQueue.toNativeUtf8();
+    final c = community.toNativeUtf8();
+    try {
+      return _unfollowCommunity(_handle, q, c);
+    } finally {
+      calloc.free(q);
+      calloc.free(c);
+    }
+  }
+
+  /// Publish a moderator's label [bundle] on [postId] in [community]. Confers
+  /// nothing: a reader counts it only while its policy lists the moderator.
+  int publishPostLabel(String sendQueue, String community, String postId,
+      String bundle,
+      {int seq = 0}) {
+    final q = sendQueue.toNativeUtf8();
+    final c = community.toNativeUtf8();
+    final p = postId.toNativeUtf8();
+    final b = bundle.toNativeUtf8();
+    try {
+      return _publishPostLabel(_handle, q, c, p, b, seq);
+    } finally {
+      calloc.free(q);
+      calloc.free(c);
+      calloc.free(p);
       calloc.free(b);
     }
   }
@@ -1350,6 +1558,23 @@ class AtEvents {
           // at zero" rather than "unbounded".
           repCeiling:
               e.kind == agoraEventReputation ? e.repCeiling : agoraNoCeiling,
+          postCommunity: _boundedString(e.postCommunity, agoraBusinessDidMax),
+          postLabels: _labelsList(
+              _boundedString(e.postLabels, agoraPostLabelsMax)),
+          policyCommunity:
+              _boundedString(e.policyCommunity, agoraBusinessDidMax),
+          policyId: _postIdString(e.policyId),
+          policySeq: e.policySeq,
+          policyTs: e.policyTs,
+          policyBundle:
+              _boundedString(e.policyBundle, agoraCommunityPolicyBundleMax),
+          labelCommunity: _boundedString(e.labelCommunity, agoraBusinessDidMax),
+          labelPostId: _postIdString(e.labelPostId),
+          labelId: _postIdString(e.labelId),
+          labelSeq: e.labelSeq,
+          labelTs: e.labelTs,
+          labelHops: e.labelHops,
+          labelBundle: _boundedString(e.labelBundle, agoraPostLabelBundleMax),
         );
       }, growable: false);
     } finally {

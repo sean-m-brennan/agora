@@ -92,6 +92,16 @@ extern "C" {
 /* Record-class or op token. MUST match AT_APP_COSIGN_TOKEN_LEN. */
 #define AGORA_COSIGN_TOKEN_MAX 15
 
+/* Phase 4 communities. A post's community is a polity DID (AGORA_BUSINESS_DID_MAX);
+ * its labels cross joined with ','. MUST match AT_APP_POST_LABELS_LEN. */
+#define AGORA_POST_LABELS_MAX 263
+/* A community's opaque, root-signed policy artifact. MUST match
+ * AT_APP_COMMUNITY_POLICY_BUNDLE_LEN; measured worst case 2980 (ethne_ffi). */
+#define AGORA_COMMUNITY_POLICY_BUNDLE_MAX 4096
+/* A moderator's opaque, member-signed label. MUST match
+ * AT_APP_POST_LABEL_BUNDLE_LEN; measured worst case 969. */
+#define AGORA_POST_LABEL_BUNDLE_MAX 1536
+
 /* kind discriminator (a superset-safe subset of at_app_event_kind_t). */
 #define AGORA_EVENT_PEER               1
 #define AGORA_EVENT_REPUTATION         2
@@ -108,6 +118,8 @@ extern "C" {
 #define AGORA_EVENT_COSIGN_REQUEST     13
 #define AGORA_EVENT_COSIGN_SIGNATURE   14
 #define AGORA_EVENT_BUSINESS_POST      15
+#define AGORA_EVENT_COMMUNITY_POLICY   16
+#define AGORA_EVENT_POST_LABEL         17
 
 /**
  * One flattened app event. Field order is ABI-significant: the Dart
@@ -291,6 +303,38 @@ typedef struct {
     uint8_t blocked;                           /* AGORA_EVENT_PEER; 0/1 */
     int32_t rep_tier;                          /* AGORA_EVENT_REPUTATION; 0..4 */
     double  rep_ceiling;                       /* AGORA_EVENT_REPUTATION */
+    /* Communities (Phase 4, Ethne D37). Appended LAST after rep_ceiling, so
+     * every prior field offset is unchanged; the Dart AgoraEvent and the cohort
+     * ctypes Ev mirror this order and re-check the new sizeof.
+     *
+     * post_community / post_labels ride AGORA_EVENT_POST: the community a post
+     * was made in ("" = none) and the author's labels joined with ','. Both are
+     * SIGNED with the post. The core applied no policy; the app does, and only
+     * for communities it follows.
+     *
+     * policy_* ride AGORA_EVENT_COMMUNITY_POLICY: a policy carried by a node that
+     * follows the community; peer_uuid is the CARRIER. policy_bundle is OPAQUE
+     * and NOT verified by the core — run ethne_content_policy_verify on it, and
+     * keep the highest seq that verifies, before following or trusting it.
+     *
+     * label_* ride AGORA_EVENT_POST_LABEL: a moderator's labels on post
+     * label_post_id; peer_uuid is the PUBLISHER. label_bundle is OPAQUE — it
+     * counts only if ethne_post_label_verify accepts it against the policy you
+     * hold. */
+    char    post_community[AGORA_BUSINESS_DID_MAX + 1];
+    char    post_labels[AGORA_POST_LABELS_MAX + 1];
+    char    policy_community[AGORA_BUSINESS_DID_MAX + 1];
+    char    policy_id[AGORA_POST_ID_MAX + 1];
+    int64_t policy_seq;
+    double  policy_ts;
+    char    policy_bundle[AGORA_COMMUNITY_POLICY_BUNDLE_MAX + 1];
+    char    label_community[AGORA_BUSINESS_DID_MAX + 1];
+    char    label_post_id[AGORA_POST_ID_MAX + 1];
+    char    label_id[AGORA_POST_ID_MAX + 1];
+    int64_t label_seq;
+    double  label_ts;
+    int32_t label_hops;
+    char    label_bundle[AGORA_POST_LABEL_BUNDLE_MAX + 1];
 } agora_event_t;
 
 /** Set $AUTONOMOUS_TRUST_ROOT for THIS process, so the app-events client below
@@ -463,6 +507,30 @@ int agora_set_customer(void *handle, const char *send_queue,
 int agora_publish_business_post(void *handle, const char *send_queue,
                                 const char *polity_did, const char *bundle,
                                 int64_t seq);
+
+/** Publish a feed post in a community's name (Phase 4). As agora_publish_post,
+ *  plus @p community (a polity DID, or NULL/"" for none) and @p labels_csv (the
+ *  author's labels joined with ',', each 1..32 of [a-z0-9_-], at most eight;
+ *  labels need a community). A malformed scope publishes nothing. */
+int agora_publish_post_scoped(void *handle, const char *send_queue,
+                              const char *body, int required_tier,
+                              const char *community, const char *labels_csv);
+
+/** Follow a community holding @p bundle (its root-signed policy, VERIFIED first
+ *  with ethne_content_policy_verify) at @p seq; call again with a newer one to
+ *  replace it. The node carries the policy and relays the community's labels. */
+int agora_follow_community(void *handle, const char *send_queue,
+                           const char *community, const char *bundle, int64_t seq);
+
+/** Stop following a community. */
+int agora_unfollow_community(void *handle, const char *send_queue,
+                             const char *community);
+
+/** Publish a moderator's label (ethne_post_label_sign) on post @p post_id. Confers
+ *  nothing: a reader counts it only while its policy lists the moderator. */
+int agora_publish_post_label(void *handle, const char *send_queue,
+                             const char *community, const char *post_id,
+                             const char *bundle, int64_t seq);
 
 int agora_request_proximity(void *handle, const char *send_queue,
                             const uint8_t *peer_uuid);

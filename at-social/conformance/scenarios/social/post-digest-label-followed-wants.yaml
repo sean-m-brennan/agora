@@ -1,0 +1,28 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-digest-label-followed-wants
+byte_pinning: false
+description: |
+    A follower asks, directed, for a label it does not hold.
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+  - id: carol
+    role: group_member
+steps:
+  - id: 1
+    from: carol
+    to: carol
+    function: trigger_follow_community
+    payload: {"community": "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ", "bundle": "{\"policy\":\"stub\",\"seq\":3}", "seq": 3}
+  - id: 2
+    from: bob
+    to: carol
+    function: peer_post_digest
+    payload: {"label": [{"author": "alice", "community": "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ", "post_id": "2222222222222222222222222222222222222222222222222222222222222222", "seq": 1, "ts": 4102444800, "bundle": "{\"label\":\"stub\",\"labels\":[\"nsfw\"]}"}]}
+expected_state:
+  carol:
+    post_wants_emitted: 1

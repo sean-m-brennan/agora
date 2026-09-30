@@ -32,6 +32,7 @@ at_extension_library(social
         post.c
         business_ad.c
         business_post.c
+        community.c
         post_store.c
         cosign.c
         social_tx.c
@@ -50,6 +51,8 @@ at_extension_tests(social
     dm_test
     cosign_test
     post_test
+    post_scope_test
+    community_test
     post_multicast_test
     social_tx_test
     proximity_test

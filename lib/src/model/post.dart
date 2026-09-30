@@ -21,6 +21,8 @@ class Post {
     required this.requiredTier,
     required this.body,
     required this.outgoing,
+    this.community = '',
+    this.labels = const [],
   });
 
   /// The author's raw 16-byte identity uuid. For an incoming post this is the
@@ -50,6 +52,13 @@ class Post {
   /// True if this node published it (echoed locally), false if received.
   final bool outgoing;
 
+  /// The community (polity DID) the post was made in, or '' for none (Phase
+  /// 4). Signed with the post; a follower of the community applies its policy.
+  final String community;
+
+  /// The author's own labels, signed with the post (Phase 4).
+  final List<String> labels;
+
   /// Author uuid as lowercase hex.
   String get authorHex =>
       authorUuid.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
@@ -63,5 +72,7 @@ class Post {
         requiredTier: e.postRequiredTier,
         body: e.postBody,
         outgoing: false,
+        community: e.postCommunity,
+        labels: e.postLabels,
       );
 }

@@ -168,6 +168,39 @@ bool identity_get_last_business_post(const char *did, char *post_id_buf,
                                      size_t bundle_sz, int64_t *seq_out,
                                      int *hops_out);
 
+/* ---- Communities (Phase 4, Ethne D37) ------------------------------------- */
+
+/** The community and labels of the most-recent post accepted from AUTHOR
+ *  @p uuid_str: @p community_buf gets the DID ("" for an unscoped post) and
+ *  @p labels_buf the labels joined with ','. False when no post was accepted. */
+bool identity_get_last_post_scope(const char *uuid_str, char *community_buf,
+                                  size_t community_sz, char *labels_buf,
+                                  size_t labels_sz);
+
+/** Follow @p did holding @p bundle at @p seq, and persist; replaces a held
+ *  policy. 0, or -1 on bad input or when the follow bound is reached. */
+int identity_follow_community(const char *did, const char *bundle, int64_t seq);
+/** Stop following @p did, and persist. */
+void identity_unfollow_community(const char *did);
+/** Whether this node follows @p did. */
+bool identity_is_following(const char *did);
+/** The policy held for a followed @p did. */
+bool identity_get_followed_community(const char *did, int64_t *seq_out,
+                                     char *bundle_buf, size_t bundle_sz);
+/** Carry every followed policy now, first-person. Returns how many went out. */
+int identity_advertise_communities(const process_t *proc);
+/** What this node last HEARD of @p did's policy. */
+bool identity_get_last_community_policy(const char *did, int64_t *seq_out,
+                                        char *bundle_buf, size_t bundle_sz);
+/** Publish a moderator's label on @p post_id in @p did. 0 when sent. */
+int identity_publish_post_label(const process_t *proc, const char *did,
+                                const char *post_id, int64_t seq,
+                                const char *bundle);
+/** The label last accepted for post @p post_id. */
+bool identity_get_last_post_label(const char *post_id, char *community_buf,
+                                  size_t community_sz, int64_t *seq_out,
+                                  int *hops_out);
+
 /* Conformance/test seam (Phase 3 P3.2): install or clear THIS node's CUSTOMER
  * edge to business @p did WITHOUT putting an ad on the wire — the app's
  * AT_APP_SET_CUSTOMER verb minus its advertising half. A negative @p

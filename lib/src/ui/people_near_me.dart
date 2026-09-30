@@ -16,6 +16,7 @@ import '../model/tie_strength.dart';
 import 'blocked_list.dart';
 import 'businesses_near_me.dart';
 import 'circles_view.dart';
+import 'communities_view.dart';
 import 'dm_thread.dart';
 import 'feed_view.dart';
 import 'moderation_sheets.dart';
@@ -89,6 +90,16 @@ class _PeopleNearMePageState extends State<PeopleNearMePage> {
             onPressed: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
                 builder: (_) => BlockedListPage(service: service),
+              ),
+            ),
+          ),
+          IconButton(
+            key: const Key('open-communities'),
+            icon: const Icon(Icons.groups_outlined),
+            tooltip: 'Communities',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => CommunitiesPage(service: service),
               ),
             ),
           ),

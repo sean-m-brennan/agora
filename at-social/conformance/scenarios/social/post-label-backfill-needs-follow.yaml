@@ -1,0 +1,23 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-label-backfill-needs-follow
+byte_pinning: false
+description: |
+    A label that arrives by backfill passes the same follow gate as one that
+    arrives by multicast.
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_post_backfill
+    payload: {"kind": "label", "post": {"community": "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ", "post_id": "1111111111111111111111111111111111111111111111111111111111111111", "seq": 1, "ts": 0, "bundle": "{\"label\":\"stub\",\"labels\":[\"nsfw\"]}", "hops": 0}}
+expected_state:
+  newcomer:
+    post_label_last:
+      "1111111111111111111111111111111111111111111111111111111111111111": {}

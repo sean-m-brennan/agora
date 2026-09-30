@@ -37,6 +37,8 @@ SOCIAL_TYPE(business_ad,        PEER_BUSINESS_AD_OBSERVED,        peer_business_
 SOCIAL_TYPE(cosign_request,     PEER_COSIGN_REQUEST_OBSERVED,     peer_cosign_request_msg_t)
 SOCIAL_TYPE(cosign_sig,         PEER_COSIGN_SIG_OBSERVED,         peer_cosign_sig_msg_t)
 SOCIAL_TYPE(business_post,      PEER_BUSINESS_POST_OBSERVED,      peer_business_post_msg_t)
+SOCIAL_TYPE(community_policy,   PEER_COMMUNITY_POLICY_OBSERVED,   peer_community_policy_msg_t)
+SOCIAL_TYPE(post_label,         PEER_POST_LABEL_OBSERVED,         peer_post_label_msg_t)
 
 /* The app verbs the social feature accepts. Every one is forwarded ONLY to
  * identity, which owns each store and each signed or encrypted send:
@@ -44,7 +46,8 @@ SOCIAL_TYPE(business_post,      PEER_BUSINESS_POST_OBSERVED,      peer_business_
  * posts (7), reactions, local block/unblock and reports (8, P4.1), presence
  * pull, local-only exact position and the proximity probe (Phase 2), business
  * page + customer edge (P3.2), both halves of a detached co-signature (P3.3),
- * and the envoy-signed business post (P3.4). */
+ * the envoy-signed business post (P3.4), and following a community and
+ * publishing a moderator's label (Phase 4). */
 AT_APP_VERB_REGISTER(set_position,           AT_APP_SET_POSITION,          "identity")
 AT_APP_VERB_REGISTER(set_profile,            AT_APP_SET_PROFILE,           "identity")
 AT_APP_VERB_REGISTER(connect_request,        AT_APP_CONNECT_REQUEST,       "identity")
@@ -63,5 +66,8 @@ AT_APP_VERB_REGISTER(return_cosign,          AT_APP_RETURN_COSIGN,         "iden
 AT_APP_VERB_REGISTER(request_attend,         AT_APP_REQUEST_ATTEND,        "identity")
 AT_APP_VERB_REGISTER(set_exact_position,     AT_APP_SET_EXACT_POSITION,    "identity")
 AT_APP_VERB_REGISTER(request_proximity,      AT_APP_REQUEST_PROXIMITY,     "identity")
+AT_APP_VERB_REGISTER(follow_community,       AT_APP_FOLLOW_COMMUNITY,      "identity")
+AT_APP_VERB_REGISTER(unfollow_community,     AT_APP_UNFOLLOW_COMMUNITY,    "identity")
+AT_APP_VERB_REGISTER(publish_post_label,     AT_APP_PUBLISH_POST_LABEL,    "identity")
 
 void at_social_msg_types_link(void) {}

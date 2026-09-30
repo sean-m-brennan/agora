@@ -46,7 +46,8 @@ SOCIAL_FILENAME = 'social.cfg.json'
 #: The shape is ``{"version": 1, "blocks": {"<uuid>": {"at": <epoch>,
 #: "reason": ""}}}``. A MAP rather than an array so an unblock is a delete and a
 #: rewrite is idempotent; a top-level ``blocks`` key beside ``version`` so box
-#: 5's per-community content policy can add a sibling without a migration.
+#: 5's per-community content policy can add a sibling without a migration --
+#: which it does: ``communities`` (Phase 4), written only when non-empty.
 SOCIAL_STORE_VERSION = 1
 
 
@@ -86,7 +87,32 @@ def social_store_load(cfg_dir):
     return out
 
 
-def social_store_save(blocks, cfg_dir):
+def social_store_load_communities(cfg_dir):
+    """The communities this node follows (Phase 4), as ``{did: {'bundle': str,
+    'seq': int}}``. Absent -- the node follows nothing -- is ``{}``; a malformed
+    key raises, as a malformed ``blocks`` does. Twin of C
+    ``social_store_load_all``."""
+    path = social_store_path(cfg_dir)
+    if not os.path.exists(path):
+        return {}
+    with open(path, 'r') as f:
+        doc = json.load(f)
+    com = doc.get('communities')
+    if com is None:
+        return {}
+    if not isinstance(com, dict):
+        raise ValueError('%s: communities is not an object' % path)
+    out = {}
+    for did, entry in com.items():
+        if (not isinstance(entry, dict) or not isinstance(entry.get('bundle'), str)
+                or not isinstance(entry.get('seq'), int)
+                or isinstance(entry.get('seq'), bool)):
+            raise ValueError('%s: malformed community %r' % (path, did))
+        out[str(did)] = {'bundle': entry['bundle'], 'seq': int(entry['seq'])}
+    return out
+
+
+def social_store_save(blocks, cfg_dir, communities=None):
     """Write @p blocks (``{uuid_str: at_epoch_float}``) to the document.
 
     Atomic, via :func:`atomic_write` -- a reader or a crash never sees a torn
@@ -104,6 +130,13 @@ def social_store_save(blocks, cfg_dir):
             for uuid_str, at in blocks.items()
         },
     }
+    # The followed communities (Phase 4), ONLY when there are any, so a node
+    # that follows nothing writes the document it always did.
+    if communities:
+        doc['communities'] = {
+            str(did): {'bundle': str(rec['bundle']), 'seq': int(rec['seq'])}
+            for did, rec in communities.items()
+        }
     with atomic_write(path) as f:
         json.dump(doc, f, indent=2, sort_keys=True)
     return path

@@ -1,0 +1,26 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-digest-label-unfollowed-no-want
+byte_pinning: false
+description: |
+    A digest offers each label WITH its community, so a node that does not
+    follow it asks for nothing. Asking would be wasted twice over: the label
+    would be dropped at the follow gate, and a dropped label never enters the
+    dedup ring, so it would be asked for again at every digest.
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+  - id: carol
+    role: group_member
+steps:
+  - id: 1
+    from: bob
+    to: carol
+    function: peer_post_digest
+    payload: {"label": [{"author": "alice", "community": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK", "post_id": "2222222222222222222222222222222222222222222222222222222222222222", "seq": 1, "ts": 4102444800, "bundle": "{\"label\":\"stub\",\"labels\":[\"nsfw\"]}"}]}
+expected_state:
+  carol:
+    post_wants_emitted: 0

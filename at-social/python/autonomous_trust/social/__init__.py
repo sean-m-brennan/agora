@@ -25,7 +25,7 @@ Python on either backend.
 
 Importing this package registers nothing. The core finds the feature through
 ``_at_extension.py`` (a source tree) or the ``autonomous_trust.extensions``
-entry point (an install); its Extension attaches the 17 verbs of
+entry point (an install); its Extension attaches the 22 verbs of
 ``protocol.SocialProtocol`` to the identity process and follows identity
 through the IdentityHooks. Present means on.
 """

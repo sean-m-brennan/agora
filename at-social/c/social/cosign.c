@@ -73,6 +73,13 @@ bool at_cosign_op_ok(const char *record, const char *op)
         return strcmp(op, "designate") == 0 || strcmp(op, "rotate") == 0
             || strcmp(op, "release") == 0;
     }
+    /* Phase 4 communities (Ethne D37): the roll replacing its content policy,
+     * and conferring or revoking an office (the Moderator). A resignation is
+     * self-signed, so it is not offered, as a departure is not. */
+    if (strcmp(record, "content_policy") == 0)
+        return strcmp(op, "amend") == 0;
+    if (strcmp(record, "office") == 0)
+        return strcmp(op, "confer") == 0 || strcmp(op, "revoke") == 0;
     return false;
 }
 

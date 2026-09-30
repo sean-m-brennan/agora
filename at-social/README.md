@@ -12,7 +12,7 @@ identity adapters' extension points.
 
 ```
 at-social/
-  c/social/            libat_social: sources, CMakeLists.txt, test/ (17 ctest)
+  c/social/            libat_social: sources, CMakeLists.txt, test/ (21 ctest)
   python/              the autonomous_trust.social distribution (pyproject, tests)
   conformance/         AT harness plug-in: scenarios/social/, conformance_plugin.py,
                        python/social_adapter.py, c/social_adapter.{c,h}
@@ -64,13 +64,14 @@ for it: a build has social when `AT_EXTERNAL_EXTENSIONS` names `c/social` (below
 from load-time constructors:
 
 - the identity hooks (AT's `identity/id_ext.h`, below);
-- its 37 identity verbs, 19 from the wire and 18 from the app, through
+- its 42 identity verbs, 21 from the wire and 21 from the app, through
   `processes/extension.h` on "identity" only;
-- its 12 message types and 18 `AT_APP_*` verbs (`social/social_msg_types.h`);
+- its 14 message types and 21 `AT_APP_*` verbs (`social/social_msg_types.h`);
 - the app-event decoders behind `at_agora.h`.
 
 The app-facing API kept its names: `at_agora.h`, `at_app_events_*`,
-`at_agora_event_*` and event kinds 4–15. The Agora shim and the Dart bindings
+`at_agora_event_*` and event kinds 4–15, to which Agora has appended 16 and 17
+(Phase 4 communities). The Agora shim and the Dart bindings
 changed only their link and include lines. The anchor is `at_social_link()`
 (`social/at_social.h`).
 
@@ -127,7 +128,8 @@ prefix `autonomous_trust.social.`), found by its entry point or its
 `_at_extension.py` marker. The modules are:
 
 - `protocol` holds `SocialProtocol`: the 17 verbs moved off `IdentityProtocol`
-  with their strings unchanged, and the three store-and-forward verbs;
+  with their strings unchanged, the three store-and-forward verbs, and the two
+  community verbs;
 - `extension` is the `Extension`;
 - `handlers` holds the handlers and senders, as module functions `f(proc, …)`;
 - `state` holds `SocialState`, on `proc.social`;
@@ -228,4 +230,58 @@ peer, and a post is never backfilled to its own author.
   is a singleton shared by every participant, so each scenario tests ONE hop.
 - `../test/cohort/partition_cohort.sh` runs the whole chain live across a real
   split.
+
+## Communities (Phase 4, Ethne D37)
+
+A community is an Ethne polity, and how content posted in its name is moderated
+is its roll's decision: what an author must meet (operator-bound, a lowest
+tier, a daily post cap) and what each label does (allow, warn, hide). The roll
+tightens the policy at a majority and loosens it only above one; a Moderator it
+seats labels posts alone. This library carries all of that and decides none
+of it. The policy and every label are opaque Ethne artifacts here, verified by
+the app, and the verdict for a post is the app's (`ethne_content_policy_verdict`
+in Agora's cdylib). A reader who does not follow a community sees its posts
+unmoderated.
+
+| Verb | Channel | Carries |
+|---|---|---|
+| `peer_post` (scoped) | group multicast | a post in a community's name: `"community"` and the author's `"labels"`, SIGNED — the canonical form gains a trailer only when a community is named, so every other post keeps its bytes and its id (`post.h`) |
+| `peer_community_policy` | group multicast, encrypted | the community's root-signed policy, carried in the FIRST PERSON by a node that follows it; never relayed (`community.h`) |
+| `peer_post_label` | group multicast, encrypted | a moderator's member-signed labels on one post; relayed under `POST_MAX_HOPS` by nodes that follow the community (`community.h`) |
+| `app_follow_community` / `app_unfollow_community` | app, local only | follow a community holding a policy the app verified; the core carries it and persists the follow |
+| `app_publish_post_label` | app | put a moderator's label on the wire; confers nothing |
+
+**The core never follows, replaces or trusts a policy from the wire.** A policy
+ad is signature-checked against its CARRIER, deduped, and handed to the app;
+the app verifies the community's root signature and, if it follows, hands the
+newer bundle back through `app_follow_community`. A carrier claiming a higher
+seq cannot freeze or roll back what a node holds.
+
+**The follow gate.** A label is dropped unread and unrelayed by a node that does
+not follow its community — the business-post page gate's twin — because a label
+matters only where the policy applies. Labels are stored for backfill, and a
+digest offers each one WITH its community, so a node that does not follow it
+never asks: it would only drop it, and a dropped label never enters the dedup
+ring, so it would ask again at every digest.
+
+**Persistence.** Follows live in `etc/at/social.cfg.json` beside the blocks, as
+`"communities": {"<did>": {"bundle", "seq"}}`, written only when non-empty, so a
+node that follows nothing writes the same bytes as before. Holders re-carry
+every `$AT_SOCIAL_POLICY_SEC` (default 300) and at the next sweep after a peer
+is confirmed.
+
+**Co-signing.** The courier's allowlist gains `content_policy`/`amend` and
+`office`/`confer`, `office`/`revoke`, so the roll acts behind a policy travel
+the same detached exchange an expulsion does.
+
+**Tests.** `post_scope_test.c` and `community_test.c` pin the canonical forms,
+literal for literal with `test_post_scope.py` and `test_community_codec.py`; 23
+conformance scenarios (`community-*`, `post-label-*`, `post-digest-label-*`,
+`post-digest-offers-a-stored-label`, `cosign-ask-content-policy-delivered`,
+`cosign-ask-office-conferral-delivered`) cover the verbs on both runtimes;
+`../test/cohort/community_policy_cohort.sh` runs it live.
+
+**Limits, stated.** A members-only posting rule is not here: it needs an author
+to prove that its node is a member, which nothing yet builds. The label store is
+in memory, like the post store.
 

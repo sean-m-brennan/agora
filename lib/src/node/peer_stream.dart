@@ -17,6 +17,8 @@ import '../model/attention_budget.dart';
 import '../model/business.dart';
 import '../model/business_directory.dart';
 import '../model/business_post.dart';
+import '../model/community_policy.dart';
+import '../model/community_policy_store.dart';
 import '../model/cosign_exchanges.dart';
 import '../model/dm.dart';
 import '../model/feed_entry.dart';
@@ -49,7 +51,11 @@ class PeerService extends ChangeNotifier {
     @visibleForTesting RollPublisher? rollPublisher,
     @visibleForTesting ModerationVerbs? moderationVerbs,
     @visibleForTesting PolityActs? polityActs,
+    @visibleForTesting CommunityCrypto? communityCrypto,
+    @visibleForTesting CommunityGovernance? communityGovernance,
   })  : _daemon = daemon ?? _defaultDaemon(),
+        _communityCryptoOverride = communityCrypto,
+        _governanceOverride = communityGovernance,
         _polityActsOverride = polityActs,
         _moderationVerbsOverride = moderationVerbs,
         _bundleVerifierOverride = bundleVerifier,
@@ -86,6 +92,11 @@ class PeerService extends ChangeNotifier {
   /// Test-only stand-in for the polity acts an expulsion needs. Null in the
   /// app, where they are the cdylib over this node's charter archive.
   final PolityActs? _polityActsOverride;
+
+  /// Test-only stand-ins for the community-policy crypto and the roll acts
+  /// behind it (Phase 4). Null in the app, where the cdylib does both.
+  final CommunityCrypto? _communityCryptoOverride;
+  final CommunityGovernance? _governanceOverride;
 
   /// Build the default daemon. When $AGORA_EXTERNAL_DAEMON is set (to a non-empty
   /// value other than "0"/"false"), attach to an already-running `agorad` under
@@ -531,6 +542,7 @@ class PeerService extends ChangeNotifier {
       nameOfBusiness: _nameOfBusiness,
       recency: (ts) => _feed.recency(ts, now),
       isHiddenAuthor: isBlockedUuid,
+      verdictOf: verdictFor,
     );
   }
 
@@ -585,11 +597,18 @@ class PeerService extends ChangeNotifier {
   /// post is echoed into the local feed IMMEDIATELY (the core does not echo it
   /// back). Returns the shim rc (0 ok, -2 daemon not ready), or -1 if no channel
   /// is open yet or the body is empty.
-  int publishPost(String body, PostAudience audience) {
+  ///
+  /// [community] makes it a post in that community's name, with the author's
+  /// own [labels] (Phase 4): both are signed with the post, and followers of
+  /// the community apply its policy to it. Labels need a community.
+  int publishPost(String body, PostAudience audience,
+      {String community = '', List<String> labels = const []}) {
     final trimmed = body.trim();
     if (trimmed.isEmpty) return -1;
+    if (community.isEmpty && labels.isNotEmpty) return -1;
     final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
     final tier = minTierForAudience(audience);
+    final sorted = (labels.toSet().toList()..sort());
     _feed.add(Post(
       authorUuid: const [],
       postId: '', // the core computes the real content id; not returned to app
@@ -598,13 +617,18 @@ class PeerService extends ChangeNotifier {
       requiredTier: tier,
       body: trimmed,
       outgoing: true,
+      community: community,
+      labels: sorted,
     ));
     final ev = _events;
     if (ev == null) {
       notifyListeners();
       return -1;
     }
-    final rc = ev.publishPost(_daemon.queues.appToAt, trimmed, tier);
+    final rc = community.isEmpty
+        ? ev.publishPost(_daemon.queues.appToAt, trimmed, tier)
+        : ev.publishPostScoped(_daemon.queues.appToAt, trimmed, tier,
+            community: community, labels: sorted);
     notifyListeners();
     return rc;
   }
@@ -1302,6 +1326,359 @@ class PeerService extends ChangeNotifier {
     return true;
   }
 
+  // --- communities (Phase 4, Ethne D37) -------------------------------------
+
+  CommunityPolicyStore? _communityStore;
+  final CommunityBook _communityFallback = CommunityBook();
+
+  /// The communities this reader follows, has heard, and has switched off.
+  CommunityBook get communities => _communityStore?.book ?? _communityFallback;
+
+  CommunityCrypto? get _crypto {
+    final o = _communityCryptoOverride;
+    if (o != null) return o;
+    final lib = _ethneLib();
+    return lib == null ? null : _EthneCommunityCrypto(lib);
+  }
+
+  void _saveCommunities() => _communityStore?.save();
+
+  /// A policy carried to us (Phase 4). The core verified only the CARRIER; the
+  /// community's root signature is checked HERE, and an unverifiable policy is
+  /// dropped. A newer version of one we follow replaces it, in the core as
+  /// well, since the core never replaces a held policy from the wire. The
+  /// policy of the community this node is a member of is followed on sight.
+  bool _ingestCommunityPolicy(AtRawEvent e) {
+    if (e.kind != agoraEventCommunityPolicy) return false;
+    final read = _crypto?.verifyPolicy(e.policyBundle);
+    if (read == null) return true;
+    final policy = CommunityPolicy.fromVerified(read, e.policyBundle);
+    if (policy.communityDid != e.policyCommunity) return true;
+    final newer = communities.hear(policy);
+    if (newer) {
+      _events?.followCommunity(
+          _daemon.queues.appToAt, policy.communityDid, policy.bundle,
+          seq: policy.seq);
+    } else if (policy.communityDid == ownPolityDid &&
+        !communities.followed.containsKey(policy.communityDid)) {
+      followCommunity(policy.communityDid);
+    }
+    _saveCommunities();
+    notifyListeners();
+    return true;
+  }
+
+  /// A moderator's label (Phase 4). Kept as it arrived; whether it counts is
+  /// decided against the policy at verdict time, so a moderator revoked later
+  /// stops counting without anyone re-labelling anything.
+  bool _ingestPostLabel(AtRawEvent e) {
+    if (e.kind != agoraEventPostLabel) return false;
+    if (communities.addLabel(HeldLabel(
+        labelId: e.labelId,
+        communityDid: e.labelCommunity,
+        postId: e.labelPostId,
+        bundle: e.labelBundle))) {
+      notifyListeners();
+    }
+    return true;
+  }
+
+  /// How this reader shows [p] under its community's policy, or null when no
+  /// policy applies: the post names no community, or one this reader does not
+  /// follow or has switched off. A verdict the library cannot compute is
+  /// treated as none rather than as a hide — this reader then sees the post as
+  /// a non-follower would.
+  PolicyVerdict? verdictFor(Post p) {
+    if (p.community.isEmpty) return null;
+    final policy = communities.applying(p.community);
+    final crypto = _crypto;
+    if (policy == null || crypto == null) return null;
+    final peer = _peers[_hex(p.authorUuid)];
+    try {
+      return PolicyVerdict.fromJson(crypto.verdict(
+        policyBundle: policy.bundle,
+        postId: p.postId,
+        authorLabels: p.labels,
+        labels: communities.labelsFor(p.community, p.postId),
+        authorTier: peer == null ? 0 : trustTier(peer),
+        authorOperatorBound: peer?.operatorBound ?? false,
+        authorPostIndexToday: communities.indexToday(p),
+      ));
+    } on Object {
+      return null;
+    }
+  }
+
+  /// The posts a community's policy is hiding from this reader, with why. Held,
+  /// not deleted: switching the policy off restores them at once.
+  List<({Post post, PolicyVerdict verdict})> get feedHiddenByPolicy => [
+        for (final p in _feed.posts)
+          if (!p.outgoing && !isBlockedUuid(p.authorUuid))
+            if (verdictFor(p) case final v? when v.action == PolicyAction.hide)
+              (post: p, verdict: v),
+      ];
+
+  /// Follow [did], holding the newest policy heard for it. Returns false when
+  /// none has been heard.
+  bool followCommunity(String did) {
+    final p = communities.follow(did);
+    if (p == null) return false;
+    _events?.followCommunity(_daemon.queues.appToAt, did, p.bundle, seq: p.seq);
+    _saveCommunities();
+    notifyListeners();
+    return true;
+  }
+
+  void unfollowCommunity(String did) {
+    communities.unfollow(did);
+    _events?.unfollowCommunity(_daemon.queues.appToAt, did);
+    _saveCommunities();
+    notifyListeners();
+  }
+
+  /// Apply [did]'s policy to this reader's own feed, or set it aside. Local:
+  /// nothing leaves this node, and this node still carries the policy.
+  void setCommunityPolicyApplied(String did, bool applied) {
+    if (applied) {
+      communities.disabled.remove(did);
+    } else if (communities.followed.containsKey(did)) {
+      communities.disabled.add(did);
+    }
+    _saveCommunities();
+    notifyListeners();
+  }
+
+  /// Whether this node may label posts in [did]: its member key is among the
+  /// moderators the held policy lists.
+  bool canModerate(String did) {
+    final me = staffIdentity?.did;
+    final p = communities.followed[did];
+    return me != null && p != null && p.moderators.contains(me);
+  }
+
+  int _labelSeq = 0;
+
+  /// Label [post] as a moderator of its community. An empty [labels] retracts
+  /// this moderator's earlier labels on it. Returns the shim rc, or -1 when
+  /// this node cannot moderate there or the label could not be signed.
+  int labelPost(Post post, List<String> labels) {
+    final me = staffIdentity;
+    final crypto = _crypto;
+    if (me == null || crypto == null || !canModerate(post.community)) return -1;
+    // Later labels must win; milliseconds are monotonic enough for one node.
+    final seq = DateTime.now().millisecondsSinceEpoch + _labelSeq++;
+    final String bundle;
+    try {
+      bundle = crypto.signLabel(
+          communityDid: post.community,
+          postId: post.postId,
+          labels: labels,
+          seq: seq,
+          moderatorPriv: me.priv,
+          moderatorDid: me.did);
+    } on Object {
+      return -1;
+    }
+    communities.addLabel(HeldLabel(
+        labelId: 'local:$seq',
+        communityDid: post.community,
+        postId: post.postId,
+        bundle: bundle));
+    final rc = _events?.publishPostLabel(
+            _daemon.queues.appToAt, post.community, post.postId, bundle,
+            seq: seq) ??
+        -1;
+    notifyListeners();
+    return rc;
+  }
+
+  CommunityGovernance? get _governance {
+    final o = _governanceOverride;
+    if (o != null) return o;
+    final arc = _polityArchive;
+    final lib = _ethneLib();
+    final self = staffIdentity;
+    if (arc == null || lib == null || self == null) return null;
+    return _ArchiveCommunityGovernance(arc, lib, self, _staff?.identity?.root);
+  }
+
+  /// Whether this node can propose its community's policy or its moderators.
+  bool get canGovernCommunity => ownPolityDid != null && _governance != null;
+
+  /// Why the last community act was refused, in the library's words.
+  String? lastCommunityError;
+
+  /// If this node holds its polity's ROOT key, mint the policy its log says is
+  /// in force and follow it — which is also what carries it. Returns whether a
+  /// policy was published.
+  bool publishOwnPolicy() {
+    final gov = _governance;
+    final did = ownPolityDid;
+    final crypto = _crypto;
+    if (gov == null || did == null || crypto == null) return false;
+    final String? bundle;
+    try {
+      bundle = gov.mintPolicy(did);
+    } on Object {
+      return false;
+    }
+    if (bundle == null) return false;
+    final read = crypto.verifyPolicy(bundle);
+    if (read == null) return false;
+    communities.hear(CommunityPolicy.fromVerified(read, bundle));
+    return followCommunity(did);
+  }
+
+  /// Propose replacing this community's policy with [policy] (Ethne
+  /// `ContentPolicy` JSON), co-signed by [deciderDids] over the same exchange
+  /// an expulsion uses.
+  AuthoredExchange? beginPolicyAmendment({
+    required Map<String, dynamic> policy,
+    required String rationale,
+    required List<String> deciderDids,
+    required List<AgoraPeer> askPeers,
+  }) =>
+      _beginGovernanceAct(
+          (gov, did) => gov.pendingPolicy(
+              polityDid: did,
+              policy: policy,
+              rationale: rationale,
+              deciderDids: deciderDids),
+          subjectDid: '',
+          askPeers: askPeers);
+
+  /// Propose seating ([confer] true) or unseating [holderDid] as Moderator.
+  AuthoredExchange? beginModeratorChange({
+    required String holderDid,
+    required bool confer,
+    required String rationale,
+    required List<String> deciderDids,
+    required List<AgoraPeer> askPeers,
+  }) =>
+      _beginGovernanceAct(
+          (gov, did) => gov.pendingModerator(
+              polityDid: did,
+              holderDid: holderDid,
+              confer: confer,
+              rationale: rationale,
+              deciderDids: deciderDids),
+          subjectDid: holderDid,
+          askPeers: askPeers);
+
+  AuthoredExchange? _beginGovernanceAct(
+      Map<String, dynamic> Function(CommunityGovernance, String) pendingOf,
+      {required String subjectDid,
+      required List<AgoraPeer> askPeers}) {
+    lastCommunityError = null;
+    final gov = _governance;
+    final did = ownPolityDid;
+    if (gov == null || did == null) {
+      lastCommunityError = 'This node cannot sign for a community.';
+      notifyListeners();
+      return null;
+    }
+    final Map<String, dynamic> pending;
+    try {
+      pending = pendingOf(gov, did);
+    } on Object catch (e) {
+      lastCommunityError = '$e';
+      notifyListeners();
+      return null;
+    }
+    final ax = AuthoredExchange.fromPending(pending,
+        memberDid: subjectDid, createdAt: _nowSec());
+    final own = staffIdentity?.did;
+    final othersNeeded = ax.signersRequired.any((d) => d != own);
+    if (othersNeeded && askPeers.isEmpty) {
+      lastCommunityError = 'Pick at least one peer to ask for a signature.';
+      notifyListeners();
+      return null;
+    }
+    if (own != null && ax.signersRequired.contains(own)) {
+      try {
+        _cosign.addSignature(CosignSignature(
+            cid: ax.cid, signerDid: own, sig: gov.signOwn(ax.bytes), ts: 0));
+      } on Object catch (e) {
+        lastCommunityError = '$e';
+        notifyListeners();
+        return null;
+      }
+    }
+    if (othersNeeded) {
+      final rc = _moderationVerbs.requestCosign(
+          [for (final p in askPeers) p.uuid],
+          record: ax.record,
+          op: ax.op,
+          polityDid: ax.polityDid,
+          cid: ax.cid,
+          bytes: ax.bytes);
+      if (rc != 0) {
+        lastCommunityError = rc == -2
+            ? 'Not connected yet — the ask was not sent.'
+            : 'The ask could not be sent.';
+        notifyListeners();
+        return null;
+      }
+    }
+    _cosign.addAuthored(ax);
+    notifyListeners();
+    return ax;
+  }
+
+  /// Close a policy amendment or a Moderator change once every decider has
+  /// signed: assemble, re-verify the whole log (a loosening short of its bar
+  /// fails HERE and nothing is kept), persist, and — on the node that holds the
+  /// root key — publish the new policy. Returns whether the act landed.
+  bool completeCommunityAct(AuthoredExchange ax) {
+    lastCommunityError = null;
+    final gov = _governance;
+    if (gov == null || !expulsionReady(ax)) {
+      lastCommunityError = 'Not every decider has signed yet.';
+      notifyListeners();
+      return false;
+    }
+    final sigs = countedSignatures(ax);
+    try {
+      gov.assemble(ax.record, ax.payload,
+          [for (final s in sigs) (did: s.signerDid, sig: s.sig)]);
+    } on Object catch (e) {
+      return _communityActFailed(ax, '$e');
+    }
+    _affirmationState = null;
+    _guardianStateMap = null;
+    _polityVerified = null;
+    final bool verified;
+    try {
+      verified = gov.verify();
+    } on Object catch (e) {
+      _openPolityArchive();
+      return _communityActFailed(ax, '$e');
+    }
+    if (!verified) {
+      _openPolityArchive();
+      return _communityActFailed(ax,
+          'The log did not verify after the append (a loosening needs more than a majority); nothing was kept.');
+    }
+    try {
+      _staff?.updateArchive(gov.dump());
+      _staff?.save();
+    } on Object {
+      // Landed in memory; the save reports its own failure.
+    }
+    ax.status = AuthoredStatus.landed;
+    publishOwnPolicy();
+    notifyListeners();
+    return true;
+  }
+
+  bool _communityActFailed(AuthoredExchange ax, String why) {
+    ax.status = AuthoredStatus.failed;
+    ax.error = why;
+    lastCommunityError = why;
+    notifyListeners();
+    return false;
+  }
+
   // --- expulsion, initiated here (Phase 4 P4.1) ------------------------------
 
   PolityActs? get _polityActs {
@@ -1520,6 +1897,10 @@ class PeerService extends ChangeNotifier {
             File('${_daemon.root}/etc/at/agora.polity.json'))
         .load();
     _openPolityArchive();
+    // The communities this reader follows (Phase 4), every bundle re-verified.
+    _communityStore = await CommunityPolicyStore(
+            File('${_daemon.root}/etc/at/agora.communities.json'))
+        .load((b) => _crypto?.verifyPolicy(b));
 
     // Resolve our in-process event sockets under the same config root as the
     // daemon (Dart cannot setenv its own process; the shim does it in C).
@@ -1538,6 +1919,14 @@ class PeerService extends ChangeNotifier {
     }
 
     _events!.requestRoster(_daemon.queues.appToAt);
+    // Hand the core what this reader follows, so it carries each policy even if
+    // its own record was lost, and mint our own community's policy if this node
+    // holds the polity's root key.
+    for (final p in communities.followed.values) {
+      _events!.followCommunity(_daemon.queues.appToAt, p.communityDid, p.bundle,
+          seq: p.seq);
+    }
+    publishOwnPolicy();
     // If the operator opted in before the channel was ready, push it now.
     if (_ownGeohash != null) {
       _events!.setPosition(_daemon.queues.appToAt, _ownGeohash!);
@@ -1584,6 +1973,9 @@ class PeerService extends ChangeNotifier {
       // A business ad — routed into the directory after Ethne verification.
       if (_ingestBusinessAd(e)) continue;
       if (_ingestBusinessPost(e)) continue;
+      // A community's policy, and a moderator's label (Phase 4).
+      if (_ingestCommunityPolicy(e)) continue;
+      if (_ingestPostLabel(e)) continue;
       // A co-signature ask, and a signature coming back — a live exchange.
       if (_ingestCosignRequest(e)) continue;
       if (_ingestCosignSignature(e)) continue;
@@ -1677,6 +2069,121 @@ class _ArchivePolityActs implements PolityActs {
       for (final m in members)
         if (m is Map && m['did'] is String) m['did'] as String,
     ];
+  }
+
+  @override
+  Map<String, dynamic> dump() =>
+      jsonDecode(_arc.dumpJson()) as Map<String, dynamic>;
+}
+
+/// The community-policy crypto over the Ethne cdylib (Phase 4).
+class _EthneCommunityCrypto implements CommunityCrypto {
+  _EthneCommunityCrypto(this._lib);
+  final EthneFfi _lib;
+
+  @override
+  Map<String, dynamic>? verifyPolicy(String bundle) =>
+      _lib.verifyContentPolicy(bundle);
+
+  @override
+  Map<String, dynamic> verdict({
+    required String policyBundle,
+    required String postId,
+    required List<String> authorLabels,
+    required List<String> labels,
+    required int authorTier,
+    required bool authorOperatorBound,
+    required int authorPostIndexToday,
+  }) =>
+      _lib.contentPolicyVerdict(
+          policyJson: policyBundle,
+          postId: postId,
+          authorLabels: authorLabels,
+          labels: labels,
+          authorTier: authorTier,
+          authorOperatorBound: authorOperatorBound,
+          authorPostIndexToday: authorPostIndexToday);
+
+  @override
+  String signLabel({
+    required String communityDid,
+    required String postId,
+    required List<String> labels,
+    required int seq,
+    required Map<String, dynamic> moderatorPriv,
+    required String moderatorDid,
+  }) =>
+      _lib.signPostLabel(
+          communityDid: communityDid,
+          postId: postId,
+          labels: labels,
+          seq: seq,
+          moderator: EthneKeypair(moderatorDid, moderatorPriv, const {}));
+}
+
+/// The community's roll acts over this node's charter archive (Phase 4).
+class _ArchiveCommunityGovernance implements CommunityGovernance {
+  _ArchiveCommunityGovernance(this._arc, this._lib, this._self, this._root);
+  final EthneArchive _arc;
+  final EthneFfi _lib;
+  final EthneKeypair _self;
+  final EthneKeypair? _root;
+
+  @override
+  Map<String, dynamic> pendingPolicy({
+    required String polityDid,
+    required Map<String, dynamic> policy,
+    required String rationale,
+    required List<String> deciderDids,
+  }) =>
+      _arc.pendingChange(
+          record: 'content_policy',
+          op: 'amend',
+          polityDid: polityDid,
+          memberDid: '',
+          rationale: rationale,
+          deciderDids: deciderDids,
+          policy: policy);
+
+  @override
+  Map<String, dynamic> pendingModerator({
+    required String polityDid,
+    required String holderDid,
+    required bool confer,
+    required String rationale,
+    required List<String> deciderDids,
+  }) =>
+      _arc.pendingChange(
+          record: 'office',
+          op: confer ? 'confer' : 'revoke',
+          office: 'Moderator',
+          polityDid: polityDid,
+          memberDid: holderDid,
+          rationale: rationale,
+          deciderDids: deciderDids);
+
+  @override
+  String signOwn(String bytesHex) =>
+      _lib.signDetached(priv: _self.priv, bytesHex: bytesHex);
+
+  @override
+  void assemble(String record, Map<String, dynamic> payload,
+          List<({String did, String sig})> signatures) =>
+      _arc.assembleSigned(
+          record: record, payload: payload, signatures: signatures);
+
+  @override
+  bool verify() => _arc.verify();
+
+  @override
+  Map<String, dynamic> policyState(String polityDid) =>
+      _arc.contentPolicyState(polityDid);
+
+  @override
+  String? mintPolicy(String polityDid) {
+    final root = _root;
+    if (root == null) return null;
+    return _arc.signContentPolicy(polityDid: polityDid, root: root);
   }
 
   @override

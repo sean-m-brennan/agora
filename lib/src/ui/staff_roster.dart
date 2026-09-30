@@ -561,8 +561,22 @@ class _AuthoredTile extends StatelessWidget {
     final missing = exchange.signersRequired
         .where((d) => !counted.any((s) => s.signerDid == d))
         .toList();
+    // A community act (Phase 4) rides the same exchange as an expulsion but
+    // lands differently: nothing is capped, and the new policy is published.
+    final community = exchange.record == 'content_policy' ||
+        exchange.record == 'office';
+    final title = switch (exchange.record) {
+      'content_policy' => 'Replace the content policy',
+      'office' => exchange.op == 'confer'
+          ? 'Seat ${_short(exchange.memberDid)} as moderator'
+          : 'Unseat ${_short(exchange.memberDid)} as moderator',
+      _ => 'Expel ${_short(exchange.memberDid)}',
+    };
     final status = switch (exchange.status) {
       AuthoredStatus.collecting => '${counted.length} of $need signed',
+      AuthoredStatus.landed when community =>
+        'Recorded. The policy readers follow is republished by the node '
+            'holding the community\'s root key.',
       AuthoredStatus.landed => exchange.targetPeerUuid == null
           ? 'Recorded. No peer was picked, so no standing was changed.'
           : (exchange.standingRc == 0
@@ -579,8 +593,7 @@ class _AuthoredTile extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Expel ${_short(exchange.memberDid)}',
-                style: const TextStyle(fontWeight: FontWeight.w600)),
+            Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
             const SizedBox(height: 4),
             Text(status, key: const Key('authored-status')),
             if (exchange.status == AuthoredStatus.collecting &&
@@ -593,9 +606,11 @@ class _AuthoredTile extends StatelessWidget {
                 child: FilledButton(
                   key: const Key('authored-complete'),
                   onPressed: service.expulsionReady(exchange)
-                      ? () => service.completeExpulsion(exchange)
+                      ? () => community
+                          ? service.completeCommunityAct(exchange)
+                          : service.completeExpulsion(exchange)
                       : null,
-                  child: const Text('Record expulsion'),
+                  child: Text(community ? 'Record it' : 'Record expulsion'),
                 ),
               ),
           ],

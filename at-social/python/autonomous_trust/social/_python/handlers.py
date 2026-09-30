@@ -25,7 +25,8 @@ import os
 import time
 from queue import Full
 from . import proximity
-from .social_store import social_store_load, social_store_save
+from .social_store import (social_store_load, social_store_load_communities,
+                           social_store_save)
 from autonomous_trust.core._python.config import to_json_string, from_json_string
 from autonomous_trust.core._python.network import Message
 from .protocol import SocialProtocol
@@ -967,9 +968,12 @@ def _persist_social_blocks(proc, cfg_dir=None):
     """
     try:
         from autonomous_trust.core._python.config.configuration import Configuration
+        # The blocks AND the followed communities (Phase 4): one document, so
+        # saving either writes both, or a block would forget every follow.
         social_store_save(
             dict(proc.social.social_blocks),
-            cfg_dir if cfg_dir is not None else Configuration.get_cfg_dir())
+            cfg_dir if cfg_dir is not None else Configuration.get_cfg_dir(),
+            communities=dict(proc.social.communities))
         return True
     except (OSError, IOError, ValueError) as err:
         proc.logger.warning('Could not persist social blocks: %s', err)
@@ -982,8 +986,9 @@ def load_social_blocks(proc, cfg_dir=None):
     blocked peer's messages land."""
     try:
         from autonomous_trust.core._python.config.configuration import Configuration
-        restored = social_store_load(
-            cfg_dir if cfg_dir is not None else Configuration.get_cfg_dir())
+        where = cfg_dir if cfg_dir is not None else Configuration.get_cfg_dir()
+        restored = social_store_load(where)
+        follows = social_store_load_communities(where)
     except (OSError, IOError, ValueError) as err:
         proc.logger.warning(
             'social blocks unreadable (%s) — starting with NO blocks; the '
@@ -992,6 +997,7 @@ def load_social_blocks(proc, cfg_dir=None):
         return 0
     with proc.lock:
         proc.social.social_blocks = dict(restored)
+        proc.social.communities = dict(follows)
         return len(proc.social.social_blocks)
 
 def reload_social_blocks(proc, cfg_dir=None):
@@ -1156,11 +1162,18 @@ def _ingest_post(proc, queues, body, via_group):
             proc.logger.warning('peer_post malformed, refusing')
             return True
         from .codec import (post_verify, post_content_id,
-                                    bound_post_body, POST_TIER_MIN,
-                                    POST_TIER_MAX)
+                                    bound_post_body, post_scope_from_json,
+                                    POST_TIER_MIN, POST_TIER_MAX)
         if tier < POST_TIER_MIN or tier > POST_TIER_MAX:
             proc.logger.warning('peer_post bad tier %r, refusing', tier)
             return True
+        # A post in a community's name (Phase 4) carries a signed scope;
+        # anything present must be well-formed, since the signature covers it.
+        scope = post_scope_from_json(body)
+        if scope is None:
+            proc.logger.warning('peer_post malformed scope, refusing')
+            return True
+        community, labels = scope
         from nacl.signing import VerifyKey
         # Resolve the verify key, binding uuid <-> key where we can.
         peer = proc.peers.find_by_uuid(author) if proc.peers else None
@@ -1181,7 +1194,7 @@ def _ingest_post(proc, queues, body, via_group):
                     str(author)[:8])
                 return True
         if not post_verify(vk, author, int(seq), float(ts), int(tier),
-                           text, sig):
+                           text, sig, community, labels):
             proc.logger.warning(
                 'peer_post from %s: BAD SIGNATURE, dropping', str(author)[:8])
             return True
@@ -1196,7 +1209,8 @@ def _ingest_post(proc, queues, body, via_group):
                 str(author)[:8], int(tier), author_tier)
             return True
         # Content-id dedup (the app-content store): drop a repeat.
-        pid = post_content_id(author, int(seq), float(ts), int(tier), text)
+        pid = post_content_id(author, int(seq), float(ts), int(tier), text,
+                              community, labels)
         with proc.lock:
             if pid in proc.social._seen_post_ids:
                 proc.logger.debug('peer_post %s already seen, dropping', pid)
@@ -1226,16 +1240,23 @@ def _ingest_post(proc, queues, body, via_group):
                     'peer_post %s from %s hidden (locally blocked)',
                     pid, str(author)[:8])
                 return True
+            # Shown as any post is: the community's policy is the APP's to
+            # apply, and a reader who does not follow the community sees it
+            # unmoderated (Phase 4). Twin of C _last_post_store.
             proc.social.last_post[str(author)] = {
                 'post_id': pid,
                 'seq': int(seq),
                 'ts': float(ts),
                 'tier': int(tier),
                 'body': bound_post_body(text),
+                'community': community,
+                'labels': list(labels),
             }
-        proc.logger.debug('post %s from %s accepted (hops=%d%s)',
-                          pid, str(author)[:8], int(hops),
-                          '' if via_group else ', backfilled')
+        # A backfilled acceptance is said at INFO: rare, and the only evidence
+        # the heal delivered it when no app is attached. Mirrors C _ingest_post.
+        (proc.logger.debug if via_group else proc.logger.info)(
+            'post %s from %s accepted (hops=%d%s)', pid, str(author)[:8],
+            int(hops), '' if via_group else ', backfilled')
     except Exception as err:
         proc.report_exception(err, 'handle_post')
     return True
@@ -1595,7 +1616,10 @@ def _business_post_publish(proc, queues, did, seq, bundle):
             'ts': ts,
             'bundle': bundle,
             'sig': sig,
-            'hops': int(hops),
+            # A publish is always hop 0. This read an undefined `hops` until
+            # Phase 4, so every Python publish raised NameError into the
+            # handler below and never went out; nothing drove it.
+            'hops': 0,
         })
         out = Message(proc.name, SocialProtocol.business_post, payload,
                       to_whom=proc.group, from_whom=proc.identity)
@@ -1830,12 +1854,22 @@ def send_post_digest(proc, queues):
     with proc.lock:
         feed = _digest_ids_locked(proc.social.feed_store, now)
         biz = _digest_ids_locked(proc.social.biz_store, now)
+        # A label is offered WITH its community (Phase 4), so a peer that does
+        # not follow it asks for nothing. Twin of C identity_send_post_digest.
+        label = []
+        for lid in _digest_ids_locked(proc.social.label_store, now):
+            env = from_json_string(proc.social.label_store[lid]['env'])
+            if isinstance(env, dict) and isinstance(env.get('community'), str):
+                label.append({'id': lid, 'community': env['community']})
         proc.social.last_digest_at = now
-    if not feed and not biz:
+    if not feed and not biz and not label:
         return 1
+    digest = {'feed': feed, 'biz': biz}
+    if label:
+        digest['label'] = label
     try:
         out = Message(proc.name, SocialProtocol.post_digest,
-                      to_json_string({'feed': feed, 'biz': biz}),
+                      to_json_string(digest),
                       to_whom=proc.group, from_whom=proc.identity)
         queues[CfgIds.network].put(out, block=True, timeout=proc.q_cadence)
         return 0
@@ -1909,13 +1943,25 @@ def handle_post_digest(proc, queues, message):
                 want[kind] = [i for i in ids
                               if isinstance(i, str) and len(i) == 64
                               and i not in seen][:POST_WANT_MAX]
-            if not (want['feed'] or want['biz']):
+            # Labels: only those for communities we follow, and do not hold.
+            offered = body.get('label')
+            offered = offered if isinstance(offered, list) else []
+            labels = [e.get('id') for e in offered
+                      if isinstance(e, dict) and isinstance(e.get('id'), str)
+                      and len(e['id']) == 64
+                      and isinstance(e.get('community'), str)
+                      and e['community'] in proc.social.communities
+                      and e['id'] not in proc.social._seen_post_label_ids]
+            if labels:
+                want['label'] = labels[:POST_WANT_MAX]
+            if not (want['feed'] or want['biz'] or want.get('label')):
                 return True
             if not _cooldown_pass_locked(proc.social.want_sent_at,
                                          str(peer.uuid), time.time()):
                 return True
         proc.logger.info('asking %s for %d missed post(s)', str(peer.uuid)[:8],
-                         len(want['feed']) + len(want['biz']))
+                         len(want['feed']) + len(want['biz'])
+                         + len(want.get('label', [])))
         _send_directed(proc, queues, peer, SocialProtocol.post_want, want,
                        'handle_post_digest')
     except Exception as err:
@@ -1945,7 +1991,8 @@ def handle_post_want(proc, queues, message):
                                   'not served', requester[:8])
                 return True
             for kind, store in (('feed', proc.social.feed_store),
-                                ('biz', proc.social.biz_store)):
+                                ('biz', proc.social.biz_store),
+                                ('label', proc.social.label_store)):
                 ids = body.get(kind)
                 ids = ids if isinstance(ids, list) else []
                 taken = 0
@@ -1983,11 +2030,13 @@ def handle_post_backfill(proc, queues, message):
         return True
     kind = body.get('kind') if isinstance(body, dict) else None
     post = body.get('post') if isinstance(body, dict) else None
-    if not isinstance(post, dict) or kind not in ('feed', 'biz'):
+    if not isinstance(post, dict) or kind not in ('feed', 'biz', 'label'):
         proc.logger.warning('peer_post_backfill malformed, refusing')
         return True
     if kind == 'feed':
         return _ingest_post(proc, queues, post, False)
+    if kind == 'label':
+        return _ingest_post_label(proc, queues, post, False)
     return _ingest_business_post(proc, queues, post, False)
 
 
@@ -1998,6 +2047,332 @@ def get_last_business_post(proc, did):
     of C ``identity_get_last_business_post``."""
     with proc.lock:
         rec = proc.social.last_business_post.get(str(did))
+        return dict(rec) if rec else {}
+
+
+# ------------------------------------------------------------------
+# COMMUNITIES (Phase 4, Ethne D37): a community's content policy and a
+# moderator's labels. Twin of the C block in id_social.c. This runtime never
+# parses a policy, never decides whether a label counts, and never hides a post
+# by policy -- all of that is the app's, against a policy only it can verify.
+# What it owns is carriage: holding what the app told it to follow, carrying
+# that in the first person, and moving labels only to nodes that follow.
+# ------------------------------------------------------------------
+
+POLICY_AD_DEFAULT_SEC = 300
+
+
+def _ring_seen_or_record_locked(ring, ident, record=True, cap=256):
+    if ident in ring:
+        return True
+    if record:
+        ring.append(ident)
+        if len(ring) > cap:
+            ring.pop(0)
+    return False
+
+
+def is_following(proc, did):
+    """Whether this node follows ``did``. Twin of C ``identity_is_following``."""
+    with proc.lock:
+        return bool(did) and str(did) in proc.social.communities
+
+
+def get_followed_community(proc, did):
+    """The policy held for ``did``, {'bundle','seq'}, or {}."""
+    with proc.lock:
+        rec = proc.social.communities.get(str(did))
+        return dict(rec) if rec else {}
+
+
+def follow_community(proc, did, bundle, seq=0, queues=None):
+    """Follow ``did`` holding ``bundle`` (which the app verified) at ``seq``,
+    and persist; replaces a held policy. When ``queues`` is given, carry it now.
+    Returns False on bad input or past COMMUNITIES_MAX. Twin of C
+    ``identity_follow_community`` + ``handle_app_follow_community``."""
+    from .codec import (COMMUNITY_DID_MAX, COMMUNITY_POLICY_BUNDLE_MAX,
+                        COMMUNITIES_MAX)
+    if (not isinstance(did, str) or not isinstance(bundle, str) or not did
+            or not bundle or len(did.encode('utf-8')) > COMMUNITY_DID_MAX
+            or len(bundle.encode('utf-8')) > COMMUNITY_POLICY_BUNDLE_MAX):
+        proc.logger.warning('follow_community refused: bad community/bundle')
+        return False
+    with proc.lock:
+        if (did not in proc.social.communities
+                and len(proc.social.communities) >= COMMUNITIES_MAX):
+            proc.logger.warning('follow_community refused: %d already followed',
+                                COMMUNITIES_MAX)
+            return False
+        proc.social.communities[did] = {'bundle': bundle, 'seq': int(seq)}
+    _persist_social_blocks(proc)
+    proc.logger.info('following %s at seq %d', did[:24], int(seq))
+    if queues is not None:
+        _policy_advertise(proc, queues, did, int(seq), bundle)
+    return True
+
+
+def unfollow_community(proc, did):
+    """Stop following ``did``, and persist. Twin of C
+    ``identity_unfollow_community``."""
+    with proc.lock:
+        proc.social.communities.pop(str(did), None)
+    _persist_social_blocks(proc)
+
+
+def _policy_advertise(proc, queues, did, seq, bundle):
+    """Carry one policy IN THE FIRST PERSON: sign as THIS node and multicast.
+    Never a relay. Twin of C ``_policy_advertise``."""
+    from .codec import policy_ad_sign, policy_ad_id
+    try:
+        ts = float(time.time())
+        sig = policy_ad_sign(proc.identity.signature.private, proc.identity.uuid,
+                             str(did), int(seq), ts, bundle)
+        pid = policy_ad_id(proc.identity.uuid, str(did), int(seq), ts, bundle)
+        with proc.lock:
+            _ring_seen_or_record_locked(proc.social._seen_policy_ad_ids, pid)
+        payload = to_json_string({
+            'carrier': str(proc.identity.uuid),
+            'carrier_pk': bytes(proc.identity.signature.public).hex(),
+            'community': str(did), 'seq': int(seq), 'ts': ts,
+            'bundle': bundle, 'sig': sig,
+        })
+        out = Message(proc.name, SocialProtocol.community_policy, payload,
+                      to_whom=proc.group, from_whom=proc.identity)
+        queues[CfgIds.network].put(out, block=True, timeout=proc.q_cadence)
+        return pid
+    except Full:
+        proc.logger.error('_policy_advertise: Network queue full')
+    except Exception as err:
+        proc.report_exception(err, '_policy_advertise')
+    return None
+
+
+def _policy_ad_interval():
+    try:
+        v = int(os.environ.get('AT_SOCIAL_POLICY_SEC', ''))
+        if v > 0:
+            return float(v)
+    except ValueError:
+        pass
+    return float(POLICY_AD_DEFAULT_SEC)
+
+
+def advertise_communities(proc, queues):
+    """Carry every followed policy now. Returns how many went out. Twin of C
+    ``identity_advertise_communities``; also the conformance seam."""
+    with proc.lock:
+        proc.social.last_policy_ad_at = time.time()
+        held = [(d, dict(r)) for d, r in proc.social.communities.items()]
+    sent = 0
+    for did, rec in held:
+        if _policy_advertise(proc, queues, did, int(rec['seq']), rec['bundle']):
+            sent += 1
+    return sent
+
+
+def maybe_advertise_communities(proc, queues):
+    with proc.lock:
+        due = (bool(proc.social.communities)
+               and time.time() - proc.social.last_policy_ad_at >= _policy_ad_interval())
+    if due:
+        advertise_communities(proc, queues)
+
+
+def _carried_key(proc, who, pk_hex, verb):
+    """A known peer's stored key, which the carried one MUST match, else the
+    carried key best-effort; None to drop. Twin of C ``_carried_key``."""
+    from nacl.signing import VerifyKey
+    peer = proc.peers.find_by_uuid(who) if proc.peers else None
+    if peer is not None:
+        if bytes(peer.signature.public).hex() != pk_hex:
+            proc.logger.warning('%s from %s: key != known key, dropping '
+                                '(impersonation)', verb, str(who)[:8])
+            return None
+        return peer.signature.public
+    try:
+        return VerifyKey(bytes.fromhex(pk_hex))
+    except (ValueError, TypeError):
+        proc.logger.warning('%s from %s: bad key, dropping', verb, str(who)[:8])
+        return None
+
+
+def _community_fields_ok(body, who_key, pk_key, bundle_max):
+    from .codec import COMMUNITY_DID_MAX
+    if not isinstance(body, dict):
+        return False
+    who = body.get(who_key)
+    pk = body.get(pk_key)
+    did = body.get('community')
+    seq = body.get('seq')
+    ts = body.get('ts')
+    bundle = body.get('bundle')
+    sig = body.get('sig')
+    return (isinstance(who, str) and isinstance(pk, str) and len(pk) == 64
+            and isinstance(did, str) and 0 < len(did.encode('utf-8')) <= COMMUNITY_DID_MAX
+            and isinstance(seq, int) and not isinstance(seq, bool)
+            and isinstance(ts, (int, float))
+            and isinstance(bundle, str)
+            and 0 < len(bundle.encode('utf-8')) <= bundle_max
+            and isinstance(sig, str) and len(sig) == 128)
+
+
+def handle_community_policy(proc, queues, message):
+    """An inbound policy ad: verify, dedup, record what we heard -- and nothing
+    more. We do not follow it, replace a held policy with it, or carry it on.
+    Twin of C ``handle_community_policy``."""
+    if message.function != SocialProtocol.community_policy:
+        return False
+    from .codec import (policy_ad_verify, policy_ad_id,
+                        COMMUNITY_POLICY_BUNDLE_MAX)
+    try:
+        body = from_json_string(message.obj)
+        if not _community_fields_ok(body, 'carrier', 'carrier_pk',
+                                    COMMUNITY_POLICY_BUNDLE_MAX):
+            proc.logger.warning('peer_community_policy malformed, refusing')
+            return True
+        carrier = body['carrier']
+        vk = _carried_key(proc, carrier, body['carrier_pk'],
+                          'peer_community_policy')
+        if vk is None:
+            return True
+        args = (carrier, body['community'], int(body['seq']), float(body['ts']),
+                body['bundle'])
+        if not policy_ad_verify(vk, *args, body['sig']):
+            proc.logger.warning('peer_community_policy: BAD SIGNATURE, dropping')
+            return True
+        pid = policy_ad_id(*args)
+        with proc.lock:
+            if _ring_seen_or_record_locked(proc.social._seen_policy_ad_ids, pid):
+                return True
+            # A carrier we blocked is not heard, as a blocked advertiser is not.
+            if _is_blocked_locked(proc, carrier):
+                return True
+            proc.social.last_policy[body['community']] = {
+                'policy_id': pid, 'seq': int(body['seq']),
+                'bundle': body['bundle'], 'carrier': carrier}
+    except Exception as err:
+        proc.report_exception(err, 'handle_community_policy')
+    return True
+
+
+def get_last_community_policy(proc, did):
+    """What this node last HEARD of ``did``'s policy, or {}. Twin of C
+    ``identity_get_last_community_policy``."""
+    with proc.lock:
+        rec = proc.social.last_policy.get(str(did))
+        return dict(rec) if rec else {}
+
+
+def publish_post_label(proc, queues, did, post_id, seq, bundle):
+    """Publish a moderator's label: sign as THIS node, keep for backfill,
+    multicast at hops 0. Confers nothing. Twin of C
+    ``identity_publish_post_label``."""
+    from .codec import post_label_sign, post_label_id, community_post_id_valid
+    if not did or not bundle or not community_post_id_valid(post_id):
+        proc.logger.warning('publish_post_label refused (needs a community, a '
+                            '64-hex post id and a bundle)')
+        return None
+    try:
+        ts = float(time.time())
+        sig = post_label_sign(proc.identity.signature.private, proc.identity.uuid,
+                              str(did), post_id, int(seq), ts, bundle)
+        lid = post_label_id(proc.identity.uuid, str(did), post_id, int(seq), ts,
+                            bundle)
+        env = {'author': str(proc.identity.uuid),
+               'author_pk': bytes(proc.identity.signature.public).hex(),
+               'community': str(did), 'post_id': post_id, 'seq': int(seq),
+               'ts': ts, 'bundle': bundle, 'sig': sig, 'hops': 0}
+        with proc.lock:
+            _ring_seen_or_record_locked(proc.social._seen_post_label_ids, lid)
+            _store_for_backfill_locked(proc.social.label_store, lid, ts,
+                                       str(proc.identity.uuid), env)
+        out = Message(proc.name, SocialProtocol.post_label, to_json_string(env),
+                      to_whom=proc.group, from_whom=proc.identity)
+        queues[CfgIds.network].put(out, block=True, timeout=proc.q_cadence)
+        proc.logger.info('published label %s on %s in %s', lid, post_id,
+                         str(did)[:24])
+        return lid
+    except Full:
+        proc.logger.error('publish_post_label: Network queue full')
+    except Exception as err:
+        proc.report_exception(err, 'publish_post_label')
+    return None
+
+
+def handle_post_label(proc, queues, message):
+    """An inbound group-multicast label. Twin of C ``handle_post_label``."""
+    if message.function != SocialProtocol.post_label:
+        return False
+    try:
+        body = from_json_string(message.obj)
+    except Exception as err:
+        proc.report_exception(err, 'handle_post_label')
+        return True
+    return _ingest_post_label(proc, queues, body, True)
+
+
+def _ingest_post_label(proc, queues, body, via_group):
+    """The one inbound path for a label: multicast (relayed while under the hop
+    bound) or backfill (never relayed). THE FOLLOW GATE sits after the signature
+    check and before the dedup, record and relay, where a business post's page
+    gate sits. Twin of C ``_ingest_post_label``."""
+    from .codec import (post_label_verify, post_label_id,
+                        community_post_id_valid, POST_LABEL_BUNDLE_MAX,
+                        POST_MAX_HOPS)
+    try:
+        if (not _community_fields_ok(body, 'author', 'author_pk',
+                                     POST_LABEL_BUNDLE_MAX)
+                or not community_post_id_valid(body.get('post_id'))
+                or not isinstance(body.get('hops'), int)
+                or isinstance(body.get('hops'), bool) or body['hops'] < 0):
+            proc.logger.warning('peer_post_label malformed, refusing')
+            return True
+        author = body['author']
+        vk = _carried_key(proc, author, body['author_pk'], 'peer_post_label')
+        if vk is None:
+            return True
+        args = (author, body['community'], body['post_id'], int(body['seq']),
+                float(body['ts']), body['bundle'])
+        if not post_label_verify(vk, *args, body['sig']):
+            proc.logger.warning('peer_post_label: BAD SIGNATURE, dropping')
+            return True
+        if not is_following(proc, body['community']):
+            proc.logger.debug('peer_post_label for %s, which we do not follow: '
+                              'dropped, not relayed', body['community'][:24])
+            return True
+        lid = post_label_id(*args)
+        hops = int(body['hops'])
+        with proc.lock:
+            if _ring_seen_or_record_locked(proc.social._seen_post_label_ids, lid):
+                return True
+            _store_for_backfill_locked(proc.social.label_store, lid,
+                                       float(body['ts']), author, body)
+            proc.social.last_label[body['post_id']] = {
+                'label_id': lid, 'community': body['community'],
+                'seq': int(body['seq']), 'hops': hops, 'bundle': body['bundle']}
+        (proc.logger.debug if via_group else proc.logger.info)(
+            'label %s on %s accepted (hops=%d%s)', lid, body['post_id'], hops,
+            '' if via_group else ', backfilled')
+        if via_group and hops < POST_MAX_HOPS:
+            fwd = dict(body)
+            fwd['hops'] = hops + 1
+            try:
+                out = Message(proc.name, SocialProtocol.post_label,
+                              to_json_string(fwd), to_whom=proc.group,
+                              from_whom=proc.identity)
+                queues[CfgIds.network].put(out, block=True, timeout=proc.q_cadence)
+            except Full:
+                proc.logger.error('_ingest_post_label: Network queue full')
+    except Exception as err:
+        proc.report_exception(err, '_ingest_post_label')
+    return True
+
+
+def get_last_post_label(proc, post_id):
+    """The label last accepted for post ``post_id``, or {}. Twin of C
+    ``identity_get_last_post_label``."""
+    with proc.lock:
+        rec = proc.social.last_label.get(str(post_id))
         return dict(rec) if rec else {}
 
 # ------------------------------------------------------------------

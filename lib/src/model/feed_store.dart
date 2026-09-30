@@ -45,6 +45,8 @@ class FeedStore {
             requiredTier: post.requiredTier,
             body: post.body,
             outgoing: post.outgoing,
+            community: post.community,
+            labels: post.labels,
           );
     return true;
   }

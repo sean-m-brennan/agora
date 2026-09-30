@@ -19,7 +19,7 @@ from autonomous_trust.core.identity.protocol import IdentityProtocol
 from autonomous_trust.social.protocol import SocialProtocol
 
 
-def test_the_20_verbs():
+def test_the_22_verbs():
     """Iterates the social verbs.
 
         - opt-in coarse position, the "with-distance" feature
@@ -63,15 +63,21 @@ def test_the_20_verbs():
           periodic digest of ids, the directed want for the missing ones,
           and the directed backfill carrying one post's ORIGINAL signed
           envelope, which the receiver re-verifies and never relays.
+        - communities, Phase 4 (community_policy, post_label) — a
+          community's root-signed policy carried in the first person by a
+          node that follows it (never relayed, like an ad), and a
+          moderator's labels on one post (relayed by followers, like a
+          business post). Two verbs because they are two artifacts with
+          two carriage rules; neither bundle is opened here.
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update.
     """
     values = list(SocialProtocol)
-    assert len(values) == 20
+    assert len(values) == 22
     for verb in ('report', 'business_ad', 'business_post', 'cosign_request',
                  'cosign_sig', 'dm', 'proximity_trigger', 'post_digest',
-                 'post_want', 'post_backfill'):
+                 'post_want', 'post_backfill', 'community_policy', 'post_label'):
         assert verb in values, verb
 
 

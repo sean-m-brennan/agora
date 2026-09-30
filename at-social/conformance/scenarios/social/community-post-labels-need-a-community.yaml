@@ -1,0 +1,24 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: community-post-labels-need-a-community
+byte_pinning: false
+description: |
+    A label means something only under a policy, and a policy is a
+    community's: a post that carries labels but names no community is
+    malformed and refused on both runtimes.
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_post
+    payload: {"body": "where to?", "seq": 1, "ts": 0, "tier": 0, "labels": ["nsfw"], "signed_labels": []}
+expected_state:
+  newcomer:
+    post_last:
+      "bg": {"absent": true}

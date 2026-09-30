@@ -18,7 +18,7 @@
  * at_agora.h — the Agora social feature's half of the flat app-event ABI.
  *
  * app_events.h is the core's surface and is the same in every build. This
- * header adds what the social feature carries over it: the event kinds 4..15,
+ * header adds what the social feature carries over it: the event kinds 4..17,
  * their flat payload structs, kind-checked accessors, and the app→AT social
  * verbs. It is installed only by a core built with AT_SOCIAL.
  *
@@ -69,6 +69,16 @@ extern "C" {
  *  AT_POST_ID_LEN (social/social_msg_types.h), AT_POST_ID_HEX_LEN (social/post.h), and
  *  AGORA_POST_ID_MAX in the shim / cohort ctypes. */
 #define AT_APP_POST_ID_LEN 64
+/** The community a post is made in (a polity DID). MUST match
+ *  AT_POST_COMMUNITY_LEN (social_msg_types.h). */
+#define AT_APP_POST_COMMUNITY_LEN 95
+/** A post's labels joined with ','. MUST match AT_POST_LABELS_LEN. */
+#define AT_APP_POST_LABELS_LEN 263
+/** A community's opaque policy artifact. MUST match
+ *  AT_COMMUNITY_POLICY_BUNDLE_LEN. */
+#define AT_APP_COMMUNITY_POLICY_BUNDLE_LEN 4096
+/** A moderator's opaque label. MUST match AT_POST_LABEL_BUNDLE_LEN. */
+#define AT_APP_POST_LABEL_BUNDLE_LEN 1536
 
 /** Max bytes of the opaque Ethne page bundle carried on a business ad (Phase 3
  *  P3.2). MUST match AT_BUSINESS_BUNDLE_MAX in social/business_ad.h,
@@ -197,7 +207,20 @@ enum {
      *  the envoy signature inside the bundle, which only the app can check. It
      *  reaches you at all only because this node already holds the business's
      *  page — the core drops a post from a polity it knows nothing about. */
-    AT_APP_EVENT_BUSINESS_POST = 15
+    AT_APP_EVENT_BUSINESS_POST = 15,
+
+    /** A community's content policy, carried by a node that follows it (Phase
+     *  4, @ref at_app_community_policy_t). The core verified only the
+     *  CARRIER's signature; the policy's authority is the community's root
+     *  signature inside @c bundle, which the app verifies before following it
+     *  or trusting it over one it holds. */
+    AT_APP_EVENT_COMMUNITY_POLICY = 16,
+
+    /** A moderator's labels on one post (Phase 4, @ref at_app_post_label_t).
+     *  It reaches you only because this node follows the community. Whether it
+     *  COUNTS is decided against the policy you hold, which must list the
+     *  moderator who signed it. */
+    AT_APP_EVENT_POST_LABEL = 17
 };
 
 /** One peer's shared coarse position. Mirrors `peer_position_msg_t`. */
@@ -270,7 +293,36 @@ typedef struct {
     double  ts;
     int32_t required_tier;
     char    body[AT_APP_POST_BODY_LEN + 1];
+    /** The community the post is made in (Phase 4); "" = none. Appended, so
+     *  every earlier field keeps its offset. */
+    char    community[AT_APP_POST_COMMUNITY_LEN + 1];
+    /** The author's signed labels, joined with ','; "" = none. */
+    char    labels[AT_APP_POST_LABELS_LEN + 1];
 } at_app_post_t;
+
+/** A community's content policy, heard from a carrier (Phase 4). Mirrors
+ *  `peer_community_policy_msg_t`. Carried by AT_APP_EVENT_COMMUNITY_POLICY. */
+typedef struct {
+    uint8_t carrier_uuid[AT_APP_UUID_LEN];
+    char    community[AT_APP_POST_COMMUNITY_LEN + 1];
+    char    policy_id[AT_APP_POST_ID_LEN + 1];
+    int64_t seq;
+    double  ts;
+    char    bundle[AT_APP_COMMUNITY_POLICY_BUNDLE_LEN + 1];
+} at_app_community_policy_t;
+
+/** A moderator's labels on one post (Phase 4). Mirrors
+ *  `peer_post_label_msg_t`. Carried by AT_APP_EVENT_POST_LABEL. */
+typedef struct {
+    uint8_t publisher_uuid[AT_APP_UUID_LEN];
+    char    community[AT_APP_POST_COMMUNITY_LEN + 1];
+    char    post_id[AT_APP_POST_ID_LEN + 1];
+    char    label_id[AT_APP_POST_ID_LEN + 1];
+    int64_t seq;
+    double  ts;
+    int32_t hops;
+    char    bundle[AT_APP_POST_LABEL_BUNDLE_LEN + 1];
+} at_app_post_label_t;
 
 /** One reaction to one of THIS node's posts (Increment 8). @c peer_uuid is the
  *  REACTOR (crypto_box-authenticated, so trustworthy); @c post_id is the
@@ -408,6 +460,8 @@ AT_APP_STATIC_ASSERT(sizeof(at_app_business_ad_t) <= AT_APP_EVENT_PAYLOAD_MAX, "
 AT_APP_STATIC_ASSERT(sizeof(at_app_cosign_request_t) <= AT_APP_EVENT_PAYLOAD_MAX, "at_app_cosign_request_t outgrew AT_APP_EVENT_PAYLOAD_MAX");
 AT_APP_STATIC_ASSERT(sizeof(at_app_cosign_sig_t) <= AT_APP_EVENT_PAYLOAD_MAX, "at_app_cosign_sig_t outgrew AT_APP_EVENT_PAYLOAD_MAX");
 AT_APP_STATIC_ASSERT(sizeof(at_app_business_post_t) <= AT_APP_EVENT_PAYLOAD_MAX, "at_app_business_post_t outgrew AT_APP_EVENT_PAYLOAD_MAX");
+AT_APP_STATIC_ASSERT(sizeof(at_app_community_policy_t) <= AT_APP_EVENT_PAYLOAD_MAX, "at_app_community_policy_t outgrew AT_APP_EVENT_PAYLOAD_MAX");
+AT_APP_STATIC_ASSERT(sizeof(at_app_post_label_t) <= AT_APP_EVENT_PAYLOAD_MAX, "at_app_post_label_t outgrew AT_APP_EVENT_PAYLOAD_MAX");
 
 /** @brief Keep the Agora event decoders in a STATIC link.
  *
@@ -474,6 +528,14 @@ static inline const at_app_cosign_sig_t *at_agora_event_cosign_sig(const at_app_
 static inline const at_app_business_post_t *at_agora_event_business_post(const at_app_event_t *ev)
 {
     return (ev != NULL && ev->kind == AT_APP_EVENT_BUSINESS_POST) ? (const at_app_business_post_t *)(const void *)ev->data.payload : NULL;
+}
+static inline const at_app_community_policy_t *at_agora_event_community_policy(const at_app_event_t *ev)
+{
+    return (ev != NULL && ev->kind == AT_APP_EVENT_COMMUNITY_POLICY) ? (const at_app_community_policy_t *)(const void *)ev->data.payload : NULL;
+}
+static inline const at_app_post_label_t *at_agora_event_post_label(const at_app_event_t *ev)
+{
+    return (ev != NULL && ev->kind == AT_APP_EVENT_POST_LABEL) ? (const at_app_post_label_t *)(const void *)ev->data.payload : NULL;
 }
 /** @} */
 
@@ -779,6 +841,53 @@ int at_app_events_return_cosign(at_app_events_t *handle, const char *q_out,
                                 const uint8_t peer_uuid[AT_APP_UUID_LEN],
                                 const char *cid, const char *signer_did,
                                 const char *sig_hex);
+
+/**
+ * @brief Publish a feed post in a community's name (Phase 4).
+ *
+ * As at_app_events_publish_post, adding the community's DID and the author's
+ * own labels, both signed with the post. @p labels_csv is the labels joined
+ * with ',' (each 1..32 of [a-z0-9_-], at most eight), or NULL/"" for none;
+ * labels need a community. A malformed scope is refused by the identity process
+ * and nothing is published. The community's policy is applied by READERS that
+ * follow it; the core applies none.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 otherwise.
+ */
+int at_app_events_publish_post_scoped(at_app_events_t *handle, const char *q_out,
+                                      const char *body, int required_tier,
+                                      const char *community, const char *labels_csv);
+
+/**
+ * @brief Follow a community, holding its policy (Phase 4).
+ *
+ * Sends `AT_APP_FOLLOW_COMMUNITY` with {"community","bundle","seq"}. VERIFY
+ * @p bundle first (ethne_content_policy_verify): the core cannot, and will carry
+ * it in this node's name. Call again with a newer bundle to replace it.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 otherwise.
+ */
+int at_app_events_follow_community(at_app_events_t *handle, const char *q_out,
+                                   const char *community, const char *bundle,
+                                   int64_t seq);
+
+/** @brief Stop following a community (Phase 4): `AT_APP_UNFOLLOW_COMMUNITY`. */
+int at_app_events_unfollow_community(at_app_events_t *handle, const char *q_out,
+                                     const char *community);
+
+/**
+ * @brief Publish a moderator's label on a post (Phase 4).
+ *
+ * Sends `AT_APP_PUBLISH_POST_LABEL` with {"community","post_id","bundle","seq"}.
+ * @p bundle is the member-signed label (ethne_post_label_sign); THIS CALL
+ * CONFERS NOTHING — a reader counts the label only while the policy it holds
+ * lists the moderator who signed it.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 otherwise.
+ */
+int at_app_events_publish_post_label(at_app_events_t *handle, const char *q_out,
+                                     const char *community, const char *post_id,
+                                     const char *bundle, int64_t seq);
 
 #ifdef __cplusplus
 }

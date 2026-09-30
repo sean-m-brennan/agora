@@ -24,6 +24,7 @@
 #include "social_store.h"
 #include "structures/data.h"
 #include "utilities/util.h"
+#include "utilities/allocation.h"
 
 static int _default_path(const char *cfg_dir, char *out, size_t out_len)
 {
@@ -33,10 +34,64 @@ static int _default_path(const char *cfg_dir, char *out, size_t out_len)
 
 int social_store_load(const char *cfg_dir, map_t *blocks)
 {
+    return social_store_load_all(cfg_dir, blocks, NULL);
+}
+
+int social_store_save(const map_t *blocks, const char *cfg_dir)
+{
+    return social_store_save_all(blocks, NULL, cfg_dir);
+}
+
+/* The follows, as string_data of compact {"bundle","seq"}. */
+static int _load_communities(json_t *root, map_t *communities)
+{
+    json_t *j_com = json_object_get(root, "communities");
+    if (j_com == NULL)
+        return 0;                              /* follows nothing */
+    if (!json_is_object(j_com))
+        return -1;
+    const char *did;
+    json_t *entry;
+    json_object_foreach(j_com, did, entry) {
+        json_t *j_b = json_object_get(entry, "bundle");
+        json_t *j_s = json_object_get(entry, "seq");
+        if (!json_is_object(entry) || !json_is_string(j_b) || !json_is_integer(j_s))
+            return -1;
+        json_t *rec = json_pack("{s:s, s:I}", "bundle", json_string_value(j_b),
+                                "seq", json_integer_value(j_s));
+        char *js = rec ? json_dumps(rec, JSON_COMPACT | JSON_SORT_KEYS) : NULL;
+        json_decref(rec);
+        if (js == NULL)
+            return -1;
+        /* string_data takes a smrt buffer, NUL included. */
+        size_t len = strlen(js);
+        char *dup = smrt_create(len + 1);
+        if (dup == NULL) {
+            free(js);
+            return -1;
+        }
+        memcpy(dup, js, len + 1);
+        free(js);
+        data_t *dat = string_data(dup, len + 1);
+        if (dat == NULL) {
+            smrt_deref(dup);
+            return -1;
+        }
+        map_set(communities, (map_key_t)did, dat);
+    }
+    return 0;
+}
+
+int social_store_load_all(const char *cfg_dir, map_t *blocks, map_t *communities)
+{
     if (blocks == NULL)
         return -1;
     map_free(blocks);
     map_init(blocks);
+    if (communities != NULL) {
+        map_free(communities);
+        map_init(communities);
+    }
     if (cfg_dir == NULL)
         return -1;
     char path[4096];
@@ -71,11 +126,21 @@ int social_store_load(const char *cfg_dir, map_t *blocks)
         if (dat != NULL)
             map_set(blocks, (map_key_t)uuid_str, dat);
     }
+    if (communities != NULL && _load_communities(root, communities) != 0) {
+        /* Whole or not at all, as for the blocks. */
+        map_free(blocks);
+        map_init(blocks);
+        map_free(communities);
+        map_init(communities);
+        json_decref(root);
+        return -1;
+    }
     json_decref(root);
     return 0;
 }
 
-int social_store_save(const map_t *blocks, const char *cfg_dir)
+int social_store_save_all(const map_t *blocks, const map_t *communities,
+                          const char *cfg_dir)
 {
     if (blocks == NULL || cfg_dir == NULL)
         return -1;
@@ -111,6 +176,32 @@ int social_store_save(const map_t *blocks, const char *cfg_dir)
     if (doc == NULL) {
         json_decref(j_blocks);
         return -1;
+    }
+    /* Follows, only when there are any: see social_store.h. */
+    if (communities != NULL && map_size((map_t *)communities) > 0) {
+        json_t *j_com = json_object();
+        map_key_t did = NULL;
+        data_t *rec = NULL;
+        map_entries_for_each((map_t *)communities, did, rec)
+        {
+            char *js = NULL;
+            json_t *obj = (rec != NULL && data_string_ptr(rec, &js) == 0 && js != NULL)
+                              ? json_loads(js, 0, NULL) : NULL;
+            json_t *j_b = obj ? json_object_get(obj, "bundle") : NULL;
+            json_t *j_s = obj ? json_object_get(obj, "seq") : NULL;
+            if (j_com != NULL && json_is_string(j_b) && json_is_integer(j_s))
+                json_object_set_new(j_com, did,
+                                    json_pack("{s:s, s:I}", "bundle",
+                                              json_string_value(j_b), "seq",
+                                              json_integer_value(j_s)));
+            json_decref(obj);
+        }
+        map_end_for_each
+        if (j_com == NULL) {
+            json_decref(doc);
+            return -1;
+        }
+        json_object_set_new(doc, "communities", j_com);
     }
 
     /* Atomic write: dump to a temp sibling, then rename over the target, so a

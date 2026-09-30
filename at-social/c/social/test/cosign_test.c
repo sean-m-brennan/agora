@@ -80,8 +80,17 @@ DEFINE_TEST(test_only_known_acts_are_carried)
     /* Ops do not cross classes, and an unknown class carries nothing. */
     ck_assert(!at_cosign_op_ok("membership", "designate"));
     ck_assert(!at_cosign_op_ok("guardian", "admit"));
-    ck_assert(!at_cosign_op_ok("office", "confer"));
+    ck_assert(!at_cosign_op_ok("treaty", "sign"));
     ck_assert(!at_cosign_op_ok(NULL, "admit"));
+
+    /* Phase 4 communities: the roll replacing its content policy, and seating
+     * or unseating an office. A resignation is self-signed, like a departure,
+     * and is not offered. */
+    ck_assert(at_cosign_op_ok("content_policy", "amend"));
+    ck_assert(at_cosign_op_ok("office", "confer"));
+    ck_assert(at_cosign_op_ok("office", "revoke"));
+    ck_assert(!at_cosign_op_ok("office", "resign"));
+    ck_assert(!at_cosign_op_ok("content_policy", "admit"));
     ck_assert(!at_cosign_op_ok("membership", NULL));
 }
 

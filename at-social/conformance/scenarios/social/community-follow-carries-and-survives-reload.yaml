@@ -1,0 +1,30 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: community-follow-carries-and-survives-reload
+byte_pinning: false
+description: |
+    Following a community is what makes a node a carrier: it holds the
+    policy, carries it at once in the first person, and keeps the follow
+    across a restart, beside its blocks in social.cfg.json.
+participants:
+  - id: node
+    role: border_guard
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: trigger_follow_community
+    payload: {"community": "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ", "bundle": "{\"policy\":\"stub\",\"seq\":3}", "seq": 3}
+  - id: 2
+    from: node
+    to: node
+    function: trigger_social_reload
+    payload: {}
+    description: |
+        Save and load back: the round trip a restart performs.
+expected_state:
+  node:
+    communities_followed:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ": {"seq": 3, "bundle": "{\"policy\":\"stub\",\"seq\":3}"}
+    community_policies_emitted: 1

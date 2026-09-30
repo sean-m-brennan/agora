@@ -1,0 +1,26 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: community-post-scope-is-signed
+byte_pinning: false
+description: |
+    THE SCOPE IS SIGNED. The author signed the post with no labels; a relay
+    added "nsfw" on the way. The envelope is well formed and the body is the
+    author's, but the signature no longer covers what arrived, so the post is
+    refused as a forgery. A relay that could add or strip labels could make a
+    community's policy hide or show whatever it liked.
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_post
+    payload: {"body": "fine art", "seq": 1, "ts": 0, "tier": 0, "community": "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ", "labels": ["nsfw"], "signed_community": "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ", "signed_labels": []}
+expected_state:
+  newcomer:
+    post_last:
+      "bg": {"absent": true}

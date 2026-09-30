@@ -22,10 +22,18 @@
 // A reader told nothing cannot tell "the cafe has been quiet" from "something
 // claiming to be the cafe was refused", and those are different facts about a
 // neighbourhood.
+//
+// COMMUNITIES (Phase 4). A post can be made in a community's name, with the
+// author's own labels. Where this reader follows that community, its policy
+// decides: a post it hides is COUNTED in a banner that says which community
+// and why, and can be shown anyway by setting the policy aside; a post it
+// warns about sits behind a tap-through that says what the warning is. A
+// moderator of the community can label a post from its tile.
 
 import 'package:flutter/material.dart';
 
 import '../model/business_post.dart';
+import '../model/community_policy.dart';
 import '../model/feed_entry.dart';
 import '../model/post.dart';
 import '../model/tie_strength.dart';
@@ -44,6 +52,10 @@ class _FeedPageState extends State<FeedPage> {
   final TextEditingController _compose = TextEditingController();
   PostAudience _audience = PostAudience.public;
 
+  /// The community the next post is made in ('' = none), and its labels.
+  String _community = '';
+  final Set<String> _labels = {};
+
   @override
   void dispose() {
     _compose.dispose();
@@ -53,8 +65,10 @@ class _FeedPageState extends State<FeedPage> {
   void _publish() {
     final body = _compose.text.trim();
     if (body.isEmpty) return;
-    widget.service.publishPost(body, _audience);
+    widget.service.publishPost(body, _audience,
+        community: _community, labels: _labels.toList());
     _compose.clear();
+    setState(_labels.clear);
   }
 
   @override
@@ -70,7 +84,11 @@ class _FeedPageState extends State<FeedPage> {
                 final entries = widget.service.feed;
                 final refused = widget.service.businessPostsUnverified;
                 final hidden = widget.service.feedHiddenByBlock;
-                if (entries.isEmpty && refused == 0 && hidden == 0) {
+                final byPolicy = widget.service.feedHiddenByPolicy;
+                if (entries.isEmpty &&
+                    refused == 0 &&
+                    hidden == 0 &&
+                    byPolicy.isEmpty) {
                   return const Center(
                     child: Text('No posts yet — share something.'),
                   );
@@ -85,6 +103,9 @@ class _FeedPageState extends State<FeedPage> {
                 final banners = <Widget>[
                   if (refused > 0) _UnverifiedBanner(count: refused),
                   if (hidden > 0) _HiddenByBlockBanner(count: hidden),
+                  if (byPolicy.isNotEmpty)
+                    _HiddenByPolicyBanner(
+                        hidden: byPolicy, service: widget.service),
                 ];
                 if (entries.isEmpty) {
                   return ListView(
@@ -107,8 +128,11 @@ class _FeedPageState extends State<FeedPage> {
                     i -= banners.length;
                     final entry = entries[i];
                     return switch (entry) {
-                      PersonEntry(:final post) =>
-                        _PostTile(post: post, service: widget.service),
+                      PersonEntry(:final post, :final verdict) => _PostTile(
+                          key: ValueKey('post-${post.postId}'),
+                          post: post,
+                          verdict: verdict,
+                          service: widget.service),
                       BusinessEntry() => _BusinessPostTile(entry: entry),
                     };
                   },
@@ -139,6 +163,17 @@ class _FeedPageState extends State<FeedPage> {
                           .toList(),
                     ),
                   ],
+                ),
+                _CommunityPicker(
+                  service: widget.service,
+                  community: _community,
+                  labels: _labels,
+                  onCommunity: (c) => setState(() {
+                    _community = c;
+                    _labels.clear();
+                  }),
+                  onLabel: (l, on) =>
+                      setState(() => on ? _labels.add(l) : _labels.remove(l)),
                 ),
                 const SizedBox(height: 6),
                 Row(
@@ -233,6 +268,124 @@ class _HiddenByBlockBanner extends StatelessWidget {
   }
 }
 
+/// The posts a community's policy is hiding, grouped by community, with why
+/// and a way to see them anyway (Phase 4). Neutral surface: a policy the
+/// reader follows is the reader's choice, like a block.
+class _HiddenByPolicyBanner extends StatelessWidget {
+  const _HiddenByPolicyBanner({required this.hidden, required this.service});
+
+  final List<({Post post, PolicyVerdict verdict})> hidden;
+  final PeerService service;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final byCommunity = <String, List<PolicyVerdict>>{};
+    for (final h in hidden) {
+      byCommunity.putIfAbsent(h.post.community, () => []).add(h.verdict);
+    }
+    return Card(
+      key: const Key('hidden-by-policy'),
+      color: scheme.surfaceContainerHighest,
+      margin: EdgeInsets.zero,
+      child: Column(
+        children: [
+          for (final e in byCommunity.entries)
+            ExpansionTile(
+              dense: true,
+              leading: Icon(Icons.shield_outlined,
+                  color: scheme.onSurfaceVariant),
+              title: Text(e.value.length == 1
+                  ? '1 post hidden by ${shortDid(e.key)}\'s policy'
+                  : '${e.value.length} posts hidden by '
+                      '${shortDid(e.key)}\'s policy'),
+              children: [
+                for (final why in {
+                  for (final v in e.value)
+                    for (final r in v.reasons) r.describe
+                })
+                  ListTile(dense: true, title: Text('Hidden because $why')),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton(
+                    key: Key('policy-off-${e.key}'),
+                    onPressed: () =>
+                        service.setCommunityPolicyApplied(e.key, false),
+                    child: const Text('Show anyway (set this policy aside)'),
+                  ),
+                ),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// A short form of a DID for display: its last characters, which is where two
+/// did:key identities differ.
+String shortDid(String did) =>
+    did.length <= 14 ? did : '…${did.substring(did.length - 10)}';
+
+/// Which community the next post is made in, and its labels (Phase 4). Offers
+/// the communities this reader follows, and the labels their policy names.
+class _CommunityPicker extends StatelessWidget {
+  const _CommunityPicker({
+    required this.service,
+    required this.community,
+    required this.labels,
+    required this.onCommunity,
+    required this.onLabel,
+  });
+
+  final PeerService service;
+  final String community;
+  final Set<String> labels;
+  final ValueChanged<String> onCommunity;
+  final void Function(String label, bool on) onLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    final followed = service.communities.followed;
+    if (followed.isEmpty) return const SizedBox.shrink();
+    final policy = followed[community];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Text('In:'),
+            const SizedBox(width: 8),
+            DropdownButton<String>(
+              key: const Key('compose-community'),
+              value: followed.containsKey(community) ? community : '',
+              onChanged: (c) => onCommunity(c ?? ''),
+              items: [
+                const DropdownMenuItem(value: '', child: Text('No community')),
+                for (final did in followed.keys)
+                  DropdownMenuItem(value: did, child: Text(shortDid(did))),
+              ],
+            ),
+          ],
+        ),
+        if (policy != null && policy.labels.isNotEmpty)
+          Wrap(
+            spacing: 6,
+            children: [
+              for (final l in policy.labels.keys)
+                FilterChip(
+                  key: Key('compose-label-$l'),
+                  label: Text(l),
+                  selected: labels.contains(l),
+                  onSelected: (on) => onLabel(l, on),
+                ),
+            ],
+          ),
+      ],
+    );
+  }
+}
+
 /// A business post: the polity speaking, and visibly not a person.
 class _BusinessPostTile extends StatelessWidget {
   const _BusinessPostTile({required this.entry});
@@ -282,14 +435,79 @@ class _BusinessPostTile extends StatelessWidget {
   }
 }
 
-class _PostTile extends StatelessWidget {
-  const _PostTile({required this.post, required this.service});
+class _PostTile extends StatefulWidget {
+  const _PostTile(
+      {super.key, required this.post, required this.service, this.verdict});
 
   final Post post;
   final PeerService service;
 
+  /// The community policy's verdict, when one applies (show or warn; a hidden
+  /// post never gets a tile).
+  final PolicyVerdict? verdict;
+
+  @override
+  State<_PostTile> createState() => _PostTileState();
+}
+
+class _PostTileState extends State<_PostTile> {
+  /// Whether the reader tapped through a warning.
+  bool _revealed = false;
+
+  Post get post => widget.post;
+  PeerService get service => widget.service;
+
+  Future<void> _label(BuildContext context) async {
+    final policy = service.communities.followed[post.community];
+    if (policy == null) return;
+    final chosen = <String>{};
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: const Text('Label as moderator'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final e in policy.labels.entries)
+                CheckboxListTile(
+                  key: Key('mod-label-${e.key}'),
+                  dense: true,
+                  value: chosen.contains(e.key),
+                  title: Text(e.key),
+                  subtitle: Text(switch (e.value) {
+                    LabelAction.hide => 'hides the post',
+                    LabelAction.warn => 'puts it behind a warning',
+                    LabelAction.allow => 'shown as a tag',
+                  }),
+                  onChanged: (v) => setD(() =>
+                      v == true ? chosen.add(e.key) : chosen.remove(e.key)),
+                ),
+              const Text('Labelling none clears your earlier labels.',
+                  style: TextStyle(fontSize: 12)),
+            ],
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.of(ctx).pop(false),
+                child: const Text('Cancel')),
+            FilledButton(
+                key: const Key('mod-label-submit'),
+                onPressed: () => Navigator.of(ctx).pop(true),
+                child: const Text('Label')),
+          ],
+        ),
+      ),
+    );
+    if (ok != true || !context.mounted) return;
+    final rc = service.labelPost(post, chosen.toList()..sort());
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(rc == 0 ? 'Label published' : 'Could not label')));
+  }
+
   @override
   Widget build(BuildContext context) {
+    final verdict = widget.verdict;
     final scheme = Theme.of(context).colorScheme;
     final who = post.outgoing
         ? 'you'
@@ -303,16 +521,58 @@ class _PostTile extends StatelessWidget {
     // content id at the app boundary, so no react affordance there.
     final canReact =
         !post.outgoing && post.authorUuid.isNotEmpty && post.postId.isNotEmpty;
+    // The community and every label that applies, shown as tags (Phase 4).
+    final tags = verdict?.tags ?? post.labels;
+    final where =
+        post.community.isEmpty ? '' : ' · in ${shortDid(post.community)}';
+    final warned = verdict?.action == PolicyAction.warn && !_revealed;
+    final canLabel = !post.outgoing &&
+        post.postId.isNotEmpty &&
+        post.community.isNotEmpty &&
+        service.canModerate(post.community);
     return ListTile(
       leading: CircleAvatar(
         backgroundColor:
             post.outgoing ? scheme.primaryContainer : scheme.surfaceContainerHighest,
         child: Icon(post.outgoing ? Icons.person : Icons.public, size: 18),
       ),
-      title: Text(post.body),
-      subtitle: Text('$who · $audience'),
-      trailing: canReact
-          ? IconButton(
+      title: warned
+          ? InkWell(
+              key: const Key('policy-warning'),
+              onTap: () => setState(() => _revealed = true),
+              child: Text(
+                'Content warning: '
+                '${verdict!.reasons.map((r) => r.describe).join('; ')}. '
+                'Tap to show.',
+                style: TextStyle(
+                    fontStyle: FontStyle.italic, color: scheme.onSurfaceVariant),
+              ),
+            )
+          : Text(post.body),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('$who · $audience$where'),
+          if (tags.isNotEmpty)
+            Wrap(spacing: 4, children: [
+              for (final t in tags)
+                Text('#$t',
+                    style: TextStyle(fontSize: 11, color: scheme.primary)),
+            ]),
+        ],
+      ),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (canLabel)
+            IconButton(
+              key: const Key('mod-label'),
+              icon: const Icon(Icons.label_outline, size: 20),
+              tooltip: 'Label as moderator',
+              onPressed: () => _label(context),
+            ),
+          if (canReact)
+            IconButton(
               icon: const Icon(Icons.favorite_border, size: 20),
               tooltip: 'React',
               onPressed: () {
@@ -323,8 +583,9 @@ class _PostTile extends StatelessWidget {
                 ScaffoldMessenger.of(context)
                     .showSnackBar(SnackBar(content: Text(msg)));
               },
-            )
-          : null,
+            ),
+        ],
+      ),
       dense: true,
     );
   }

@@ -73,11 +73,11 @@ void main() {
   test('AgoraEvent matches sizeof(agora_event_t)', () {
     // Grew 8024 -> 11288 with the P3.2 business tail, 11288 -> 17872 with the
     // P3.3 co-signing tail, 17872 -> 22152 with the P3.4 business-post tail,
-    // and 22152 -> 22168 with the P4.1 moderation tail. When this fails, the C
-    // struct moved: update at_agora_shim.c's _Static_assert, ALL FIVE cohort
-    // ctypes Ev asserts, and this one TOGETHER, and check that only the tail
-    // grew.
-    expect(sizeOf<AgoraEvent>(), 22168,
+    // 22152 -> 22168 with the P4.1 moderation tail, and 22168 -> 28600 with
+    // the Phase 4 communities tail. When this fails, the C struct moved:
+    // update at_agora_shim.c's _Static_assert, ALL SEVEN cohort ctypes Ev
+    // asserts, and this one TOGETHER, and check that only the tail grew.
+    expect(sizeOf<AgoraEvent>(), 28600,
         reason: 'agora_event_t drift — poll() would misread every field '
             'past the drift point');
   });
@@ -92,6 +92,8 @@ void main() {
     const cosignBytesOffset = 11720; // unchanged by P3.4
     const businessPostBundleOffset = 18052; // unchanged by P4.1
     const blockedOffset = 22149; // P4.1, measured from the C compiler
+    const postCommunityOffset = 22168; // Phase 4 communities, measured
+    const labelBundleOffset = 27060; // Phase 4 communities, measured
     final mem = calloc<Uint8>(sizeOf<AgoraEvent>());
     try {
       mem[businessBundleOffset] = 0x41; // 'A'
@@ -101,6 +103,10 @@ void main() {
       mem[businessPostBundleOffset] = 0x63; // 'c'
       mem[businessPostBundleOffset + 1] = 0x00;
       mem[blockedOffset] = 0x01;
+      mem[postCommunityOffset] = 0x64; // 'd'
+      mem[postCommunityOffset + 1] = 0x00;
+      mem[labelBundleOffset] = 0x65; // 'e'
+      mem[labelBundleOffset + 1] = 0x00;
       final ev = mem.cast<AgoraEvent>().ref;
       expect(ev.businessBundle[0], 0x41,
           reason: 'business_bundle moved — a later tail was not appended');
@@ -110,6 +116,10 @@ void main() {
           reason: 'business_post_bundle is not where the C struct puts it');
       expect(ev.blocked, 0x01,
           reason: 'blocked is not where the C struct puts it');
+      expect(ev.postCommunity[0], 0x64,
+          reason: 'post_community is not where the C struct puts it');
+      expect(ev.labelBundle[0], 0x65,
+          reason: 'label_bundle is not where the C struct puts it');
     } finally {
       calloc.free(mem);
     }

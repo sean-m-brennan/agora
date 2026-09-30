@@ -83,6 +83,14 @@ _TRIGGER_ADVERTISE_BUSINESS = 'trigger_advertise_business'
 # the same string and calls identity_send_post_digest.
 _TRIGGER_POST_DIGEST = 'trigger_post_digest'
 
+# Pseudo-functions (Phase 4 communities): following, unfollowing, labelling and
+# carrying are app verbs, so each drives the production call the C adapter's
+# twin drives through the AT_APP_* handler. Follow carries the policy at once.
+_TRIGGER_FOLLOW_COMMUNITY = 'trigger_follow_community'
+_TRIGGER_UNFOLLOW_COMMUNITY = 'trigger_unfollow_community'
+_TRIGGER_PUBLISH_POST_LABEL = 'trigger_publish_post_label'
+_TRIGGER_ADVERTISE_COMMUNITIES = 'trigger_advertise_communities'
+
 
 # -- expected_state keys (moved from _Participant._check_expected_state) -- #
 
@@ -466,6 +474,52 @@ def _check_sf_emitted(self: _Participant, key: str, expected: Any) -> None:
     if actual != expected:
         raise AssertionError(f'{self.id}: {key}={actual}, expected {expected}')
 
+def _check_community_map(self: _Participant, key: str, expected: Any) -> None:
+    # {did: {seq?, bundle?} | {}} (Phase 4): what this participant FOLLOWS
+    # (communities_followed) or last HEARD (community_policy_last). {} asserts
+    # none. C mirrors via identity_get_followed_community /
+    # identity_get_last_community_policy.
+    get = (social_handlers.get_followed_community
+           if key == 'communities_followed'
+           else social_handlers.get_last_community_policy)
+    for did, want in expected.items():
+        actual = get(self.process, did)
+        if not want:
+            if actual:
+                raise AssertionError(f'{self.id}: {key}[{did!r}] present, '
+                                     f'expected none')
+            continue
+        if not actual:
+            raise AssertionError(f'{self.id}: {key}[{did!r}] missing')
+        for fk in ('seq', 'bundle'):
+            if fk in want and actual.get(fk) != want[fk]:
+                raise AssertionError(f'{self.id}: {key}[{did!r}].{fk}='
+                                     f'{actual.get(fk)!r}, expected {want[fk]!r}')
+
+def _check_post_label_last(self: _Participant, key: str, expected: Any) -> None:
+    # {post_id: {community?, seq?, hops?} | {}} (Phase 4). C mirrors via
+    # identity_get_last_post_label.
+    for post_id, want in expected.items():
+        actual = social_handlers.get_last_post_label(self.process, post_id)
+        if not want:
+            if actual:
+                raise AssertionError(f'{self.id}: post_label_last[{post_id[:16]}] '
+                                     f'present, expected none')
+            continue
+        if not actual:
+            raise AssertionError(f'{self.id}: post_label_last[{post_id[:16]}] missing')
+        for fk in ('community', 'seq', 'hops'):
+            if fk in want and actual.get(fk) != want[fk]:
+                raise AssertionError(f'{self.id}: post_label_last[{post_id[:16]}].'
+                                     f'{fk}={actual.get(fk)!r}, expected {want[fk]!r}')
+
+def _check_community_emitted(self: _Participant, key: str, expected: Any) -> None:
+    verb = {'community_policies_emitted': SocialProtocol.community_policy,
+            'post_labels_emitted': SocialProtocol.post_label}[key]
+    actual = self.emit_tally.get(verb, 0)
+    if actual != int(expected):
+        raise AssertionError(f'{self.id}: {key}={actual}, expected {int(expected)}')
+
 def _check_proximity_probes_emitted(self: _Participant, key: str, expected: Any) -> None:
     # peer_proximity_probe emissions by this participant (Phase 2).
     # The initiator's opt-in guard observable: an opted-OUT initiator
@@ -653,6 +707,33 @@ def _trigger_post_digest(self: IdentityAdapter, participant: _Participant, inbou
     return participant.drain_outbox()
 
 
+def _trigger_follow_community(self: IdentityAdapter, participant: _Participant, inbound: Message):
+    spec = from_json_string(inbound.obj) if inbound.obj else {}
+    social_handlers.follow_community(participant.process, str(spec.get('community', '')),
+                                     str(spec.get('bundle', '')),
+                                     int(spec.get('seq', 0)), queues=participant.queues)
+    return participant.drain_outbox()
+
+def _trigger_unfollow_community(self: IdentityAdapter, participant: _Participant, inbound: Message):
+    spec = from_json_string(inbound.obj) if inbound.obj else {}
+    social_handlers.unfollow_community(participant.process,
+                                       str(spec.get('community', '')))
+    return participant.drain_outbox()
+
+def _trigger_publish_post_label(self: IdentityAdapter, participant: _Participant, inbound: Message):
+    spec = from_json_string(inbound.obj) if inbound.obj else {}
+    social_handlers.publish_post_label(participant.process, participant.queues,
+                                       str(spec.get('community', '')),
+                                       str(spec.get('post_id', '')),
+                                       int(spec.get('seq', 0)),
+                                       str(spec.get('bundle', '')))
+    return participant.drain_outbox()
+
+def _trigger_advertise_communities(self: IdentityAdapter, participant: _Participant, inbound: Message):
+    social_handlers.advertise_communities(participant.process, participant.queues)
+    return participant.drain_outbox()
+
+
 # -- inbound builders (moved from IdentityAdapter._build_inbound) -------- #
 
 def _sf_author(participants, sender: _Participant, spec: dict):
@@ -676,6 +757,65 @@ def _sf_spec_id(participants, sender, spec: dict, biz: bool) -> str:
     return post_content_id(a.process.identity.uuid, seq, ts,
                            int(spec.get('tier', 0)), str(spec.get('body', '')))
 
+def _label_spec_id(participants, sender, spec: dict) -> str:
+    from autonomous_trust.social.codec import post_label_id
+    a = _sf_author(participants, sender, spec)
+    return post_label_id(a.process.identity.uuid, str(spec.get('community', '')),
+                         str(spec.get('post_id', '')), int(spec.get('seq', 1)),
+                         float(spec.get('ts', 0.0)), str(spec.get('bundle', '')))
+
+def _label_env(participants, sender, spec: dict) -> dict:
+    # One moderator label's envelope, signed by its `author` (default: the
+    # sender) as publish_post_label would. `sig` / `author_pk` override.
+    # Mirrors the C _label_env.
+    from autonomous_trust.social.codec import post_label_sign
+    a = _sf_author(participants, sender, spec)
+    ident = a.process.identity
+    did = str(spec.get('community', ''))
+    pid = str(spec.get('post_id', ''))
+    seq = int(spec.get('seq', 1))
+    ts = float(spec.get('ts', 0.0))
+    bundle = str(spec.get('bundle', ''))
+    sig = spec.get('sig') if isinstance(spec.get('sig'), str) else None
+    if sig is None:
+        try:
+            sig = post_label_sign(ident.signature.private, ident.uuid, did, pid,
+                                  seq, ts, bundle)
+        except ValueError:
+            sig = ''
+    pk = (spec['author_pk'] if isinstance(spec.get('author_pk'), str)
+          else bytes(ident.signature.public).hex())
+    return {'author': str(ident.uuid), 'author_pk': pk, 'community': did,
+            'post_id': pid, 'seq': seq, 'ts': ts, 'bundle': bundle, 'sig': sig,
+            'hops': int(spec.get('hops', 0))}
+
+def _build_post_label(self: IdentityAdapter, participants, sender: _Participant,
+        sender_identity, *, from_id: str, to_id: str, function: str,
+        payload: dict[str, Any]) -> str:
+    return to_json_string(_label_env(participants, sender,
+                                     payload if isinstance(payload, dict) else {}))
+
+def _build_community_policy(self: IdentityAdapter, participants, sender: _Participant,
+        sender_identity, *, from_id: str, to_id: str, function: str,
+        payload: dict[str, Any]) -> str:
+    # {carrier, carrier_pk, community, seq, ts, bundle, sig}, signed by the
+    # SENDER in the first person as _policy_advertise would. Mirrors the C
+    # peer_community_policy builder.
+    from autonomous_trust.social.codec import policy_ad_sign
+    payload = payload if isinstance(payload, dict) else {}
+    ident = sender.process.identity
+    did = str(payload.get('community', ''))
+    seq = int(payload.get('seq', 0))
+    ts = float(payload.get('ts', 0.0))
+    bundle = str(payload.get('bundle', ''))
+    sig = payload.get('sig') if isinstance(payload.get('sig'), str) else \
+        policy_ad_sign(ident.signature.private, ident.uuid, did, seq, ts, bundle)
+    pk = (payload['carrier_pk'] if isinstance(payload.get('carrier_pk'), str)
+          else bytes(ident.signature.public).hex())
+    return to_json_string({'carrier': str(ident.uuid), 'carrier_pk': pk,
+                           'community': did, 'seq': seq, 'ts': ts,
+                           'bundle': bundle, 'sig': sig})
+
 def _build_post_ids(self: IdentityAdapter, participants, sender: _Participant,
         sender_identity, *, from_id: str, to_id: str, function: str,
         payload: dict[str, Any]) -> str:
@@ -689,6 +829,16 @@ def _build_post_ids(self: IdentityAdapter, participants, sender: _Participant,
         specs = specs if isinstance(specs, list) else []
         body[kind] = [_sf_spec_id(participants, sender, sp, kind == 'biz')
                       for sp in specs if isinstance(sp, dict)]
+    # Labels (Phase 4): a digest offers {id, community}, a want asks by id.
+    lspecs = payload.get('label')
+    if isinstance(lspecs, list):
+        if function == SocialProtocol.post_digest:
+            body['label'] = [{'id': _label_spec_id(participants, sender, sp),
+                              'community': str(sp.get('community', ''))}
+                             for sp in lspecs if isinstance(sp, dict)]
+        else:
+            body['label'] = [_label_spec_id(participants, sender, sp)
+                             for sp in lspecs if isinstance(sp, dict)]
     return to_json_string(body)
 
 def _build_post_backfill(self: IdentityAdapter, participants, sender: _Participant,
@@ -701,6 +851,9 @@ def _build_post_backfill(self: IdentityAdapter, participants, sender: _Participa
     payload = payload if isinstance(payload, dict) else {}
     kind = payload.get('kind', 'feed')
     spec = payload.get('post') if isinstance(payload.get('post'), dict) else {}
+    if kind == 'label':
+        return to_json_string({'kind': kind,
+                               'post': _label_env(participants, sender, spec)})
     a = _sf_author(participants, sender, spec)
     ident = a.process.identity
     seq = int(spec.get('seq', 1))
@@ -867,14 +1020,31 @@ def _build_post(self: IdentityAdapter, participants, sender: _Participant,
         author_pk = payload['author_pk']
     else:
         author_pk = bytes(sender.process.identity.signature.public).hex()
+    # The scope the AUTHOR signed (Phase 4), which a scenario may make differ
+    # from the one on the envelope. Mirrors the C _signed_scope.
+    p = payload if isinstance(payload, dict) else {}
+    if 'signed_community' in p or 'signed_labels' in p:
+        s_comm, s_labels = p.get('signed_community', ''), p.get('signed_labels', [])
+    else:
+        s_comm, s_labels = p.get('community', ''), p.get('labels', [])
     if isinstance(payload, dict) and isinstance(payload.get('sig'), str):
         sig = payload['sig']
     else:
-        sig = post_sign(sender.process.identity.signature.private,
-                        author_uuid, seq, ts, tier, text)
-    obj = to_json_string({'author': author_str, 'author_pk': author_pk,
-                          'seq': seq, 'ts': ts, 'tier': tier,
-                          'body': text, 'sig': sig, 'hops': hops})
+        try:
+            sig = post_sign(sender.process.identity.signature.private,
+                            author_uuid, seq, ts, tier, text,
+                            s_comm if isinstance(s_comm, str) else '',
+                            s_labels if isinstance(s_labels, list) else [])
+        except ValueError:
+            sig = ''   # an unsignable scope: C's signer fails the same way
+    env = {'author': author_str, 'author_pk': author_pk,
+           'seq': seq, 'ts': ts, 'tier': tier,
+           'body': text, 'sig': sig, 'hops': hops}
+    if 'community' in p:
+        env['community'] = p['community']
+    if 'labels' in p:
+        env['labels'] = p['labels']
+    obj = to_json_string(env)
     return obj
 
 def _build_business_ad(self: IdentityAdapter, participants, sender: _Participant,
@@ -1059,6 +1229,10 @@ class SocialAdapter(IdentityAdapter):
                 _TRIGGER_PROXIMITY_PROBE: _trigger_proximity_probe,
                 _TRIGGER_ADVERTISE_BUSINESS: _trigger_advertise_business,
                 _TRIGGER_POST_DIGEST: _trigger_post_digest,
+                _TRIGGER_FOLLOW_COMMUNITY: _trigger_follow_community,
+                _TRIGGER_UNFOLLOW_COMMUNITY: _trigger_unfollow_community,
+                _TRIGGER_PUBLISH_POST_LABEL: _trigger_publish_post_label,
+                _TRIGGER_ADVERTISE_COMMUNITIES: _trigger_advertise_communities,
                 }
     INBOUND_BUILDERS = {**IdentityAdapter.INBOUND_BUILDERS,
                         SocialProtocol.position_query: _build_position_query,
@@ -1078,6 +1252,8 @@ class SocialAdapter(IdentityAdapter):
                         SocialProtocol.post_digest: _build_post_ids,
                         SocialProtocol.post_want: _build_post_ids,
                         SocialProtocol.post_backfill: _build_post_backfill,
+                        SocialProtocol.community_policy: _build_community_policy,
+                        SocialProtocol.post_label: _build_post_label,
                         }
     STATE_CHECKS = {**IdentityAdapter.STATE_CHECKS,
                     'peer_position': _check_peer_position,
@@ -1102,6 +1278,11 @@ class SocialAdapter(IdentityAdapter):
                     'post_wants_emitted': _check_sf_emitted,
                     'post_backfills_emitted': _check_sf_emitted,
                     'posts_emitted': _check_sf_emitted,
+                    'communities_followed': _check_community_map,
+                    'community_policy_last': _check_community_map,
+                    'post_label_last': _check_post_label_last,
+                    'community_policies_emitted': _check_community_emitted,
+                    'post_labels_emitted': _check_community_emitted,
                     }
 
     def _run_proximity_probe(self, initiator: _Participant,

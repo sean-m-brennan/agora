@@ -244,9 +244,52 @@ static int decode_post(const generic_msg_t *msg, at_app_event_t *ev)
     memcpy(out->body, in->body,
            AT_APP_POST_BODY_LEN);
     out->body[AT_APP_POST_BODY_LEN] = '\0';
+    memcpy(out->community, in->community, AT_APP_POST_COMMUNITY_LEN);
+    out->community[AT_APP_POST_COMMUNITY_LEN] = '\0';
+    memcpy(out->labels, in->labels, AT_APP_POST_LABELS_LEN);
+    out->labels[AT_APP_POST_LABELS_LEN] = '\0';
     return 0;
 }
 AT_APP_EVENT_DECODER_REGISTER(decode_post, PEER_POST_OBSERVED, decode_post)
+
+static int decode_community_policy(const generic_msg_t *msg, at_app_event_t *ev)
+{
+    const peer_community_policy_msg_t *in = AT_MSG_EXT_CONST(msg, peer_community_policy_msg_t);
+    at_app_community_policy_t *out = AT_APP_EVENT_EXT(ev, at_app_community_policy_t);
+    ev->kind = AT_APP_EVENT_COMMUNITY_POLICY;
+    memcpy(out->carrier_uuid, in->peer_uuid, AT_APP_UUID_LEN);
+    memcpy(out->community, in->community, AT_APP_POST_COMMUNITY_LEN);
+    out->community[AT_APP_POST_COMMUNITY_LEN] = '\0';
+    memcpy(out->policy_id, in->policy_id, AT_APP_POST_ID_LEN);
+    out->policy_id[AT_APP_POST_ID_LEN] = '\0';
+    out->seq = in->seq;
+    out->ts = in->ts;
+    memcpy(out->bundle, in->bundle, AT_APP_COMMUNITY_POLICY_BUNDLE_LEN);
+    out->bundle[AT_APP_COMMUNITY_POLICY_BUNDLE_LEN] = '\0';
+    return 0;
+}
+AT_APP_EVENT_DECODER_REGISTER(decode_community_policy, PEER_COMMUNITY_POLICY_OBSERVED, decode_community_policy)
+
+static int decode_post_label(const generic_msg_t *msg, at_app_event_t *ev)
+{
+    const peer_post_label_msg_t *in = AT_MSG_EXT_CONST(msg, peer_post_label_msg_t);
+    at_app_post_label_t *out = AT_APP_EVENT_EXT(ev, at_app_post_label_t);
+    ev->kind = AT_APP_EVENT_POST_LABEL;
+    memcpy(out->publisher_uuid, in->peer_uuid, AT_APP_UUID_LEN);
+    memcpy(out->community, in->community, AT_APP_POST_COMMUNITY_LEN);
+    out->community[AT_APP_POST_COMMUNITY_LEN] = '\0';
+    memcpy(out->post_id, in->post_id, AT_APP_POST_ID_LEN);
+    out->post_id[AT_APP_POST_ID_LEN] = '\0';
+    memcpy(out->label_id, in->label_id, AT_APP_POST_ID_LEN);
+    out->label_id[AT_APP_POST_ID_LEN] = '\0';
+    out->seq = in->seq;
+    out->ts = in->ts;
+    out->hops = in->hops;
+    memcpy(out->bundle, in->bundle, AT_APP_POST_LABEL_BUNDLE_LEN);
+    out->bundle[AT_APP_POST_LABEL_BUNDLE_LEN] = '\0';
+    return 0;
+}
+AT_APP_EVENT_DECODER_REGISTER(decode_post_label, PEER_POST_LABEL_OBSERVED, decode_post_label)
 
 static int decode_reaction(const generic_msg_t *msg, at_app_event_t *ev)
 {
@@ -804,4 +847,101 @@ int at_app_events_return_cosign(at_app_events_t *handle, const char *q_out,
     }
     json_decref(env);
     return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
+/* Send one app verb to identity with @p env (consumed). */
+static int _send_verb(const char *q_out, const char *verb, json_t *env)
+{
+    if (env == NULL)
+        return -1;
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)verb;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
+int at_app_events_publish_post_scoped(at_app_events_t *handle, const char *q_out,
+                                      const char *body, int required_tier,
+                                      const char *community, const char *labels_csv)
+{
+    if (handle == NULL || !at_app_name_survives(q_out))
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    if (required_tier < 0) required_tier = 0;
+    if (required_tier > 4) required_tier = 4;
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    json_object_set_new(env, "body", json_string(body != NULL ? body : ""));
+    json_object_set_new(env, "tier", json_integer(required_tier));
+    if (community != NULL && community[0] != '\0')
+        json_object_set_new(env, "community", json_string(community));
+    /* Split the labels; identity validates them, and refuses the post whole
+     * if any is malformed. */
+    json_t *labels = json_array();
+    if (labels_csv != NULL && labels != NULL) {
+        const char *p = labels_csv;
+        while (*p != '\0') {
+            const char *comma = strchr(p, ',');
+            size_t n = comma ? (size_t)(comma - p) : strlen(p);
+            if (n > 0)
+                json_array_append_new(labels, json_stringn(p, n));
+            if (comma == NULL)
+                break;
+            p = comma + 1;
+        }
+    }
+    json_object_set_new(env, "labels", labels);
+    return _send_verb(q_out, AT_APP_PUBLISH_POST, env);
+}
+
+int at_app_events_follow_community(at_app_events_t *handle, const char *q_out,
+                                   const char *community, const char *bundle,
+                                   int64_t seq)
+{
+    if (handle == NULL || !at_app_name_survives(q_out) || community == NULL
+        || bundle == NULL || community[0] == '\0' || bundle[0] == '\0')
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    return _send_verb(q_out, AT_APP_FOLLOW_COMMUNITY,
+                      json_pack("{s:s, s:s, s:I}", "community", community, "bundle",
+                                bundle, "seq", (json_int_t)seq));
+}
+
+int at_app_events_unfollow_community(at_app_events_t *handle, const char *q_out,
+                                     const char *community)
+{
+    if (handle == NULL || !at_app_name_survives(q_out) || community == NULL
+        || community[0] == '\0')
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    return _send_verb(q_out, AT_APP_UNFOLLOW_COMMUNITY,
+                      json_pack("{s:s}", "community", community));
+}
+
+int at_app_events_publish_post_label(at_app_events_t *handle, const char *q_out,
+                                     const char *community, const char *post_id,
+                                     const char *bundle, int64_t seq)
+{
+    if (handle == NULL || !at_app_name_survives(q_out) || community == NULL
+        || post_id == NULL || bundle == NULL || community[0] == '\0'
+        || bundle[0] == '\0')
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    return _send_verb(q_out, AT_APP_PUBLISH_POST_LABEL,
+                      json_pack("{s:s, s:s, s:s, s:I}", "community", community,
+                                "post_id", post_id, "bundle", bundle, "seq",
+                                (json_int_t)seq));
 }

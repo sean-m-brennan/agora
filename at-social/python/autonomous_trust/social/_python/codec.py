@@ -296,14 +296,51 @@ def bound_post_body(text: str) -> str:
     return _clamp_bytes(text, POST_BODY_MAX)
 
 
+# A post in a community's name (Phase 4, Ethne D37) carries a signed SCOPE:
+# the community's polity DID and the author's own labels. MUST match C post.h.
+POST_COMMUNITY_MAX = 95
+POST_LABEL_MAX = 32
+POST_LABELS_MAX = 8
+_LABEL_CHARS = frozenset('abcdefghijklmnopqrstuvwxyz0123456789-_')
+
+
+def post_label_valid(label) -> bool:
+    """1..POST_LABEL_MAX bytes of [a-z0-9_-] (Ethne check_label). Twin of C
+    at_post_label_valid."""
+    return (isinstance(label, str) and 0 < len(label) <= POST_LABEL_MAX
+            and all(c in _LABEL_CHARS for c in label))
+
+
+def post_scope_valid(community: str = '', labels=()) -> bool:
+    """Labels need a community; a community is bounded; at most POST_LABELS_MAX
+    valid labels. Twin of C at_post_scope_valid."""
+    if not isinstance(community, str) or len(community.encode('utf-8')) > POST_COMMUNITY_MAX:
+        return False
+    labels = list(labels or ())
+    if not community:
+        return not labels
+    return len(labels) <= POST_LABELS_MAX and all(post_label_valid(x) for x in labels)
+
+
+def normalize_labels(labels) -> list:
+    """Sorted, duplicates removed: what a publisher signs. Twin of C
+    at_post_scope_normalize."""
+    return sorted(set(labels or ()))
+
+
 def post_canonical(author_uuid, seq: int, ts: float, required_tier: int,
-                   body: str) -> bytes:
+                   body: str, community: str = '', labels=()) -> bytes:
     """THE cross-language signing/hash contract (see C extensions/social/post.h):
       author_uuid[16] || u64le(seq) || f64le(ts) || u8(required_tier)
       || u32le(body_len) || utf8_body
     where ts is the raw IEEE-754 little-endian double (struct '<d'). The body is
-    bound-truncated first, so the canonical matches what crosses the wire. MUST
-    stay byte-identical to C at_post_canonical."""
+    bound-truncated first, so the canonical matches what crosses the wire. A
+    post in a community's name appends the scope trailer
+      u8(1) || u16le(did_len) || did || u8(n) || (u8(len) || label)*
+    and an unscoped post's bytes are unchanged. MUST stay byte-identical to C
+    at_post_canonical_scoped."""
+    if not post_scope_valid(community, labels):
+        raise ValueError('malformed post scope')
     out = bytearray(_uuid16(author_uuid))
     out += int(seq).to_bytes(8, 'little')
     out += _struct.pack('<d', float(ts))
@@ -311,18 +348,154 @@ def post_canonical(author_uuid, seq: int, ts: float, required_tier: int,
     b = bound_post_body(body).encode('utf-8')
     out += _u32le(len(b))
     out += b
+    if community:
+        d = community.encode('utf-8')
+        out += b'\x01' + len(d).to_bytes(2, 'little') + d
+        labels = list(labels or ())
+        out += bytes((len(labels),))
+        for lab in labels:
+            lb = lab.encode('utf-8')
+            out += bytes((len(lb),)) + lb
     return bytes(out)
 
 
 def post_content_id(author_uuid, seq: int, ts: float, required_tier: int,
-                    body: str) -> str:
+                    body: str, community: str = '', labels=()) -> str:
     """blake2b-256 of the canonical bytes, lowercase hex (POST_ID_HEX_LEN chars).
     Same primitive as libsodium crypto_generichash (BLAKE2b-256). Twin of C
-    at_post_content_id."""
+    at_post_content_id_scoped."""
     import hashlib
     return hashlib.blake2b(
-        post_canonical(author_uuid, seq, ts, required_tier, body),
+        post_canonical(author_uuid, seq, ts, required_tier, body, community,
+                       labels),
         digest_size=32).hexdigest()
+
+
+def post_scope_from_json(body: dict):
+    """(community, labels) from a peer_post envelope, or None when the scope is
+    malformed: "labels" without "community", a bad label, too many, an
+    over-long community. Absent is the unscoped ('', []). Twin of C
+    _scope_from_json."""
+    if 'community' not in body and 'labels' not in body:
+        return '', []
+    community = body.get('community')
+    labels = body.get('labels', [])
+    if not isinstance(community, str) or not community:
+        return None
+    if not isinstance(labels, list):
+        return None
+    if not post_scope_valid(community, labels):
+        return None
+    return community, list(labels)
+
+
+# --- communities (Phase 4, Ethne D37) ---------------------------------------- #
+# A community's content policy (an opaque, root-signed Ethne artifact) carried
+# in the FIRST PERSON by a node that follows it, and a moderator's labels on one
+# post (an opaque, member-signed Ethne artifact) relayed like a business post.
+# The runtime parses neither. MUST stay byte-identical to C social/community.c.
+COMMUNITY_DID_MAX = 95
+COMMUNITY_POLICY_BUNDLE_MAX = 4096
+POST_LABEL_BUNDLE_MAX = 1536
+COMMUNITY_ID_HEX_LEN = 64
+COMMUNITIES_MAX = 32
+
+
+def community_post_id_valid(pid) -> bool:
+    """64 lowercase hex. Twin of C at_community_post_id_valid."""
+    return (isinstance(pid, str) and len(pid) == COMMUNITY_ID_HEX_LEN
+            and all(c in '0123456789abcdef' for c in pid))
+
+
+def _community_canonical(who, community: str, post_id, seq: int, ts: float,
+                         bundle: str, bundle_max: int) -> bytes:
+    out = bytearray(_uuid16(who))
+    d = _clamp_bytes(community, COMMUNITY_DID_MAX).encode('utf-8')
+    out += _u32le(len(d)) + d
+    if post_id is not None:
+        if not community_post_id_valid(post_id):
+            raise ValueError('bad post id')
+        out += post_id.encode('ascii')
+    out += int(seq).to_bytes(8, 'little')
+    out += _struct.pack('<d', float(ts))
+    b = _clamp_bytes(bundle, bundle_max).encode('utf-8')
+    out += _u32le(len(b)) + b
+    return bytes(out)
+
+
+def policy_ad_canonical(carrier_uuid, community: str, seq: int, ts: float,
+                        bundle: str) -> bytes:
+    """carrier_uuid[16] || u32le(did_len) || did || u64le(seq) || f64le(ts)
+    || u32le(bundle_len) || bundle. Twin of C at_policy_ad_canonical."""
+    return _community_canonical(carrier_uuid, community, None, seq, ts, bundle,
+                                COMMUNITY_POLICY_BUNDLE_MAX)
+
+
+def post_label_canonical(author_uuid, community: str, post_id: str, seq: int,
+                         ts: float, bundle: str) -> bytes:
+    """author_uuid[16] || u32le(did_len) || did || post_id[64] || u64le(seq)
+    || f64le(ts) || u32le(bundle_len) || bundle. Twin of C
+    at_post_label_canonical."""
+    return _community_canonical(author_uuid, community, post_id, seq, ts, bundle,
+                                POST_LABEL_BUNDLE_MAX)
+
+
+def _blake(b: bytes) -> str:
+    import hashlib
+    return hashlib.blake2b(b, digest_size=32).hexdigest()
+
+
+def policy_ad_id(carrier_uuid, community, seq, ts, bundle) -> str:
+    return _blake(policy_ad_canonical(carrier_uuid, community, seq, ts, bundle))
+
+
+def post_label_id(author_uuid, community, post_id, seq, ts, bundle) -> str:
+    return _blake(post_label_canonical(author_uuid, community, post_id, seq, ts,
+                                       bundle))
+
+
+def _sign_hex(signing_key, canon: bytes) -> str:
+    return signing_key.sign(canon).signature.hex()
+
+
+def _verify_hex(verify_key, canon: bytes, sig_hex: str) -> bool:
+    try:
+        sig = bytes.fromhex(sig_hex)
+    except (ValueError, TypeError):
+        return False
+    if len(sig) != 64:
+        return False
+    from nacl.exceptions import BadSignatureError
+    try:
+        verify_key.verify(canon, sig)
+        return True
+    except BadSignatureError:
+        return False
+
+
+def policy_ad_sign(signing_key, carrier_uuid, community, seq, ts, bundle) -> str:
+    return _sign_hex(signing_key,
+                     policy_ad_canonical(carrier_uuid, community, seq, ts, bundle))
+
+
+def policy_ad_verify(verify_key, carrier_uuid, community, seq, ts, bundle,
+                     sig_hex) -> bool:
+    return _verify_hex(verify_key,
+                       policy_ad_canonical(carrier_uuid, community, seq, ts, bundle),
+                       sig_hex)
+
+
+def post_label_sign(signing_key, author_uuid, community, post_id, seq, ts,
+                    bundle) -> str:
+    return _sign_hex(signing_key, post_label_canonical(author_uuid, community,
+                                                       post_id, seq, ts, bundle))
+
+
+def post_label_verify(verify_key, author_uuid, community, post_id, seq, ts, bundle,
+                      sig_hex) -> bool:
+    return _verify_hex(verify_key, post_label_canonical(author_uuid, community,
+                                                        post_id, seq, ts, bundle),
+                       sig_hex)
 
 
 # --- business ads (Phase 3 P3.2, "businesses near me") ---------------------- #
@@ -604,6 +777,10 @@ COSIGN_TOKEN_MAX = 15
 COSIGN_OPS = {
     'membership': ('admit', 'expel'),
     'guardian': ('designate', 'rotate', 'release'),
+    # Phase 4 communities (Ethne D37). A resignation is self-signed and not
+    # offered, as a departure is not. Twin of C at_cosign_op_ok.
+    'content_policy': ('amend',),
+    'office': ('confer', 'revoke'),
 }
 
 _COSIGN_HEX = frozenset('0123456789abcdef')
@@ -794,16 +971,21 @@ def social_pos_score(count: int) -> float:
 
 
 def post_sign(signing_key: '_SigningKey', author_uuid, seq: int, ts: float,
-              required_tier: int, body: str) -> str:
+              required_tier: int, body: str, community: str = '',
+              labels=()) -> str:
     """Detached Ed25519 signature over post_canonical, lowercase hex."""
     sig = signing_key.sign(
-        post_canonical(author_uuid, seq, ts, required_tier, body)).signature
+        post_canonical(author_uuid, seq, ts, required_tier, body, community,
+                       labels)).signature
     return sig.hex()
 
 
 def post_verify(verify_key: '_VerifyKey', author_uuid, seq: int, ts: float,
-                required_tier: int, body: str, sig_hex: str) -> bool:
+                required_tier: int, body: str, sig_hex: str,
+                community: str = '', labels=()) -> bool:
     """Verify a detached signature (lowercase hex) over post_canonical."""
+    if not post_scope_valid(community, labels):
+        return False
     try:
         sig = bytes.fromhex(sig_hex)
     except (ValueError, TypeError):
@@ -813,7 +995,8 @@ def post_verify(verify_key: '_VerifyKey', author_uuid, seq: int, ts: float,
     from nacl.exceptions import BadSignatureError
     try:
         verify_key.verify(
-            post_canonical(author_uuid, seq, ts, required_tier, body), sig)
+            post_canonical(author_uuid, seq, ts, required_tier, body, community,
+                           labels), sig)
         return True
     except BadSignatureError:
         return False

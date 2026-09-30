@@ -15,7 +15,7 @@
 # ******************
 """The social feature as an identity extension (FEATURE_SPLIT_PLAN Phase 5).
 
-Registers social's 17 verbs on the identity process (``functools.partial`` of
+Registers social's 22 verbs on the identity process (``functools.partial`` of
 module functions, so the process still pickles), sets ``proc.social``, and
 follows identity through the IdentityHooks the core calls: admission, the
 periodic resync, and the blocked-peer check behind ``get_peer_tier``. Its
@@ -75,6 +75,10 @@ def _register(proc, proc_name: str) -> None:
                                    functools.partial(handlers.handle_reaction, proc))
     proc.protocol.register_handler(SocialProtocol.report,
                                    functools.partial(handlers.handle_peer_report, proc))
+    proc.protocol.register_handler(SocialProtocol.community_policy,
+                                   functools.partial(handlers.handle_community_policy, proc))
+    proc.protocol.register_handler(SocialProtocol.post_label,
+                                   functools.partial(handlers.handle_post_label, proc))
     proc.protocol.register_handler(SocialProtocol.post_digest,
                                    functools.partial(handlers.handle_post_digest, proc))
     proc.protocol.register_handler(SocialProtocol.post_want,
@@ -113,6 +117,8 @@ def _on_peer_confirmed(proc, queues, peer) -> None:
     # whatever the interval says. Twin of C _social_peer_confirmed.
     with proc.lock:
         proc.social.last_digest_at = 0.0
+        # And the policies we carry: a newcomer has heard none of them.
+        proc.social.last_policy_ad_at = 0.0
 
 
 def _periodic_resync(proc, queues) -> None:
@@ -162,6 +168,8 @@ def _periodic_resync(proc, queues) -> None:
     # Store-and-forward: advertise our recent posts, at most every
     # $AT_SOCIAL_DIGEST_SEC. Twin of C _maybe_send_post_digest.
     handlers.maybe_send_post_digest(proc, queues)
+    # Communities (Phase 4): carry the policies we follow, first-person.
+    handlers.maybe_advertise_communities(proc, queues)
 
 
 def _is_blocked_locked(proc, uuid_str) -> bool:

@@ -1,0 +1,28 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: community-policy-heard-not-carried
+byte_pinning: false
+description: |
+    A policy ad is heard and handed to the app, and that is all. A node that
+    does not follow the community neither follows it on its own nor carries
+    it on: the policy's authority is the community's root signature inside
+    the bundle, which only the app can check.
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_community_policy
+    payload: {"community": "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ", "seq": 3, "ts": 0, "bundle": "{\"policy\":\"stub\",\"seq\":3}"}
+expected_state:
+  newcomer:
+    community_policy_last:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ": {"seq": 3, "bundle": "{\"policy\":\"stub\",\"seq\":3}"}
+    communities_followed:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ": {}
+    community_policies_emitted: 0

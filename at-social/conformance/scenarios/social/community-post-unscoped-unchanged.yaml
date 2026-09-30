@@ -1,0 +1,23 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: community-post-unscoped-unchanged
+byte_pinning: false
+description: |
+    A post that names no community is the post it always was: no scope on the
+    envelope, the old canonical bytes, and a recorded scope that is empty.
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_post
+    payload: {"body": "plain", "seq": 1, "ts": 0, "tier": 0}
+expected_state:
+  newcomer:
+    post_last:
+      "bg": {"body": "plain", "community": "", "labels": []}

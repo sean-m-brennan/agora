@@ -35,3 +35,52 @@ abstract class PolityActs {
   /// The log, for persisting after an append.
   Map<String, dynamic> dump();
 }
+
+/// The roll acts behind a community's content policy (Phase 4, Ethne D37): the
+/// roll replacing its policy, and conferring or revoking the Moderator office.
+/// Both travel the same detached co-signing exchange an expulsion does — the
+/// record's bytes move, the deciders' keys do not — under the record classes
+/// `content_policy` and `office`.
+///
+/// A separate interface from [PolityActs] so an expulsion-only fake need not
+/// grow; the production implementation serves both.
+abstract class CommunityGovernance {
+  /// Begin replacing the policy of [polityDid] with [policy] (Ethne
+  /// `ContentPolicy` JSON). A majority tightens; loosening needs more.
+  Map<String, dynamic> pendingPolicy({
+    required String polityDid,
+    required Map<String, dynamic> policy,
+    required String rationale,
+    required List<String> deciderDids,
+  });
+
+  /// Begin conferring ([confer] true) or revoking Moderator on [holderDid].
+  /// A conferral also needs the holder's own signature.
+  Map<String, dynamic> pendingModerator({
+    required String polityDid,
+    required String holderDid,
+    required bool confer,
+    required String rationale,
+    required List<String> deciderDids,
+  });
+
+  /// Sign exported bytes with this node's own member key.
+  String signOwn(String bytesHex);
+
+  /// Attach [signatures] to [payload] (of record class [record]) and append.
+  void assemble(String record, Map<String, dynamic> payload,
+      List<({String did, String sig})> signatures);
+
+  /// Every signature and every governance rule, over the whole log.
+  bool verify();
+
+  /// `{policy, set_by, moderators}` as this log reads now.
+  Map<String, dynamic> policyState(String polityDid);
+
+  /// Mint the policy artifact under the polity's ROOT key, or null when this
+  /// node does not hold it.
+  String? mintPolicy(String polityDid);
+
+  /// The log, for persisting.
+  Map<String, dynamic> dump();
+}

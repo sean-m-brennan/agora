@@ -60,8 +60,10 @@
 #include "cosign.h"
 #include "social_tx.h"
 #include "social_store.h"
+#include "community.h"
 #include "proximity.h"
 static bool _peer_shares_our_group(const process_t *proc, const char *peer_uuid_str);
+static json_t *_business_map_load_json(map_t *map, const char *key);
 static void _record_peer_group_uuid(const process_t *proc,
                                     const char *peer_uuid_str,
                                     const char *group_uuid_str);
@@ -138,6 +140,20 @@ static char ID_BUSINESS_POST[] = "peer_business_post";
  * so the node serving it vouches for nothing. It is terminal: never relayed.
  * Digest and want are honoured only from admitted peers. None of the three is
  * on the plaintext allowlist. See post_store.h. */
+/* COMMUNITIES (Phase 4, Ethne D37). A community's content policy and a
+ * moderator's labels, both opaque Ethne artifacts the core carries and never
+ * parses (community.h):
+ *
+ *   peer_community_policy  GROUP MULTICAST, encrypted: a root-signed policy,
+ *                          carried in the FIRST PERSON by a node that follows
+ *                          the community, like a business ad. Never relayed.
+ *   peer_post_label        GROUP MULTICAST, encrypted: a moderator's labels on
+ *                          one post, relayed a bounded number of hops by nodes
+ *                          that follow the community, like a business post.
+ *
+ * Neither is on the plaintext allowlist. */
+static char ID_COMMUNITY_POLICY[] = "peer_community_policy";
+static char ID_POST_LABEL[]       = "peer_post_label";
 static char ID_POST_DIGEST[]   = "peer_post_digest";
 static char ID_POST_WANT[]     = "peer_post_want";
 static char ID_POST_BACKFILL[] = "peer_post_backfill";
@@ -172,6 +188,9 @@ static char ID_APP_SET_CUSTOMER[] = AT_APP_SET_CUSTOMER;
 static char ID_APP_REQUEST_COSIGN[] = AT_APP_REQUEST_COSIGN;
 static char ID_APP_RETURN_COSIGN[] = AT_APP_RETURN_COSIGN;
 static char ID_APP_PUBLISH_BUSINESS_POST[] = AT_APP_PUBLISH_BUSINESS_POST;
+static char ID_APP_FOLLOW_COMMUNITY[] = AT_APP_FOLLOW_COMMUNITY;
+static char ID_APP_UNFOLLOW_COMMUNITY[] = AT_APP_UNFOLLOW_COMMUNITY;
+static char ID_APP_PUBLISH_POST_LABEL[] = AT_APP_PUBLISH_POST_LABEL;
 #define POST_MAX_HOPS 1
 #define POST_DEDUP_CAP 256
 /* Store-and-forward bounds. A digest offers only posts younger than
@@ -202,6 +221,16 @@ static char ID_APP_PUBLISH_BUSINESS_POST[] = AT_APP_PUBLISH_BUSINESS_POST;
  * about who said it. BUSINESS_POST_DEDUP_CAP bounds the post-content dedup
  * ring — the thing that makes gossip converge instead of echoing. */
 #define BUSINESS_POST_DEDUP_CAP 256
+
+/* Community bounds (Phase 4). A policy ad is first-person and never relayed,
+ * like a business ad; a label relays under POST_MAX_HOPS, like a business post.
+ * COMMUNITIES_MAX bounds how many communities one node follows (and so carries);
+ * a follow past it is refused, not evicted. Holders re-advertise every
+ * $AT_SOCIAL_POLICY_SEC seconds (default POLICY_AD_DEFAULT_SEC). */
+#define COMMUNITY_POLICY_DEDUP_CAP 256
+#define POST_LABEL_DEDUP_CAP 256
+#define COMMUNITIES_MAX 32
+#define POLICY_AD_DEFAULT_SEC 300
 
 /* Forward decls: defined below beside the position handlers, but used earlier
  * (the query from the admission path, the validator from state init). */
@@ -374,7 +403,28 @@ static struct {
      * the two rate limits. Guarded by social_state.lock. */
     post_store_t feed_store;
     post_store_t biz_store;
+    /* Moderator labels kept for backfill (Phase 4): a label made while a
+     * follower was on the other side of a split reaches it after the heal. */
+    post_store_t label_store;
     double       last_digest_at;
+    /* Communities (Phase 4). communities is what THIS node follows, keyed by
+     * DID, string_data of {"bundle","seq"}: the policy the app verified and
+     * handed us, which we carry and persist. The core never replaces it from
+     * the wire. last_policy_map is the observability surface for what we HEARD,
+     * keyed by DID, {"policy_id","seq","bundle","carrier"}; last_label_map the
+     * same for labels, keyed by the LABELLED post's id, {"label_id",
+     * "community","seq","hops","bundle"}. The two rings are the content-id
+     * dedup for each verb. Guarded by social_state.lock. */
+    map_t        communities;
+    map_t        last_policy_map;
+    map_t        last_label_map;
+    char         seen_policy_ads[COMMUNITY_POLICY_DEDUP_CAP][AT_COMMUNITY_ID_HEX_LEN + 1];
+    size_t       seen_policy_ad_next;
+    size_t       seen_policy_ad_count;
+    char         seen_post_labels[POST_LABEL_DEDUP_CAP][AT_COMMUNITY_ID_HEX_LEN + 1];
+    size_t       seen_post_label_next;
+    size_t       seen_post_label_count;
+    double       last_policy_ad_at;
     map_t        want_sent_at;
     map_t        want_served_at;
     pthread_mutex_t lock;
@@ -1758,7 +1808,10 @@ static void _persist_social_blocks(void)
     if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) <= 0)
         return;
     pthread_mutex_lock(&social_state.lock);
-    int rc = social_store_save(&social_state.social_blocks, cfg_dir);
+    /* The blocks AND the followed communities: one document, so saving either
+     * must write both, or a block would forget every follow. */
+    int rc = social_store_save_all(&social_state.social_blocks,
+                                   &social_state.communities, cfg_dir);
     pthread_mutex_unlock(&social_state.lock);
     if (rc != 0)
         log_warn(NULL, "Identity: could not persist social blocks to %s/%s\n",
@@ -1818,9 +1871,11 @@ void identity_reload_social_blocks(const char *cfg_dir)
      * silent mass unblock. Found by this seam wiping state in the conformance
      * harness, where the default root is /etc/at and nothing may be written;
      * the same shape would bite a real node with a read-only config mount. */
-    int rc = social_store_save(&social_state.social_blocks, cfg_dir);
+    int rc = social_store_save_all(&social_state.social_blocks,
+                                   &social_state.communities, cfg_dir);
     if (rc == 0)
-        (void)social_store_load(cfg_dir, &social_state.social_blocks);
+        (void)social_store_load_all(cfg_dir, &social_state.social_blocks,
+                                    &social_state.communities);
     pthread_mutex_unlock(&social_state.lock);
 }
 
@@ -3482,7 +3537,7 @@ static bool handle_app_unblock(const process_t *proc, directory_t *queues,
  * the signature-bound author. Mirrors identity_emit_dm. */
 static int identity_emit_post(const uuid_t author_uuid, const char *post_id,
                               int64_t seq, double ts, int required_tier,
-                              const char *body)
+                              const char *body, const at_post_scope_t *scope)
 {
     generic_msg_t msg = {0};
     msg.type = PEER_POST_OBSERVED;
@@ -3496,6 +3551,10 @@ static int identity_emit_post(const uuid_t author_uuid, const char *post_id,
     ext->required_tier = required_tier;
     at_post_bound_body(body, ext->body,
                        sizeof(ext->body));
+    if (scope != NULL) {
+        snprintf(ext->community, sizeof(ext->community), "%s", scope->community);
+        at_post_scope_labels_joined(scope, ext->labels, sizeof(ext->labels));
+    }
     return messaging_send(AT_MAIN_QUEUE, PEER_POST_OBSERVED, &msg, false);
 }
 
@@ -3557,17 +3616,24 @@ static bool _post_seen_or_record(const char *id_hex)
  * observability seam (identity_get_last_post). NOT roster state. Own locking. */
 static void _last_post_store(const char *author_str, const char *post_id,
                             int64_t seq, double ts, int required_tier,
-                            const char *body)
+                            const char *body, const at_post_scope_t *scope)
 {
     char bounded[AT_POST_BODY_MAX + 1];
     at_post_bound_body(body, bounded, sizeof(bounded));
     json_t *env = json_object();
     if (env == NULL) return;
-    if (json_object_set_new(env, "post_id", json_string(post_id)) != 0
+    json_t *labels = json_array();
+    for (uint8_t i = 0; labels != NULL && scope != NULL && i < scope->n_labels; i++)
+        json_array_append_new(labels, json_string(scope->labels[i]));
+    if (labels == NULL
+        || json_object_set_new(env, "post_id", json_string(post_id)) != 0
         || json_object_set_new(env, "seq", json_integer((json_int_t)seq)) != 0
         || json_object_set_new(env, "ts", json_real(ts)) != 0
         || json_object_set_new(env, "tier", json_integer(required_tier)) != 0
-        || json_object_set_new(env, "body", json_string(bounded)) != 0) {
+        || json_object_set_new(env, "body", json_string(bounded)) != 0
+        || json_object_set_new(env, "community",
+                               json_string(scope != NULL ? scope->community : "")) != 0
+        || json_object_set_new(env, "labels", labels) != 0) {
         json_decref(env);
         return;
     }
@@ -3593,7 +3659,8 @@ static void _last_post_store(const char *author_str, const char *post_id,
 static int _multicast_post(const process_t *proc, const uuid_t author_uuid,
                            const char *author_pk_hex, int64_t seq, double ts,
                            uint8_t required_tier, const char *body,
-                           const char *sig_hex, int hops)
+                           const at_post_scope_t *scope, const char *sig_hex,
+                           int hops)
 {
     generic_msg_t out = {0};
     out.type = NET_MESSAGE;
@@ -3602,8 +3669,9 @@ static int _multicast_post(const process_t *proc, const uuid_t author_uuid,
     out.info.net_msg.encrypt = false;
     out.info.net_msg.group_multicast = true;
     strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
-    json_t *env = at_post_to_json(author_uuid, author_pk_hex, seq, ts,
-                                  required_tier, body, sig_hex, hops);
+    json_t *env = at_post_to_json_scoped(author_uuid, author_pk_hex, seq, ts,
+                                         required_tier, body, scope, sig_hex,
+                                         hops);
     if (env == NULL) return -1;
     net_msg_pack_json(&out.info.net_msg, env);
     json_decref(env);
@@ -3634,7 +3702,42 @@ static bool handle_app_publish_post(const process_t *proc, directory_t *queues,
                        body, sizeof(body));
     int required_tier = json_is_integer(j_tier)
                             ? (int)json_integer_value(j_tier) : 0;
+    /* A post in a community's name (Phase 4): the community and the author's
+     * own labels, which the signature will cover. Refused whole rather than
+     * trimmed: a label the author asked for and did not get would be a post
+     * the author did not write. */
+    at_post_scope_t scope;
+    memset(&scope, 0, sizeof(scope));
+    json_t *j_comm = json_object_get(payload, "community");
+    json_t *j_labels = json_object_get(payload, "labels");
+    bool scope_ok = true;
+    if (json_is_string(j_comm) && json_string_value(j_comm)[0] != '\0') {
+        size_t clen = strlen(json_string_value(j_comm));
+        scope_ok = clen <= AT_POST_COMMUNITY_MAX;
+        if (scope_ok)
+            memcpy(scope.community, json_string_value(j_comm), clen);
+    }
+    if (scope_ok && j_labels != NULL && json_array_size(j_labels) > 0) {
+        size_t i;
+        json_t *v;
+        scope_ok = json_is_array(j_labels)
+                   && json_array_size(j_labels) <= AT_POST_LABELS_MAX;
+        json_array_foreach(j_labels, i, v) {
+            if (!scope_ok) break;
+            scope_ok = json_is_string(v) && at_post_label_valid(json_string_value(v));
+            if (scope_ok)
+                snprintf(scope.labels[scope.n_labels++], AT_POST_LABEL_MAX + 1, "%s",
+                         json_string_value(v));
+        }
+    }
     json_decref(payload);
+    at_post_scope_normalize(&scope);
+    if (!scope_ok || !at_post_scope_valid(&scope)) {
+        log_warn(proc->logger, "Identity: publish_post with a malformed community "
+                 "or labels (labels need a community; [a-z0-9_-], at most %d), "
+                 "refusing\n", AT_POST_LABELS_MAX);
+        return true;
+    }
     if (required_tier < AT_POST_TIER_MIN) required_tier = AT_POST_TIER_MIN;
     if (required_tier > AT_POST_TIER_MAX) required_tier = AT_POST_TIER_MAX;
 
@@ -3651,8 +3754,8 @@ static bool handle_app_publish_post(const process_t *proc, directory_t *queues,
     double ts = (double)time(NULL);
 
     char sig_hex[AT_POST_SIG_HEX_LEN + 1];
-    if (at_post_sign(self->signature.private, self->uuid, seq, ts,
-                     (uint8_t)required_tier, body, sig_hex) != 0) {
+    if (at_post_sign_scoped(self->signature.private, self->uuid, seq, ts,
+                            (uint8_t)required_tier, body, &scope, sig_hex) != 0) {
         log_warn(proc->logger, "Identity: publish_post: signing failed\n");
         return true;
     }
@@ -3660,8 +3763,8 @@ static bool handle_app_publish_post(const process_t *proc, directory_t *queues,
     sodium_bin2hex(pk_hex, sizeof(pk_hex), self->signature.public,
                    crypto_sign_PUBLICKEYBYTES);
     char id_hex[AT_POST_ID_HEX_LEN + 1];
-    if (at_post_content_id(self->uuid, seq, ts, (uint8_t)required_tier, body,
-                           id_hex) != 0)
+    if (at_post_content_id_scoped(self->uuid, seq, ts, (uint8_t)required_tier,
+                                  body, &scope, id_hex) != 0)
         return true;
     /* Record BEFORE sending so a loopback copy of our own multicast is deduped
      * rather than re-emitted. */
@@ -3669,19 +3772,25 @@ static bool handle_app_publish_post(const process_t *proc, directory_t *queues,
     /* Kept for backfill: a peer that was not on the segment asks for it later
      * (store-and-forward). */
     {
-        json_t *own = at_post_to_json(self->uuid, pk_hex, seq, ts,
-                                      (uint8_t)required_tier, body, sig_hex, 0);
+        json_t *own = at_post_to_json_scoped(self->uuid, pk_hex, seq, ts,
+                                             (uint8_t)required_tier, body, &scope,
+                                             sig_hex, 0);
         _store_for_backfill(&social_state.feed_store, id_hex, ts, self->uuid, own);
         json_decref(own);
     }
 
     if (_multicast_post(proc, self->uuid, pk_hex, seq, ts,
-                        (uint8_t)required_tier, body, sig_hex, 0) != 0)
+                        (uint8_t)required_tier, body, &scope, sig_hex, 0) != 0)
         return true; /* identity_send_to_network already said the post did not go */
     char self_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(self->uuid, self_str);
-    log_info(proc->logger, "Identity: published post seq=%lld tier=%d (%s)\n",
-             (long long)seq, required_tier, id_hex);
+    if (scope.community[0] != '\0')
+        log_info(proc->logger, "Identity: published post seq=%lld tier=%d in %s "
+                 "with %u label(s) (%s)\n", (long long)seq, required_tier,
+                 scope.community, (unsigned)scope.n_labels, id_hex);
+    else
+        log_info(proc->logger, "Identity: published post seq=%lld tier=%d (%s)\n",
+                 (long long)seq, required_tier, id_hex);
     return true;
 }
 
@@ -3708,8 +3817,9 @@ static bool _ingest_post(const process_t *proc, json_t *payload, bool via_group)
     double ts = 0.0;
     uint8_t tier = 0;
     int hops = 0;
-    if (at_post_from_json(payload, author, author_pk, &seq, &ts, &tier,
-                          body, sizeof(body), sig_hex, &hops) != 0) {
+    at_post_scope_t scope;
+    if (at_post_from_json_scoped(payload, author, author_pk, &seq, &ts, &tier,
+                                 body, sizeof(body), &scope, sig_hex, &hops) != 0) {
         log_warn(proc->logger, "Identity: peer_post malformed, refusing\n");
         return true;
     }
@@ -3744,7 +3854,8 @@ static bool _ingest_post(const process_t *proc, json_t *payload, bool via_group)
         }
     }
 
-    if (!at_post_verify(verify_pk, author, seq, ts, tier, body, sig_hex)) {
+    if (!at_post_verify_scoped(verify_pk, author, seq, ts, tier, body, &scope,
+                               sig_hex)) {
         log_warn(proc->logger,
                  "Identity: peer_post from %s: BAD SIGNATURE, dropping\n",
                  author_str);
@@ -3783,7 +3894,7 @@ static bool _ingest_post(const process_t *proc, json_t *payload, bool via_group)
     /* Content-id dedup (the app-content store): compute the id from the verified
      * canonical and drop a repeat before emitting or re-forwarding. */
     char id_hex[AT_POST_ID_HEX_LEN + 1];
-    if (at_post_content_id(author, seq, ts, tier, body, id_hex) != 0)
+    if (at_post_content_id_scoped(author, seq, ts, tier, body, &scope, id_hex) != 0)
         return true;
     if (_post_seen_or_record(id_hex)) {
         log_debug(proc->logger, "Identity: peer_post %s already seen, dropping\n",
@@ -3821,21 +3932,34 @@ static bool _ingest_post(const process_t *proc, json_t *payload, bool via_group)
                   "still relaying\n", id_hex, author_str);
         if (via_group && hops < POST_MAX_HOPS)
             _multicast_post(proc, author, author_pk, seq, ts, tier, body,
-                            sig_hex, hops + 1);
+                            &scope, sig_hex, hops + 1);
         return true;
     }
 
-    _last_post_store(author_str, id_hex, seq, ts, (int)tier, body);
-    identity_emit_post(author, id_hex, seq, ts, (int)tier, body);
-    log_debug(proc->logger, "Identity: post %s from %s accepted (hops=%d%s)\n",
-              id_hex, author_str, hops, via_group ? "" : ", backfilled");
+    /* A post in a community's name is shown here as any post is. The
+     * community's policy is applied by the APP, which alone can verify it, and
+     * a reader who does not follow the community sees the post unmoderated
+     * (Phase 4): the core neither hides nor withholds by policy. */
+    _last_post_store(author_str, id_hex, seq, ts, (int)tier, body, &scope);
+    identity_emit_post(author, id_hex, seq, ts, (int)tier, body, &scope);
+    /* A backfilled acceptance is rare (one per post missed across a split)
+     * and is the only evidence the heal delivered it when no app is attached
+     * to see the event, so it is said at INFO. The group path stays at DEBUG:
+     * it fires for every post. */
+    if (via_group)
+        log_debug(proc->logger, "Identity: post %s from %s accepted (hops=%d)\n",
+                  id_hex, author_str, hops);
+    else
+        log_info(proc->logger,
+                 "Identity: post %s from %s accepted (hops=%d, backfilled)\n",
+                 id_hex, author_str, hops);
 
     /* Gossip forward: relay one more hop while under the reach bound. The dedup
      * ring above guarantees we forward a given post at most once. A backfill is
      * never relayed. */
     if (via_group && hops < POST_MAX_HOPS)
-        _multicast_post(proc, author, author_pk, seq, ts, tier, body, sig_hex,
-                        hops + 1);
+        _multicast_post(proc, author, author_pk, seq, ts, tier, body, &scope,
+                        sig_hex, hops + 1);
     return true;
 }
 
@@ -3892,6 +4016,34 @@ bool identity_get_last_post(const char *uuid_str, char *post_id_buf,
     }
     pthread_mutex_unlock(&social_state.lock);
     return found;
+}
+
+/* The scope of the most-recent post accepted from @p uuid_str (Phase 4). */
+bool identity_get_last_post_scope(const char *uuid_str, char *community_buf,
+                                  size_t community_sz, char *labels_buf,
+                                  size_t labels_sz)
+{
+    if (community_buf != NULL && community_sz > 0) community_buf[0] = '\0';
+    if (labels_buf != NULL && labels_sz > 0) labels_buf[0] = '\0';
+    if (!social_state.initialized || uuid_str == NULL) return false;
+    json_t *obj = _business_map_load_json(&social_state.last_post_map, uuid_str);
+    if (obj == NULL) return false;
+    const char *c = json_string_value(json_object_get(obj, "community"));
+    if (community_buf != NULL && community_sz > 0)
+        snprintf(community_buf, community_sz, "%s", c != NULL ? c : "");
+    json_t *arr = json_object_get(obj, "labels");
+    size_t off = 0, i;
+    json_t *v;
+    if (labels_buf != NULL && labels_sz > 0 && json_is_array(arr)) {
+        json_array_foreach(arr, i, v) {
+            int n = snprintf(labels_buf + off, labels_sz - off, "%s%s", i ? "," : "",
+                             json_string_value(v) ? json_string_value(v) : "");
+            if (n < 0 || (size_t)n >= labels_sz - off) break;
+            off += (size_t)n;
+        }
+    }
+    json_decref(obj);
+    return true;
 }
 
 /****************************
@@ -4898,6 +5050,593 @@ static bool handle_business_post(const process_t *proc, directory_t *queues,
     return true;
 }
 /* ======================================================================
+ * COMMUNITIES (Phase 4, Ethne D37): a community's content policy and a
+ * moderator's labels. See ID_COMMUNITY_POLICY above and community.h.
+ *
+ * WHAT THE CORE DOES NOT DO. It never parses a policy, never decides whether a
+ * label counts, and never hides or withholds a post by policy: every one of
+ * those is the app's call, against a policy only the app can verify, and a
+ * reader who does not follow a community sees its posts unmoderated. What the
+ * core owns is carriage: holding the policies the app told it to follow,
+ * carrying them in the first person, and moving labels only between nodes to
+ * whom they can matter.
+ * ====================================================================== */
+
+/* A bounded content-id ring: true if @p id was already there, else recorded.
+ * Caller holds social_state.lock. */
+static bool _ring_seen_or_record_locked(char ring[][AT_COMMUNITY_ID_HEX_LEN + 1],
+                                        size_t cap, size_t *next, size_t *count,
+                                        const char *id, bool record)
+{
+    for (size_t i = 0; i < *count; i++)
+        if (strncmp(ring[i], id, AT_COMMUNITY_ID_HEX_LEN) == 0)
+            return true;
+    if (record) {
+        snprintf(ring[*next], AT_COMMUNITY_ID_HEX_LEN + 1, "%s", id);
+        *next = (*next + 1) % cap;
+        if (*count < cap)
+            (*count)++;
+    }
+    return false;
+}
+
+static bool _policy_ad_seen_or_record(const char *id)
+{
+    pthread_mutex_lock(&social_state.lock);
+    bool seen = _ring_seen_or_record_locked(
+        social_state.seen_policy_ads, COMMUNITY_POLICY_DEDUP_CAP,
+        &social_state.seen_policy_ad_next, &social_state.seen_policy_ad_count, id,
+        true);
+    pthread_mutex_unlock(&social_state.lock);
+    return seen;
+}
+
+static bool _post_label_seen_or_record(const char *id)
+{
+    pthread_mutex_lock(&social_state.lock);
+    bool seen = _ring_seen_or_record_locked(
+        social_state.seen_post_labels, POST_LABEL_DEDUP_CAP,
+        &social_state.seen_post_label_next, &social_state.seen_post_label_count,
+        id, true);
+    pthread_mutex_unlock(&social_state.lock);
+    return seen;
+}
+
+static bool _post_label_seen_peek(const char *id)
+{
+    pthread_mutex_lock(&social_state.lock);
+    bool seen = _ring_seen_or_record_locked(
+        social_state.seen_post_labels, POST_LABEL_DEDUP_CAP,
+        &social_state.seen_post_label_next, &social_state.seen_post_label_count,
+        id, false);
+    pthread_mutex_unlock(&social_state.lock);
+    return seen;
+}
+
+/* Whether this node follows @p did. */
+bool identity_is_following(const char *did)
+{
+    if (!social_state.initialized || did == NULL || did[0] == '\0')
+        return false;
+    json_t *rec = _business_map_load_json(&social_state.communities, did);
+    if (rec == NULL)
+        return false;
+    json_decref(rec);
+    return true;
+}
+
+/* The policy this node holds for @p did: true and fills @p seq_out and
+ * @p bundle_buf when following. Conformance/observability seam. */
+bool identity_get_followed_community(const char *did, int64_t *seq_out,
+                                     char *bundle_buf, size_t bundle_sz)
+{
+    if (!social_state.initialized || did == NULL) return false;
+    json_t *rec = _business_map_load_json(&social_state.communities, did);
+    if (rec == NULL) return false;
+    json_t *j_b = json_object_get(rec, "bundle");
+    json_t *j_s = json_object_get(rec, "seq");
+    if (seq_out != NULL)
+        *seq_out = json_is_integer(j_s) ? (int64_t)json_integer_value(j_s) : 0;
+    if (bundle_buf != NULL && bundle_sz > 0)
+        snprintf(bundle_buf, bundle_sz, "%s",
+                 json_is_string(j_b) ? json_string_value(j_b) : "");
+    json_decref(rec);
+    return true;
+}
+
+/* Follow @p did, holding @p bundle (the app verified it) at @p seq, and persist.
+ * Replaces a held policy: this is also how the app hands over a newer one.
+ * Returns 0, or -1 on bad input or when COMMUNITIES_MAX are already followed. */
+int identity_follow_community(const char *did, const char *bundle, int64_t seq)
+{
+    if (!social_state.initialized || did == NULL || bundle == NULL
+        || did[0] == '\0' || bundle[0] == '\0'
+        || strlen(did) > AT_COMMUNITY_DID_MAX
+        || strlen(bundle) > AT_COMMUNITY_POLICY_BUNDLE_MAX)
+        return -1;
+    bool already = identity_is_following(did);
+    pthread_mutex_lock(&social_state.lock);
+    size_t n = map_size(&social_state.communities);
+    pthread_mutex_unlock(&social_state.lock);
+    if (!already && n >= COMMUNITIES_MAX)
+        return -1;
+    json_t *rec = json_pack("{s:s, s:I}", "bundle", bundle, "seq", (json_int_t)seq);
+    if (rec == NULL)
+        return -1;
+    _business_map_store_json(&social_state.communities, did, rec);
+    _persist_social_blocks();
+    return 0;
+}
+
+/* Stop following @p did, and persist. Idempotent. */
+void identity_unfollow_community(const char *did)
+{
+    if (!social_state.initialized || did == NULL) return;
+    pthread_mutex_lock(&social_state.lock);
+    map_remove(&social_state.communities, (map_key_t)did);
+    pthread_mutex_unlock(&social_state.lock);
+    _persist_social_blocks();
+}
+
+/* Identity -> app: one policy ad heard. */
+static int identity_emit_community_policy(const uuid_t carrier, const char *did,
+                                          const char *policy_id, int64_t seq,
+                                          double ts, const char *bundle)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_COMMUNITY_POLICY_OBSERVED;
+    peer_community_policy_msg_t *ext = AT_MSG_EXT(&msg, peer_community_policy_msg_t);
+    msg.size = sizeof(peer_community_policy_msg_t);
+    memcpy(ext->peer_uuid, carrier, 16);
+    at_community_bound_did(did, ext->community, sizeof(ext->community));
+    snprintf(ext->policy_id, sizeof(ext->policy_id), "%s",
+             policy_id != NULL ? policy_id : "");
+    ext->seq = seq;
+    ext->ts = ts;
+    at_community_bound_policy(bundle, ext->bundle, sizeof(ext->bundle));
+    return messaging_send(AT_MAIN_QUEUE, PEER_COMMUNITY_POLICY_OBSERVED, &msg, false);
+}
+
+/* Identity -> app: one label accepted. */
+static int identity_emit_post_label(const uuid_t author, const char *did,
+                                    const char *post_id, const char *label_id,
+                                    int64_t seq, double ts, int hops,
+                                    const char *bundle)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_POST_LABEL_OBSERVED;
+    peer_post_label_msg_t *ext = AT_MSG_EXT(&msg, peer_post_label_msg_t);
+    msg.size = sizeof(peer_post_label_msg_t);
+    memcpy(ext->peer_uuid, author, 16);
+    at_community_bound_did(did, ext->community, sizeof(ext->community));
+    snprintf(ext->post_id, sizeof(ext->post_id), "%s", post_id != NULL ? post_id : "");
+    snprintf(ext->label_id, sizeof(ext->label_id), "%s",
+             label_id != NULL ? label_id : "");
+    ext->seq = seq;
+    ext->ts = ts;
+    ext->hops = hops;
+    at_community_bound_label(bundle, ext->bundle, sizeof(ext->bundle));
+    return messaging_send(AT_MAIN_QUEUE, PEER_POST_LABEL_OBSERVED, &msg, false);
+}
+
+/* Resolve the key to verify a carried artifact against: a known peer's stored
+ * key, which the carried one MUST match (an impersonation guard), else the
+ * carried key, best-effort. Returns false to drop. */
+static bool _carried_key(const process_t *proc, const uuid_t who, const char *pk_hex,
+                         const char *verb, unsigned char out[crypto_sign_PUBLICKEYBYTES])
+{
+    char who_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(who, who_str);
+    public_identity_t known;
+    if (identity_find_peer_pub(proc, who, &known)) {
+        char known_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+        sodium_bin2hex(known_hex, sizeof(known_hex), known.signature.public,
+                       crypto_sign_PUBLICKEYBYTES);
+        if (strncmp(known_hex, pk_hex, crypto_sign_PUBLICKEYBYTES * 2) != 0) {
+            log_warn(proc->logger, "Identity: %s from %s: key != known key, "
+                     "dropping (impersonation)\n", verb, who_str);
+            return false;
+        }
+        memcpy(out, known.signature.public, crypto_sign_PUBLICKEYBYTES);
+        return true;
+    }
+    size_t bin_len = 0;
+    if (sodium_hex2bin(out, crypto_sign_PUBLICKEYBYTES, pk_hex, strlen(pk_hex), NULL,
+                       &bin_len, NULL) != 0
+        || bin_len != crypto_sign_PUBLICKEYBYTES) {
+        log_warn(proc->logger, "Identity: %s from %s: bad key, dropping\n", verb,
+                 who_str);
+        return false;
+    }
+    return true;
+}
+
+/* Group-multicast one policy ad, signed by THIS node: first person, never a
+ * relay. Returns 0 when sent. */
+static int _policy_advertise(const process_t *proc, const char *did, int64_t seq,
+                             const char *bundle)
+{
+    const identity_t *self = identity_self_identity(proc);
+    if (self == NULL)
+        return -1;
+    double ts = (double)time(NULL);
+    char sig_hex[AT_COMMUNITY_SIG_HEX_LEN + 1];
+    char id_hex[AT_COMMUNITY_ID_HEX_LEN + 1];
+    if (at_policy_ad_sign(self->signature.private, self->uuid, did, seq, ts, bundle,
+                          sig_hex) != 0
+        || at_policy_ad_id(self->uuid, did, seq, ts, bundle, id_hex) != 0) {
+        log_warn(proc->logger, "Identity: policy ad signing failed\n");
+        return -1;
+    }
+    /* Record BEFORE sending: our own multicast comes back round. */
+    (void)_policy_ad_seen_or_record(id_hex);
+    char pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+    sodium_bin2hex(pk_hex, sizeof(pk_hex), self->signature.public,
+                   crypto_sign_PUBLICKEYBYTES);
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = ID_COMMUNITY_POLICY;
+    out.info.net_msg.encrypt = false;          /* the group path encrypts */
+    out.info.net_msg.group_multicast = true;
+    strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    json_t *env = at_policy_ad_to_json(self->uuid, pk_hex, did, seq, ts, bundle,
+                                       sig_hex);
+    if (env == NULL)
+        return -1;
+    net_msg_pack_json(&out.info.net_msg, env);
+    json_decref(env);
+    log_debug(proc->logger, "Identity: carrying the policy of %s seq=%lld (%s)\n",
+              did, (long long)seq, id_hex);
+    return identity_send_to_network(proc, &out, "a community policy", "the group");
+}
+
+/* $AT_SOCIAL_POLICY_SEC, else POLICY_AD_DEFAULT_SEC. */
+static double _policy_ad_interval(void)
+{
+    const char *env = getenv("AT_SOCIAL_POLICY_SEC");
+    if (env != NULL && *env != '\0') {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env && *end == '\0' && v > 0)
+            return (double)v;
+    }
+    return (double)POLICY_AD_DEFAULT_SEC;
+}
+
+/* Carry every policy this node follows, now. Returns how many went out.
+ * Conformance seam; the resync calls it on its interval. */
+int identity_advertise_communities(const process_t *proc)
+{
+    char dids[COMMUNITIES_MAX][AT_COMMUNITY_DID_MAX + 1];
+    size_t n = 0;
+    pthread_mutex_lock(&social_state.lock);
+    social_state.last_policy_ad_at = (double)time(NULL);
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(&social_state.communities, key, val)
+    {
+        (void)val;
+        if (n < COMMUNITIES_MAX)
+            snprintf(dids[n++], AT_COMMUNITY_DID_MAX + 1, "%s", key);
+    }
+    map_end_for_each
+    pthread_mutex_unlock(&social_state.lock);
+    int sent = 0;
+    for (size_t i = 0; i < n; i++) {
+        static char bundle[AT_COMMUNITY_POLICY_BUNDLE_MAX + 1];
+        int64_t seq = 0;
+        if (identity_get_followed_community(dids[i], &seq, bundle, sizeof(bundle))
+            && _policy_advertise(proc, dids[i], seq, bundle) == 0)
+            sent++;
+    }
+    return sent;
+}
+
+static void _maybe_advertise_communities(const process_t *proc)
+{
+    double now = (double)time(NULL);
+    pthread_mutex_lock(&social_state.lock);
+    bool due = map_size(&social_state.communities) > 0
+               && now - social_state.last_policy_ad_at >= _policy_ad_interval();
+    pthread_mutex_unlock(&social_state.lock);
+    if (due)
+        (void)identity_advertise_communities(proc);
+}
+
+/* Observability: what we last HEARD about @p did's policy. */
+bool identity_get_last_community_policy(const char *did, int64_t *seq_out,
+                                        char *bundle_buf, size_t bundle_sz)
+{
+    if (!social_state.initialized || did == NULL) return false;
+    json_t *rec = _business_map_load_json(&social_state.last_policy_map, did);
+    if (rec == NULL) return false;
+    json_t *j_s = json_object_get(rec, "seq");
+    json_t *j_b = json_object_get(rec, "bundle");
+    if (seq_out != NULL)
+        *seq_out = json_is_integer(j_s) ? (int64_t)json_integer_value(j_s) : 0;
+    if (bundle_buf != NULL && bundle_sz > 0)
+        snprintf(bundle_buf, bundle_sz, "%s",
+                 json_is_string(j_b) ? json_string_value(j_b) : "");
+    json_decref(rec);
+    return true;
+}
+
+/* Handler: a policy ad. Verify, dedup, record what we heard and tell the app —
+ * and nothing more. We do not follow it, replace a held policy with it, or
+ * carry it on: the app verifies the root signature and decides, and following
+ * is the only thing that makes this node a carrier. */
+static bool handle_community_policy(const process_t *proc, directory_t *queues,
+                                    generic_msg_t *msg)
+{
+    (void)queues;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(&msg->info.net_msg, &payload) != 0 || payload == NULL)
+        return true;
+    uuid_t carrier;
+    char pk_hex[AT_COMMUNITY_SIG_HEX_LEN + 1];
+    char sig_hex[AT_COMMUNITY_SIG_HEX_LEN + 1];
+    char did[AT_COMMUNITY_DID_MAX + 1];
+    static char bundle[AT_COMMUNITY_POLICY_BUNDLE_MAX + 1];
+    int64_t seq = 0;
+    double ts = 0.0;
+    int rc = at_policy_ad_from_json(payload, carrier, pk_hex, did, sizeof(did), &seq,
+                                    &ts, bundle, sizeof(bundle), sig_hex);
+    json_decref(payload);
+    if (rc != 0) {
+        log_warn(proc->logger, "Identity: peer_community_policy malformed, refusing\n");
+        return true;
+    }
+    unsigned char vk[crypto_sign_PUBLICKEYBYTES];
+    if (!_carried_key(proc, carrier, pk_hex, "peer_community_policy", vk))
+        return true;
+    if (!at_policy_ad_verify(vk, carrier, did, seq, ts, bundle, sig_hex)) {
+        log_warn(proc->logger, "Identity: peer_community_policy: BAD SIGNATURE, "
+                 "dropping\n");
+        return true;
+    }
+    char id_hex[AT_COMMUNITY_ID_HEX_LEN + 1];
+    if (at_policy_ad_id(carrier, did, seq, ts, bundle, id_hex) != 0
+        || _policy_ad_seen_or_record(id_hex))
+        return true;
+    /* A carrier we blocked is not heard, as a blocked advertiser is not. */
+    if (_is_blocked(carrier))
+        return true;
+    char carrier_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(carrier, carrier_str);
+    json_t *rec = json_pack("{s:s, s:I, s:s, s:s}", "policy_id", id_hex, "seq",
+                            (json_int_t)seq, "bundle", bundle, "carrier",
+                            carrier_str);
+    _business_map_store_json(&social_state.last_policy_map, did, rec);
+    identity_emit_community_policy(carrier, did, id_hex, seq, ts, bundle);
+    log_debug(proc->logger, "Identity: heard the policy of %s seq=%lld from %s\n",
+              did, (long long)seq, carrier_str);
+    return true;
+}
+
+/* App -> AT verb (AT_APP_FOLLOW_COMMUNITY). Payload {"community","bundle",
+ * "seq"}. Locally originated only: following changes what this node carries
+ * and persists, which is the operator's decision. */
+static bool handle_app_follow_community(const process_t *proc, directory_t *queues,
+                                        generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_FOLLOW_COMMUNITY);
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    const char *did = json_string_value(json_object_get(payload, "community"));
+    const char *bundle = json_string_value(json_object_get(payload, "bundle"));
+    json_t *j_seq = json_object_get(payload, "seq");
+    int64_t seq = json_is_integer(j_seq) ? (int64_t)json_integer_value(j_seq) : 0;
+    if (identity_follow_community(did, bundle, seq) != 0) {
+        log_warn(proc->logger, "Identity: follow_community refused (missing or "
+                 "over-long community/bundle, or %d already followed)\n",
+                 COMMUNITIES_MAX);
+    } else {
+        log_info(proc->logger, "Identity: following %s at seq %lld\n", did,
+                 (long long)seq);
+        /* Carry it now, in the first person. */
+        (void)_policy_advertise(proc, did, seq, bundle);
+    }
+    json_decref(payload);
+    return true;
+}
+
+/* App -> AT verb (AT_APP_UNFOLLOW_COMMUNITY). Payload {"community"}. */
+static bool handle_app_unfollow_community(const process_t *proc,
+                                          directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_UNFOLLOW_COMMUNITY);
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    const char *did = json_string_value(json_object_get(payload, "community"));
+    if (did != NULL && did[0] != '\0') {
+        identity_unfollow_community(did);
+        log_info(proc->logger, "Identity: no longer following %s\n", did);
+    }
+    json_decref(payload);
+    return true;
+}
+
+/* Group-multicast one label envelope: the publish (hops 0) and a relay alike. */
+static int _multicast_post_label(const process_t *proc, const uuid_t author,
+                                 const char *pk_hex, const char *did,
+                                 const char *post_id, int64_t seq, double ts,
+                                 const char *bundle, const char *sig_hex, int hops)
+{
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = ID_POST_LABEL;
+    out.info.net_msg.encrypt = false;
+    out.info.net_msg.group_multicast = true;
+    strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    json_t *env = at_post_label_to_json(author, pk_hex, did, post_id, seq, ts, bundle,
+                                        sig_hex, hops);
+    if (env == NULL)
+        return -1;
+    net_msg_pack_json(&out.info.net_msg, env);
+    json_decref(env);
+    return identity_send_to_network(proc, &out, "a post label", "the group");
+}
+
+/* Publish a moderator's label: sign the canonical form as THIS node, keep it for
+ * backfill, multicast at hops 0. Returns 0 when sent. Conformance seam. */
+int identity_publish_post_label(const process_t *proc, const char *did,
+                                const char *post_id, int64_t seq, const char *bundle)
+{
+    const identity_t *self = identity_self_identity(proc);
+    if (self == NULL || did == NULL || did[0] == '\0' || bundle == NULL
+        || bundle[0] == '\0' || !at_community_post_id_valid(post_id))
+        return -1;
+    double ts = (double)time(NULL);
+    char sig_hex[AT_COMMUNITY_SIG_HEX_LEN + 1];
+    char id_hex[AT_COMMUNITY_ID_HEX_LEN + 1];
+    if (at_post_label_sign(self->signature.private, self->uuid, did, post_id, seq, ts,
+                           bundle, sig_hex) != 0
+        || at_post_label_id(self->uuid, did, post_id, seq, ts, bundle, id_hex) != 0)
+        return -1;
+    (void)_post_label_seen_or_record(id_hex);
+    char pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+    sodium_bin2hex(pk_hex, sizeof(pk_hex), self->signature.public,
+                   crypto_sign_PUBLICKEYBYTES);
+    json_t *own = at_post_label_to_json(self->uuid, pk_hex, did, post_id, seq, ts,
+                                        bundle, sig_hex, 0);
+    _store_for_backfill(&social_state.label_store, id_hex, ts, self->uuid, own);
+    json_decref(own);
+    int rc = _multicast_post_label(proc, self->uuid, pk_hex, did, post_id, seq, ts,
+                                   bundle, sig_hex, 0);
+    log_info(proc->logger, "Identity: published label %s on %s in %s\n", id_hex,
+             post_id, did);
+    return rc;
+}
+
+/* App -> AT verb (AT_APP_PUBLISH_POST_LABEL). Payload {"community","post_id",
+ * "bundle","seq"}. Confers nothing: the moderator's signature inside the bundle
+ * is what a reader checks. */
+static bool handle_app_publish_post_label(const process_t *proc, directory_t *queues,
+                                          generic_msg_t *msg)
+{
+    (void)queues;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(&msg->info.net_msg, &payload) != 0 || payload == NULL)
+        return true;
+    const char *did = json_string_value(json_object_get(payload, "community"));
+    const char *pid = json_string_value(json_object_get(payload, "post_id"));
+    const char *bundle = json_string_value(json_object_get(payload, "bundle"));
+    json_t *j_seq = json_object_get(payload, "seq");
+    int64_t seq = json_is_integer(j_seq) ? (int64_t)json_integer_value(j_seq) : 0;
+    if (identity_publish_post_label(proc, did, pid, seq, bundle) != 0)
+        log_warn(proc->logger, "Identity: publish_post_label refused (needs a "
+                 "community, a 64-hex post id and a bundle)\n");
+    json_decref(payload);
+    return true;
+}
+
+/* Observability: the label last accepted for post @p post_id. */
+bool identity_get_last_post_label(const char *post_id, char *community_buf,
+                                  size_t community_sz, int64_t *seq_out,
+                                  int *hops_out)
+{
+    if (!social_state.initialized || post_id == NULL) return false;
+    json_t *rec = _business_map_load_json(&social_state.last_label_map, post_id);
+    if (rec == NULL) return false;
+    json_t *j_c = json_object_get(rec, "community");
+    json_t *j_s = json_object_get(rec, "seq");
+    json_t *j_h = json_object_get(rec, "hops");
+    if (community_buf != NULL && community_sz > 0)
+        snprintf(community_buf, community_sz, "%s",
+                 json_is_string(j_c) ? json_string_value(j_c) : "");
+    if (seq_out != NULL)
+        *seq_out = json_is_integer(j_s) ? (int64_t)json_integer_value(j_s) : 0;
+    if (hops_out != NULL)
+        *hops_out = json_is_integer(j_h) ? (int)json_integer_value(j_h) : 0;
+    json_decref(rec);
+    return true;
+}
+
+/* The one inbound path for a label: the group multicast (@p via_group true) or
+ * a directed backfill (false, never relayed). @p payload is borrowed.
+ *
+ * THE FOLLOW GATE sits after the signature check and before the dedup, the
+ * emit and the relay, exactly where a business post's page gate sits: a label
+ * matters only where the community's policy applies, and carrying it to nodes
+ * that do not follow the community is how a gossip channel becomes an
+ * amplifier. There is no block gate: a label is the community's act, and
+ * whether it counts is the policy's question. */
+static bool _ingest_post_label(const process_t *proc, json_t *payload, bool via_group)
+{
+    uuid_t author;
+    char pk_hex[AT_COMMUNITY_SIG_HEX_LEN + 1];
+    char sig_hex[AT_COMMUNITY_SIG_HEX_LEN + 1];
+    char did[AT_COMMUNITY_DID_MAX + 1];
+    char post_id[AT_COMMUNITY_ID_HEX_LEN + 1];
+    char bundle[AT_POST_LABEL_BUNDLE_MAX + 1];
+    int64_t seq = 0;
+    double ts = 0.0;
+    int hops = 0;
+    if (at_post_label_from_json(payload, author, pk_hex, did, sizeof(did), post_id,
+                                &seq, &ts, bundle, sizeof(bundle), sig_hex,
+                                &hops) != 0) {
+        log_warn(proc->logger, "Identity: peer_post_label malformed, refusing\n");
+        return true;
+    }
+    unsigned char vk[crypto_sign_PUBLICKEYBYTES];
+    if (!_carried_key(proc, author, pk_hex, "peer_post_label", vk))
+        return true;
+    if (!at_post_label_verify(vk, author, did, post_id, seq, ts, bundle, sig_hex)) {
+        log_warn(proc->logger, "Identity: peer_post_label: BAD SIGNATURE, dropping\n");
+        return true;
+    }
+    if (!identity_is_following(did)) {
+        log_debug(proc->logger, "Identity: peer_post_label for %s, which we do not "
+                  "follow: dropped, not relayed\n", did);
+        return true;
+    }
+    char id_hex[AT_COMMUNITY_ID_HEX_LEN + 1];
+    if (at_post_label_id(author, did, post_id, seq, ts, bundle, id_hex) != 0
+        || _post_label_seen_or_record(id_hex))
+        return true;
+    _store_for_backfill(&social_state.label_store, id_hex, ts, author, payload);
+    json_t *rec = json_pack("{s:s, s:s, s:I, s:i, s:s}", "label_id", id_hex,
+                            "community", did, "seq", (json_int_t)seq, "hops", hops,
+                            "bundle", bundle);
+    _business_map_store_json(&social_state.last_label_map, post_id, rec);
+    identity_emit_post_label(author, did, post_id, id_hex, seq, ts, hops, bundle);
+    if (via_group)
+        log_debug(proc->logger, "Identity: label %s on %s in %s accepted (hops=%d)\n",
+                  id_hex, post_id, did, hops);
+    else
+        log_info(proc->logger, "Identity: label %s on %s in %s accepted (hops=%d, "
+                 "backfilled)\n", id_hex, post_id, did, hops);
+    /* Relay the ORIGINAL envelope one more hop, never re-signed (see the
+     * business post relay for why). */
+    if (via_group && hops < POST_MAX_HOPS)
+        (void)_multicast_post_label(proc, author, pk_hex, did, post_id, seq, ts,
+                                    bundle, sig_hex, hops + 1);
+    return true;
+}
+
+static bool handle_post_label(const process_t *proc, directory_t *queues,
+                              generic_msg_t *msg)
+{
+    (void)queues;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(&msg->info.net_msg, &payload) != 0 || payload == NULL)
+        return true;
+    _ingest_post_label(proc, payload, true);
+    json_decref(payload);
+    return true;
+}
+
+/* ======================================================================
  * STORE-AND-FORWARD (Agora Phase 4 DDIL). See ID_POST_DIGEST above.
  * ====================================================================== */
 
@@ -4955,20 +5694,42 @@ int identity_send_post_digest(const process_t *proc)
 {
     static char feed[POST_STORE_CAP][POST_STORE_ID_LEN + 1];
     static char biz[POST_STORE_CAP][POST_STORE_ID_LEN + 1];
+    static char label[POST_STORE_CAP][POST_STORE_ID_LEN + 1];
     double now = (double)time(NULL);
     pthread_mutex_lock(&social_state.lock);
     size_t nf = post_store_digest(&social_state.feed_store, now,
                                   POST_BACKFILL_MAX_AGE, feed, POST_STORE_CAP);
     size_t nb = post_store_digest(&social_state.biz_store, now,
                                   POST_BACKFILL_MAX_AGE, biz, POST_STORE_CAP);
+    size_t nl = post_store_digest(&social_state.label_store, now,
+                                  POST_BACKFILL_MAX_AGE, label, POST_STORE_CAP);
     social_state.last_digest_at = now;
-    json_t *env = (nf + nb > 0) ? json_object() : NULL;
+    json_t *env = (nf + nb + nl > 0) ? json_object() : NULL;
     if (env != NULL) {
         json_object_set_new(env, "feed", _ids_json(feed, nf));
         json_object_set_new(env, "biz", _ids_json(biz, nb));
+        /* A label is offered WITH its community (Phase 4), so a peer that
+         * does not follow it asks for nothing: it would only drop the label
+         * at the follow gate, and a dropped label never enters its dedup ring,
+         * so it would ask again at every digest. */
+        if (nl > 0) {
+            json_t *arr = json_array();
+            for (size_t i = 0; arr != NULL && i < nl; i++) {
+                const post_store_entry_t *e =
+                    post_store_get(&social_state.label_store, label[i]);
+                json_t *le = e ? json_loads(e->envelope, 0, NULL) : NULL;
+                const char *did = le ? json_string_value(json_object_get(le, "community"))
+                                     : NULL;
+                if (did != NULL)
+                    json_array_append_new(arr, json_pack("{s:s, s:s}", "id", label[i],
+                                                         "community", did));
+                json_decref(le);
+            }
+            json_object_set_new(env, "label", arr);
+        }
     }
     pthread_mutex_unlock(&social_state.lock);
-    if (nf + nb == 0)
+    if (nf + nb + nl == 0)
         return 1;
     if (env == NULL)
         return -1;
@@ -4981,8 +5742,8 @@ int identity_send_post_digest(const process_t *proc)
     strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     net_msg_pack_json(&out.info.net_msg, env);
     json_decref(env);
-    log_debug(proc->logger, "Identity: post digest: %zu feed, %zu business\n",
-              nf, nb);
+    log_debug(proc->logger, "Identity: post digest: %zu feed, %zu business, "
+              "%zu label\n", nf, nb, nl);
     return identity_send_to_network(proc, &out, "a post digest", "the group");
 }
 
@@ -5047,8 +5808,26 @@ static bool handle_post_digest(const process_t *proc, directory_t *queues,
     json_t *feed = _missing_ids(json_object_get(payload, "feed"), _post_seen_peek);
     json_t *biz = _missing_ids(json_object_get(payload, "biz"),
                                _business_post_seen_peek);
+    /* Labels: only those for communities we follow, and do not hold. */
+    json_t *label = json_array();
+    {
+        json_t *arr = json_object_get(payload, "label");
+        size_t i;
+        json_t *v;
+        if (label != NULL && json_is_array(arr)) {
+            json_array_foreach(arr, i, v) {
+                if (json_array_size(label) >= POST_WANT_MAX)
+                    break;
+                const char *id = json_string_value(json_object_get(v, "id"));
+                const char *did = json_string_value(json_object_get(v, "community"));
+                if (id != NULL && strlen(id) == POST_STORE_ID_LEN && did != NULL
+                    && identity_is_following(did) && !_post_label_seen_peek(id))
+                    json_array_append_new(label, json_string(id));
+            }
+        }
+    }
     json_decref(payload);
-    size_t n = json_array_size(feed) + json_array_size(biz);
+    size_t n = json_array_size(feed) + json_array_size(biz) + json_array_size(label);
     char peer_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(peer.uuid, peer_str);
     bool send = false;
@@ -5063,6 +5842,8 @@ static bool handle_post_digest(const process_t *proc, directory_t *queues,
         if (env != NULL) {
             json_object_set(env, "feed", feed);
             json_object_set(env, "biz", biz);
+            if (json_array_size(label) > 0)
+                json_object_set(env, "label", label);
             log_info(proc->logger, "Identity: asking %s for %zu missed post(s)\n",
                      peer.nickname, n);
             _send_directed(proc, &peer, ID_POST_WANT, env, "a post want");
@@ -5071,6 +5852,7 @@ static bool handle_post_digest(const process_t *proc, directory_t *queues,
     }
     json_decref(feed);
     json_decref(biz);
+    json_decref(label);
     return true;
 }
 
@@ -5091,16 +5873,18 @@ static bool handle_post_want(const process_t *proc, directory_t *queues,
     uuid_unparse_lower(peer.uuid, peer_str);
 
     /* Copy out under the lock, send after it. */
-    char *envs[2 * POST_WANT_MAX];
-    const char *kinds[2 * POST_WANT_MAX];
+    static const char *const kind_names[3] = { "feed", "biz", "label" };
+    char *envs[3 * POST_WANT_MAX];
+    const char *kinds[3 * POST_WANT_MAX];
     size_t n = 0;
     pthread_mutex_lock(&social_state.lock);
     bool serve = _cooldown_pass_locked(&social_state.want_served_at, peer_str,
                                        (double)time(NULL));
-    for (int k = 0; serve && k < 2; k++) {
-        json_t *arr = json_object_get(payload, k == 0 ? "feed" : "biz");
+    for (int k = 0; serve && k < 3; k++) {
+        json_t *arr = json_object_get(payload, kind_names[k]);
         post_store_t *store = k == 0 ? &social_state.feed_store
-                                     : &social_state.biz_store;
+                              : k == 1 ? &social_state.biz_store
+                                       : &social_state.label_store;
         size_t i, taken = 0;
         json_t *v;
         if (!json_is_array(arr))
@@ -5114,7 +5898,7 @@ static bool handle_post_want(const process_t *proc, directory_t *queues,
             envs[n] = strdup(e->envelope);
             if (envs[n] == NULL)
                 continue;
-            kinds[n++] = k == 0 ? "feed" : "biz";
+            kinds[n++] = kind_names[k];
             taken++;
         }
     }
@@ -5166,6 +5950,8 @@ static bool handle_post_backfill(const process_t *proc, directory_t *queues,
         _ingest_post(proc, post, false);
     else if (strcmp(kind, "biz") == 0)
         _ingest_business_post(proc, post, false);
+    else if (strcmp(kind, "label") == 0)
+        _ingest_post_label(proc, post, false);
     else
         log_warn(proc->logger, "Identity: peer_post_backfill of unknown kind "
                  "'%s', refusing\n", kind);
@@ -5211,7 +5997,16 @@ static void _social_init(void)
     map_init(&social_state.last_business_post_map);
     post_store_init(&social_state.feed_store);
     post_store_init(&social_state.biz_store);
+    post_store_init(&social_state.label_store);
     social_state.last_digest_at = 0.0;
+    map_init(&social_state.communities);
+    map_init(&social_state.last_policy_map);
+    map_init(&social_state.last_label_map);
+    social_state.seen_policy_ad_next = 0;
+    social_state.seen_policy_ad_count = 0;
+    social_state.seen_post_label_next = 0;
+    social_state.seen_post_label_count = 0;
+    social_state.last_policy_ad_at = 0.0;
     map_init(&social_state.want_sent_at);
     map_init(&social_state.want_served_at);
     map_init(&social_state.last_cosign_request_map);
@@ -5279,7 +6074,19 @@ static void _social_reset(void)
     map_init(&social_state.last_business_post_map);
     post_store_clear(&social_state.feed_store);
     post_store_clear(&social_state.biz_store);
+    post_store_clear(&social_state.label_store);
     social_state.last_digest_at = 0.0;
+    map_free(&social_state.communities);
+    map_init(&social_state.communities);
+    map_free(&social_state.last_policy_map);
+    map_init(&social_state.last_policy_map);
+    map_free(&social_state.last_label_map);
+    map_init(&social_state.last_label_map);
+    social_state.seen_policy_ad_next = 0;
+    social_state.seen_policy_ad_count = 0;
+    social_state.seen_post_label_next = 0;
+    social_state.seen_post_label_count = 0;
+    social_state.last_policy_ad_at = 0.0;
     map_free(&social_state.want_sent_at);
     map_init(&social_state.want_sent_at);
     map_free(&social_state.want_served_at);
@@ -5313,9 +6120,15 @@ static void _social_run_start(process_t *proc)
         char cfg_dir[CFG_PATH_LEN + 1];
         if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) > 0) {
             pthread_mutex_lock(&social_state.lock);
-            int rc = social_store_load(cfg_dir, &social_state.social_blocks);
+            int rc = social_store_load_all(cfg_dir, &social_state.social_blocks,
+                                           &social_state.communities);
             size_t n = map_size(&social_state.social_blocks);
+            size_t nc = map_size(&social_state.communities);
             pthread_mutex_unlock(&social_state.lock);
+            if (rc == 0 && nc > 0)
+                log_info(proc->logger,
+                         "Identity: following %zu communit%s\n", nc,
+                         nc == 1 ? "y" : "ies");
             if (rc != 0)
                 log_warn(proc->logger,
                          "Identity: %s/%s is unreadable — starting with NO "
@@ -5342,6 +6155,8 @@ static void _social_peer_confirmed(const process_t *proc, const public_identity_
      * whatever the interval says. */
     pthread_mutex_lock(&social_state.lock);
     social_state.last_digest_at = 0.0;
+    /* And the policies we carry: a newcomer has heard none of them. */
+    social_state.last_policy_ad_at = 0.0;
     pthread_mutex_unlock(&social_state.lock);
 }
 
@@ -5413,6 +6228,8 @@ static void _social_periodic_resync(const process_t *proc)
      * $AT_SOCIAL_DIGEST_SEC. No partition detection is needed: whoever missed
      * a post while apart asks for it after the heal. */
     _maybe_send_post_digest(proc);
+    /* Communities (Phase 4): carry the policies we follow, first-person. */
+    _maybe_advertise_communities(proc);
 }
 
 static bool _social_roster_replay(const process_t *proc, int n)
@@ -5497,6 +6314,15 @@ static int _social_register(process_t *proc, const char *proc_name)
                              (handler_ptr_t)handle_business_post);
     process_register_handler(proc, ID_APP_PUBLISH_BUSINESS_POST,
                              (handler_ptr_t)handle_app_publish_business_post);
+    process_register_handler(proc, ID_COMMUNITY_POLICY,
+                             (handler_ptr_t)handle_community_policy);
+    process_register_handler(proc, ID_POST_LABEL, (handler_ptr_t)handle_post_label);
+    process_register_handler(proc, ID_APP_FOLLOW_COMMUNITY,
+                             (handler_ptr_t)handle_app_follow_community);
+    process_register_handler(proc, ID_APP_UNFOLLOW_COMMUNITY,
+                             (handler_ptr_t)handle_app_unfollow_community);
+    process_register_handler(proc, ID_APP_PUBLISH_POST_LABEL,
+                             (handler_ptr_t)handle_app_publish_post_label);
     process_register_handler(proc, ID_POST_DIGEST,   (handler_ptr_t)handle_post_digest);
     process_register_handler(proc, ID_POST_WANT,     (handler_ptr_t)handle_post_want);
     process_register_handler(proc, ID_POST_BACKFILL, (handler_ptr_t)handle_post_backfill);

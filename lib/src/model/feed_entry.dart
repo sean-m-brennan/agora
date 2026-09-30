@@ -19,6 +19,7 @@
 // "who matters to me × how current this is" in both cases.
 
 import 'business_post.dart';
+import 'community_policy.dart';
 import 'post.dart';
 
 /// One item in the merged feed.
@@ -42,10 +43,17 @@ sealed class FeedEntry {
 }
 
 /// A person's post, weighted by tie strength.
+///
+/// [verdict] is the policy of the community the post was made in, applied by
+/// this reader (Phase 4), or null when there is none to apply: the post names
+/// no community, or one this reader does not follow or has switched off. A
+/// hidden post never becomes an entry, so a non-null verdict here is `show` or
+/// `warn`.
 final class PersonEntry extends FeedEntry {
-  const PersonEntry(this.post, {required super.score});
+  const PersonEntry(this.post, {required super.score, this.verdict});
 
   final Post post;
+  final PolicyVerdict? verdict;
 
   @override
   String get id => post.postId;
@@ -118,20 +126,31 @@ List<FeedEntry> rankFeed({
   required String Function(String polity) nameOfBusiness,
   required double Function(double ts) recency,
   bool Function(List<int> authorUuid)? isHiddenAuthor,
+  PolicyVerdict? Function(Post post)? verdictOf,
 }) {
-  final entries = <FeedEntry>[
-    for (final p in posts)
-      if (p.outgoing || isHiddenAuthor == null || !isHiddenAuthor(p.authorUuid))
-        PersonEntry(p,
-            score: (p.outgoing ? 1.0 : strengthOfAuthor(p.authorUuid)) *
-                recency(p.ts)),
+  final entries = <FeedEntry>[];
+  for (final p in posts) {
+    if (!p.outgoing && isHiddenAuthor != null && isHiddenAuthor(p.authorUuid)) {
+      continue;
+    }
+    // A community's policy (Phase 4): hidden posts stay in the store, so
+    // switching the policy off restores them at once. Your own posts are never
+    // moderated here.
+    final v = p.outgoing || verdictOf == null ? null : verdictOf(p);
+    if (v?.action == PolicyAction.hide) continue;
+    entries.add(PersonEntry(p,
+        score: (p.outgoing ? 1.0 : strengthOfAuthor(p.authorUuid)) *
+            recency(p.ts),
+        verdict: v));
+  }
+  entries.addAll([
     for (final b in businessPosts)
       BusinessEntry(b,
           score: (b.outgoing ? 1.0 : standingOfBusiness(b.polity)) *
               recency(b.ts),
           displayName: nameOfBusiness(b.polity),
           verifiedAgainstCharter: true),
-  ];
+  ]);
   entries.sort((a, b) {
     final byScore = b.score.compareTo(a.score);
     if (byScore != 0) return byScore;

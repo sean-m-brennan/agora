@@ -74,6 +74,7 @@ extern const char *at_runner_corpus_json_root(void);
 #include "social/post.h"            /* at_post_* for the peer_post builder */
 #include "social/business_ad.h"   /* at_business_ad_* for the peer_business_ad builder */
 #include "social/business_post.h" /* at_business_post_* for the peer_business_post builder */
+#include "social/community.h"     /* at_policy_ad_* / at_post_label_* (Phase 4) */
 #include "social/cosign.h"        /* AT_COSIGN_* bounds for the cosign_*_last checks */
 #include "social/id_social.h"
 #include "social/social_msg_types.h"
@@ -542,6 +543,43 @@ static bool _sf_verb(const char *function)
             || strcmp(function, "peer_post_backfill") == 0);
 }
 
+/* Read a post scope from a scenario object: `community` and `labels`, or, for
+ * the SIGNED scope, `signed_community` / `signed_labels` when present (a relay
+ * that edits the scope is a scope the author did not sign). Labels are copied
+ * as given, unvalidated, so a malformed scope can be put on the wire. */
+static void _scope_from(json_t *obj, const char *ckey, const char *lkey,
+                        at_post_scope_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    const char *c = json_string_value(json_object_get(obj, ckey));
+    if (c != NULL)
+        snprintf(out->community, sizeof(out->community), "%s", c);
+    json_t *arr = json_object_get(obj, lkey);
+    size_t i;
+    json_t *v;
+    if (json_is_array(arr))
+        json_array_foreach(arr, i, v) {
+            if (out->n_labels >= AT_POST_LABELS_MAX || !json_is_string(v))
+                break;
+            snprintf(out->labels[out->n_labels++], AT_POST_LABEL_MAX + 1, "%s",
+                     json_string_value(v));
+        }
+}
+
+static void _signed_scope(json_t *obj, at_post_scope_t *out)
+{
+    bool over = json_object_get(obj, "signed_community") != NULL
+                || json_object_get(obj, "signed_labels") != NULL;
+    if (over)
+        _scope_from(obj, "signed_community", "signed_labels", out);
+    else
+        _scope_from(obj, "community", "labels", out);
+}
+
+static int _label_spec_id(sce_run_ctx_t *ctx, ic_impl_t *sender_impl, json_t *spec,
+                          char id_out[AT_COMMUNITY_ID_HEX_LEN + 1]);
+static json_t *_label_env(sce_run_ctx_t *ctx, ic_impl_t *sender_impl, json_t *spec);
+
 /* The participant a post spec names as its `author`, else the step's sender. */
 static ic_impl_t *_sf_author(sce_run_ctx_t *ctx, ic_impl_t *sender_impl,
                              json_t *spec)
@@ -579,9 +617,28 @@ static int _sf_spec_id(sce_run_ctx_t *ctx, ic_impl_t *sender_impl, json_t *spec,
 
 /* {"feed":[spec...], "biz":[spec...]} -> {"feed":[id...], "biz":[id...]}. */
 static json_t *_sf_ids_body(sce_run_ctx_t *ctx, ic_impl_t *sender_impl,
-                            json_t *payload)
+                            json_t *payload, bool digest)
 {
     json_t *out = json_object();
+    /* Labels (Phase 4): a digest offers {id, community}, a want asks by id. */
+    json_t *lspecs = json_object_get(payload, "label");
+    if (out != NULL && json_is_array(lspecs)) {
+        json_t *arr = json_array();
+        size_t li;
+        json_t *lspec;
+        json_array_foreach(lspecs, li, lspec) {
+            char id[AT_COMMUNITY_ID_HEX_LEN + 1];
+            if (!json_is_object(lspec) || _label_spec_id(ctx, sender_impl, lspec, id) != 0)
+                continue;
+            const char *did = json_string_value(json_object_get(lspec, "community"));
+            if (digest)
+                json_array_append_new(arr, json_pack("{s:s, s:s}", "id", id,
+                                                     "community", did ? did : ""));
+            else
+                json_array_append_new(arr, json_string(id));
+        }
+        json_object_set_new(out, "label", arr);
+    }
     for (int k = 0; out != NULL && k < 2; k++) {
         const char *key = k == 0 ? "feed" : "biz";
         json_t *arr = json_array();
@@ -644,6 +701,61 @@ static json_t *_sf_post_env(sce_run_ctx_t *ctx, ic_impl_t *sender_impl,
                            body ? body : "", sig, hops);
 }
 
+/* One moderator label's envelope (Phase 4): {author?, community, post_id, seq,
+ * ts, bundle, hops, sig?, author_pk?}, signed by its `author` (default: the
+ * sender) exactly as identity_publish_post_label would. */
+static json_t *_label_env(sce_run_ctx_t *ctx, ic_impl_t *sender_impl, json_t *spec)
+{
+    ic_impl_t *a = _sf_author(ctx, sender_impl, spec);
+    if (a == NULL || a->full == NULL)
+        return NULL;
+    const char *did = json_string_value(json_object_get(spec, "community"));
+    const char *pid = json_string_value(json_object_get(spec, "post_id"));
+    const char *bundle = json_string_value(json_object_get(spec, "bundle"));
+    json_t *jseq = json_object_get(spec, "seq");
+    int64_t seq = json_is_integer(jseq) ? (int64_t)json_integer_value(jseq) : 1;
+    json_t *jts = json_object_get(spec, "ts");
+    double ts = json_is_number(jts) ? json_number_value(jts) : 0.0;
+    json_t *jhops = json_object_get(spec, "hops");
+    int hops = json_is_integer(jhops) ? (int)json_integer_value(jhops) : 0;
+    char pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+    const char *pk_over = json_string_value(json_object_get(spec, "author_pk"));
+    if (pk_over != NULL)
+        snprintf(pk_hex, sizeof(pk_hex), "%s", pk_over);
+    else
+        sodium_bin2hex(pk_hex, sizeof(pk_hex), a->full->signature.public,
+                       crypto_sign_PUBLICKEYBYTES);
+    char sig[AT_COMMUNITY_SIG_HEX_LEN + 1] = {0};
+    const char *sig_over = json_string_value(json_object_get(spec, "sig"));
+    if (sig_over != NULL)
+        snprintf(sig, sizeof(sig), "%s", sig_over);
+    else
+        at_post_label_sign(a->full->signature.private, a->full->uuid,
+                           did ? did : "", pid ? pid : "", seq, ts,
+                           bundle ? bundle : "", sig);
+    return at_post_label_to_json(a->full->uuid, pk_hex, did ? did : "",
+                                 pid ? pid : "", seq, ts, bundle ? bundle : "",
+                                 sig, hops);
+}
+
+/* A label spec's content id, as the runtime computes it. */
+static int _label_spec_id(sce_run_ctx_t *ctx, ic_impl_t *sender_impl, json_t *spec,
+                          char id_out[AT_COMMUNITY_ID_HEX_LEN + 1])
+{
+    ic_impl_t *a = _sf_author(ctx, sender_impl, spec);
+    if (a == NULL || a->full == NULL)
+        return -1;
+    json_t *jseq = json_object_get(spec, "seq");
+    json_t *jts = json_object_get(spec, "ts");
+    const char *did = json_string_value(json_object_get(spec, "community"));
+    const char *pid = json_string_value(json_object_get(spec, "post_id"));
+    const char *bundle = json_string_value(json_object_get(spec, "bundle"));
+    return at_post_label_id(a->full->uuid, did ? did : "", pid ? pid : "",
+                            json_is_integer(jseq) ? (int64_t)json_integer_value(jseq) : 1,
+                            json_is_number(jts) ? json_number_value(jts) : 0.0,
+                            bundle ? bundle : "", id_out);
+}
+
 static int _social_inbound(sce_run_ctx_t *ctx, sce_participant_t *sender,
                            ic_impl_t *sender_impl, const char *from_id,
                            const char *to_id, const char *function,
@@ -654,7 +766,10 @@ static int _social_inbound(sce_run_ctx_t *ctx, sce_participant_t *sender,
      * own the same way). */
     if ((strcmp(function, "trigger_block") == 0
          || strcmp(function, "trigger_unblock") == 0
-         || strcmp(function, "trigger_report") == 0)
+         || strcmp(function, "trigger_report") == 0
+         || strcmp(function, "trigger_follow_community") == 0
+         || strcmp(function, "trigger_unfollow_community") == 0
+         || strcmp(function, "trigger_publish_post_label") == 0)
         && json_is_object(payload)) {
         json_t *body = json_deep_copy(payload);
         if (body != NULL) {
@@ -784,7 +899,8 @@ static int _social_inbound(sce_run_ctx_t *ctx, sce_participant_t *sender,
      * Python builders. */
     if ((strcmp(function, "peer_post_digest") == 0
          || strcmp(function, "peer_post_want") == 0) && json_is_object(payload)) {
-        json_t *body = _sf_ids_body(ctx, sender_impl, payload);
+        json_t *body = _sf_ids_body(ctx, sender_impl, payload,
+                                    strcmp(function, "peer_post_digest") == 0);
         if (body == NULL)
             return -1;
         net_msg_pack_json(&out->info.net_msg, body);
@@ -794,10 +910,11 @@ static int _social_inbound(sce_run_ctx_t *ctx, sce_participant_t *sender,
     if (strcmp(function, "peer_post_backfill") == 0 && json_is_object(payload)) {
         const char *kind = json_string_value(json_object_get(payload, "kind"));
         json_t *spec = json_object_get(payload, "post");
-        json_t *env = json_is_object(spec)
-            ? _sf_post_env(ctx, sender_impl, spec,
-                           kind != NULL && strcmp(kind, "biz") == 0)
-            : NULL;
+        json_t *env = !json_is_object(spec) ? NULL
+            : (kind != NULL && strcmp(kind, "label") == 0)
+                ? _label_env(ctx, sender_impl, spec)
+                : _sf_post_env(ctx, sender_impl, spec,
+                               kind != NULL && strcmp(kind, "biz") == 0);
         if (env == NULL) {
             snprintf(ctx->err, sizeof(ctx->err),
                      "peer_post_backfill: could not build the post envelope");
@@ -845,10 +962,15 @@ static int _social_inbound(sce_run_ctx_t *ctx, sce_participant_t *sender,
         json_t *jsig = json_object_get(payload, "sig");
         if (json_is_string(jsig))
             snprintf(sig, sizeof(sig), "%s", json_string_value(jsig));
-        else if (sender_impl != NULL && sender_impl->full != NULL)
-            at_post_sign(sender_impl->full->signature.private,
-                         sender_impl->full->uuid, seq, ts, (uint8_t)tier,
-                         body_str, sig);
+        else if (sender_impl != NULL && sender_impl->full != NULL) {
+            /* The scope the AUTHOR signed (Phase 4), which a scenario may make
+             * differ from the one on the envelope. */
+            at_post_scope_t signed_scope;
+            _signed_scope(payload, &signed_scope);
+            at_post_sign_scoped(sender_impl->full->signature.private,
+                                sender_impl->full->uuid, seq, ts, (uint8_t)tier,
+                                body_str, &signed_scope, sig);
+        }
 
         json_t *env = json_object();
         if (sender_impl != NULL && sender_impl->full != NULL) {
@@ -865,6 +987,63 @@ static int _social_inbound(sce_run_ctx_t *ctx, sce_participant_t *sender,
         json_object_set_new(env, "body", json_string(body_str));
         json_object_set_new(env, "sig", json_string(sig));
         json_object_set_new(env, "hops", json_integer(hops));
+        /* The scope keys, only when the scenario names them. */
+        json_t *jcomm = json_object_get(payload, "community");
+        json_t *jlabels = json_object_get(payload, "labels");
+        if (jcomm != NULL)
+            json_object_set(env, "community", jcomm);
+        if (jlabels != NULL)
+            json_object_set(env, "labels", jlabels);
+        net_msg_pack_json(&out->info.net_msg, env);
+        json_decref(env);
+        return 0;
+    }
+
+    /* peer_community_policy (Phase 4) — {carrier, carrier_pk, community, seq,
+     * ts, bundle, sig}, signed by the SENDER in the first person, as
+     * _policy_advertise would. `sig` / `carrier_pk` override. */
+    if (strcmp(function, "peer_community_policy") == 0 && json_is_object(payload)) {
+        if (sender_impl == NULL || sender_impl->full == NULL)
+            return -1;
+        const char *did = json_string_value(json_object_get(payload, "community"));
+        const char *bundle = json_string_value(json_object_get(payload, "bundle"));
+        json_t *jseq = json_object_get(payload, "seq");
+        int64_t seq = json_is_integer(jseq) ? (int64_t)json_integer_value(jseq) : 0;
+        json_t *jts = json_object_get(payload, "ts");
+        double ts = json_is_number(jts) ? json_number_value(jts) : 0.0;
+        char pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+        const char *pk_over = json_string_value(json_object_get(payload, "carrier_pk"));
+        if (pk_over != NULL)
+            snprintf(pk_hex, sizeof(pk_hex), "%s", pk_over);
+        else
+            sodium_bin2hex(pk_hex, sizeof(pk_hex), sender_impl->full->signature.public,
+                           crypto_sign_PUBLICKEYBYTES);
+        char sig[AT_COMMUNITY_SIG_HEX_LEN + 1] = {0};
+        const char *sig_over = json_string_value(json_object_get(payload, "sig"));
+        if (sig_over != NULL)
+            snprintf(sig, sizeof(sig), "%s", sig_over);
+        else
+            at_policy_ad_sign(sender_impl->full->signature.private,
+                              sender_impl->full->uuid, did ? did : "", seq, ts,
+                              bundle ? bundle : "", sig);
+        json_t *env = at_policy_ad_to_json(sender_impl->full->uuid, pk_hex,
+                                           did ? did : "", seq, ts,
+                                           bundle ? bundle : "", sig);
+        if (env == NULL)
+            return -1;
+        net_msg_pack_json(&out->info.net_msg, env);
+        json_decref(env);
+        return 0;
+    }
+
+    /* peer_post_label (Phase 4) — see _label_env. */
+    if (strcmp(function, "peer_post_label") == 0 && json_is_object(payload)) {
+        json_t *env = _label_env(ctx, sender_impl, payload);
+        if (env == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "peer_post_label: could not build the label envelope");
+            return -1;
+        }
         net_msg_pack_json(&out->info.net_msg, env);
         json_decref(env);
         return 0;
@@ -1104,6 +1283,40 @@ static int _social_dispatch(sce_run_ctx_t *ctx, sce_participant_t *target,
             && !(sp != NULL && strcmp(sp->role, "new_node") == 0))
             _sf_admit(impl->proc, snd->pub);
         return 1;
+    }
+    /* Communities (Phase 4). Following and labelling are app verbs, so each
+     * trigger drives the real AT_APP_* handler with the step's payload; the
+     * emitted policy ad or label is attributed to this participant. Mirrors
+     * the Python adapter's _TRIGGER_FOLLOW_COMMUNITY & co. */
+    if (inbound->type == NET_MESSAGE && inbound->info.net_msg.function != NULL) {
+        const char *fn = inbound->info.net_msg.function;
+        const char *verb = strcmp(fn, "trigger_follow_community") == 0
+                               ? AT_APP_FOLLOW_COMMUNITY
+                         : strcmp(fn, "trigger_unfollow_community") == 0
+                               ? AT_APP_UNFOLLOW_COMMUNITY
+                         : strcmp(fn, "trigger_publish_post_label") == 0
+                               ? AT_APP_PUBLISH_POST_LABEL
+                               : NULL;
+        if (verb != NULL) {
+            json_t *jp = NULL;
+            if (net_msg_unpack_json(&inbound->info.net_msg, &jp) != 0 || jp == NULL) {
+                snprintf(ctx->err, sizeof(ctx->err), "%s: no payload", fn);
+                return -1;
+            }
+            generic_msg_t m = {0};
+            m.type = NET_MESSAGE;
+            strncpy(m.info.net_msg.process, "identity", PROC_NAME_LEN);
+            m.info.net_msg.function = (char *)verb;
+            net_msg_pack_json(&m.info.net_msg, jp);
+            json_decref(jp);
+            run_message_handlers(impl->proc, NULL, NET_MESSAGE, &m);
+            if (m.info.net_msg.obj != NULL) smrt_deref(m.info.net_msg.obj);
+            return 0;
+        }
+        if (strcmp(fn, "trigger_advertise_communities") == 0) {
+            (void)identity_advertise_communities(impl->proc);
+            return 0;
+        }
     }
     if (inbound->type == NET_MESSAGE
         && inbound->info.net_msg.function != NULL
@@ -1627,6 +1840,101 @@ static int _social_check_key(sce_run_ctx_t *ctx, const char *pid,
                              pid, key, got, want);
                     return -1;
                 }
+            } else if (strcmp(key, "communities_followed") == 0
+                       || strcmp(key, "community_policy_last") == 0) {
+                /* {did: {seq?} | {}} (Phase 4): what this node FOLLOWS, or
+                 * what it last HEARD of a community's policy. {} asserts none. */
+                bool followed = strcmp(key, "communities_followed") == 0;
+                const char *did;
+                json_t *want;
+                json_object_foreach(val, did, want) {
+                    int64_t got_seq = 0;
+                    static char got_bundle[AT_COMMUNITY_POLICY_BUNDLE_MAX + 1];
+                    bool have = followed
+                        ? identity_get_followed_community(did, &got_seq, got_bundle,
+                                                          sizeof(got_bundle))
+                        : identity_get_last_community_policy(did, &got_seq, got_bundle,
+                                                             sizeof(got_bundle));
+                    if (json_object_size(want) == 0) {
+                        if (have) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: %s[%s] present, expected none", pid, key, did);
+                            return -1;
+                        }
+                        continue;
+                    }
+                    if (!have) {
+                        snprintf(ctx->err, sizeof(ctx->err), "%s: %s[%s] missing",
+                                 pid, key, did);
+                        return -1;
+                    }
+                    json_t *js = json_object_get(want, "seq");
+                    if (json_is_integer(js) && got_seq != (int64_t)json_integer_value(js)) {
+                        snprintf(ctx->err, sizeof(ctx->err), "%s: %s[%s].seq=%lld, "
+                                 "expected %lld", pid, key, did, (long long)got_seq,
+                                 (long long)json_integer_value(js));
+                        return -1;
+                    }
+                    json_t *jb = json_object_get(want, "bundle");
+                    if (json_is_string(jb) && strcmp(got_bundle, json_string_value(jb)) != 0) {
+                        snprintf(ctx->err, sizeof(ctx->err), "%s: %s[%s].bundle differs",
+                                 pid, key, did);
+                        return -1;
+                    }
+                }
+            } else if (strcmp(key, "post_label_last") == 0) {
+                /* {post_id: {community?, seq?, hops?} | {}} (Phase 4). */
+                const char *post_id;
+                json_t *want;
+                json_object_foreach(val, post_id, want) {
+                    char got_comm[AT_COMMUNITY_DID_MAX + 1];
+                    int64_t got_seq = 0;
+                    int got_hops = 0;
+                    bool have = identity_get_last_post_label(post_id, got_comm,
+                                                             sizeof(got_comm), &got_seq,
+                                                             &got_hops);
+                    if (json_object_size(want) == 0) {
+                        if (have) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: post_label_last[%.16s] present, expected none",
+                                     pid, post_id);
+                            return -1;
+                        }
+                        continue;
+                    }
+                    if (!have) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: post_label_last[%.16s] missing", pid, post_id);
+                        return -1;
+                    }
+                    json_t *jc = json_object_get(want, "community");
+                    json_t *js = json_object_get(want, "seq");
+                    json_t *jh = json_object_get(want, "hops");
+                    if ((json_is_string(jc) && strcmp(got_comm, json_string_value(jc)) != 0)
+                        || (json_is_integer(js) && got_seq != (int64_t)json_integer_value(js))
+                        || (json_is_integer(jh) && got_hops != (int)json_integer_value(jh))) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: post_label_last[%.16s] = {%s, seq %lld, hops %d} "
+                                 "differs from expected", pid, post_id, got_comm,
+                                 (long long)got_seq, got_hops);
+                        return -1;
+                    }
+                }
+            } else if (strcmp(key, "community_policies_emitted") == 0
+                       || strcmp(key, "post_labels_emitted") == 0) {
+                const char *fn = strcmp(key, "community_policies_emitted") == 0
+                                     ? "peer_community_policy" : "peer_post_label";
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->captured_count; i++)
+                    if (strcmp(ctx->captured[i].from, pid) == 0
+                        && strcmp(ctx->captured[i].function, fn) == 0)
+                        got++;
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err), "%s: %s=%d, expected %d",
+                             pid, key, got, want);
+                    return -1;
+                }
             } else if (strcmp(key, "dm_last") == 0) {
                 /* {peer_id: {seq, text} | {absent: true}} (Increment 6) — the
                  * most-recent DM this participant received from another, via
@@ -1757,6 +2065,38 @@ static int _social_check_key(sce_run_ctx_t *ctx, const char *pid,
                                  post_pid, got_tier,
                                  (long long)json_integer_value(jtr));
                         return -1;
+                    }
+                    /* The scope (Phase 4): `community` a string, `labels` a
+                     * list, compared joined. */
+                    char got_comm[AT_POST_COMMUNITY_MAX + 1];
+                    char got_labels[AT_POST_LABELS_LEN + 1];
+                    identity_get_last_post_scope(want_uuid, got_comm, sizeof(got_comm),
+                                                 got_labels, sizeof(got_labels));
+                    json_t *jc = json_object_get(post_want, "community");
+                    if (json_is_string(jc) && strcmp(got_comm, json_string_value(jc)) != 0) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: post_last[%s].community=%s, expected %s", pid,
+                                 post_pid, got_comm, json_string_value(jc));
+                        return -1;
+                    }
+                    json_t *jl = json_object_get(post_want, "labels");
+                    if (json_is_array(jl)) {
+                        char want_labels[AT_POST_LABELS_LEN + 1] = {0};
+                        size_t off = 0, li;
+                        json_t *lv;
+                        json_array_foreach(jl, li, lv) {
+                            int n = snprintf(want_labels + off, sizeof(want_labels) - off,
+                                             "%s%s", li ? "," : "",
+                                             json_string_value(lv) ? json_string_value(lv) : "");
+                            if (n < 0 || (size_t)n >= sizeof(want_labels) - off) break;
+                            off += (size_t)n;
+                        }
+                        if (strcmp(got_labels, want_labels) != 0) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: post_last[%s].labels=%s, expected %s", pid,
+                                     post_pid, got_labels, want_labels);
+                            return -1;
+                        }
                     }
                 }
             } else if (strcmp(key, "cosign_request_last") == 0) {

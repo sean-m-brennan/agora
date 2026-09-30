@@ -408,11 +408,29 @@ class Ev(ctypes.Structure):
         ("blocked", ctypes.c_uint8),
         ("rep_tier", ctypes.c_int32),
         ("rep_ceiling", ctypes.c_double),
+        # Communities (Phase 4), appended LAST so every prior offset is
+        # unchanged. post_community/post_labels ride the POST event;
+        # policy_* the COMMUNITY_POLICY event (16); label_* the POST_LABEL
+        # event (17). Both bundles are OPAQUE: only the app verifies them.
+        ("post_community", ctypes.c_char * (BDID + 1)),
+        ("post_labels", ctypes.c_char * (263 + 1)),
+        ("policy_community", ctypes.c_char * (BDID + 1)),
+        ("policy_id", ctypes.c_char * (64 + 1)),
+        ("policy_seq", ctypes.c_int64),
+        ("policy_ts", ctypes.c_double),
+        ("policy_bundle", ctypes.c_char * (4096 + 1)),
+        ("label_community", ctypes.c_char * (BDID + 1)),
+        ("label_post_id", ctypes.c_char * (64 + 1)),
+        ("label_id", ctypes.c_char * (64 + 1)),
+        ("label_seq", ctypes.c_int64),
+        ("label_ts", ctypes.c_double),
+        ("label_hops", ctypes.c_int32),
+        ("label_bundle", ctypes.c_char * (1536 + 1)),
     ]
 
 # ABI guard: MUST equal sizeof(agora_event_t) in at_agora_shim.h. A silent drift
 # here would decode every field past the drift point as garbage.
-assert ctypes.sizeof(Ev) == 22168, f"Ev size {ctypes.sizeof(Ev)} != 22168 (ABI drift)"
+assert ctypes.sizeof(Ev) == 28600, f"Ev size {ctypes.sizeof(Ev)} != 28600 (ABI drift)"
 
 EV_BUSINESS_AD = 12
 SAT_SELF = 0xFF

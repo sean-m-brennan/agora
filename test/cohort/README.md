@@ -43,7 +43,8 @@ Exit status is 0 on PASS and non-zero on the first failed phase, except for
 | `staff_cohort.sh` | 3 (5 members) | dart, Ethne | P3.3: a staff polity co-signs over the wire and no private key moves |
 | `reputation_cohort.sh` | 3 | a C compiler | Paxos commits, app-driven transactions commit, checkpoints reach quorum, injected slash/resolve gates open |
 | `moderation_cohort.sh` | 3 | — | P4.1: block, report and the expulsion ceiling between real nodes |
-| `partition_cohort.sh` | 5 | — | Phase 4 DDIL: a 2+2 split keeps both islands working, and the heal loses no post (store-and-forward) and no transaction (re-proposal) |
+| `partition_cohort.sh` | 7 | — | Phase 4 DDIL: a 3+2 split keeps both islands working, only the majority admits or finalizes, and the heal loses no post (store-and-forward) and no transaction (re-proposal) |
+| `community_policy_cohort.sh` | 4 | Ethne | Phase 4 communities: a policy the roll set is carried by members, verified on arrival, and applied only by a follower; a moderator's label reaches followers only; loosening needs more than a majority; an unseated moderator stops counting |
 
 ### `two_node_cohort.sh`
 
@@ -179,28 +180,75 @@ by `staff_cohort.sh` and `ethne_polity_roundtrip_test.dart`, not here.
 
 ### `partition_cohort.sh`
 
-Five nodes. Island A is `ada`, `amy`, and `cal`, who first starts while the
-network is split. Island B is `bob` and `ben`. The split moves island B's
-host-side veths to a second bridge, so no socket inside a namespace notices;
-AT has no liveness, and each island keeps its full roster and key. The phases:
+Seven nodes. Five founders form the group; then the split makes island A
+`ada`, `amy` and `dee`, and island B `bob` and `ben`. Two more start while the
+network is split: `cal` in A and `eve` in B. The split is 3+2 on purpose.
+Admission and checkpoint finality both need a majority of the whole group, so
+three of five can admit and finalize and two of five can do neither. The split
+moves island B's host-side veths to a second bridge, so no socket inside a
+namespace notices. AT has no liveness, so each island keeps its full roster and
+key. The phases:
 
 1. discovery, and the group channel is live;
 2. a baseline post reaches everyone;
 3. a post made in each island reaches its own side and not the other;
-4. both islands keep working. cal joins A (a key rotation, and islands of 3
-   against 2); a reaction commits bilaterally in each island; and island B must
-   not finalize a checkpoint, since 2 of 5 is no majority;
-5. after the heal, fresh posts cross and cal discovers bob and ben;
+4. both islands keep working, and only the majority grows. A admits cal (a key
+   rotation). B proposes eve and must refuse, because two of five is no
+   majority. Nothing crosses the split to or from either joiner: cal learns bob
+   and ben as members from A's histories and sends to them, and every such
+   frame must die at the split. A reaction commits bilaterally in each island.
+   A (four of six) must finalize a checkpoint and B must not;
+5. after the heal, fresh posts cross, bob and ben add cal, and every node adds
+   eve, which can then read the group;
 6. store-and-forward: the two split posts reach the other island, exactly once
-   each with the original content id, through each node's periodic digest;
-7. the island whose chain lost adopts the other's and re-proposes its own
-   halves, and its split-time task commits where the other island sees it.
+   each with the original content id, through each node's periodic digest.
+   This is checked in the daemons' logs ("accepted (…, backfilled)" by content
+   id), because a backfill can land before any app observer is attached;
+7. both islands' split-time tasks are two-sided (both halves) in every
+   through-split member's persisted chain (`etc/at/reputation-history.cfg.json`).
+   The chain is the evidence because a node that receives a finished entry by
+   chain adoption logs nothing about it. Re-proposals after the heal are
+   printed for information.
 
 netns only: a docker disconnect removes the interface the discovery socket is
 bound to, which is a different fault from a partition.
 
 ```
 sudo -E env "PATH=$PATH" ./test/cohort/partition_cohort.sh
+```
+
+### `community_policy_cohort.sh`
+
+Four nodes on one segment. `keeper` and `mod` are members of a three-member
+community polity (the third founder is a key no node holds); `keeper` holds the
+root key and authors the posts, and the roll seats `mod` as Moderator. `cal`
+follows the community once it has heard and verified its policy; `dee` hears it
+and does not follow. The driver plays the app: it keeps the charter log, mints
+every artifact through the Ethne cdylib, and computes every verdict with
+`ethne_content_policy_verdict` over the bytes the node received — the same call
+the Flutter app makes. The phases:
+
+1. discovery, one node at a time, and a live group channel;
+2. policy v1 (daily cap 2, "spoiler" warns, "nsfw" hides) is carried by
+   `keeper`, reaches `cal` and `dee`, and verifies out of the received bytes;
+   `cal` follows, `dee` does not;
+3. `keeper` posts three times in the community's name, the first labelled
+   "spoiler": at `cal` the first is behind a warning, the second shows, and the
+   third is over the cap and hidden; `dee` receives all three with their scope
+   intact and applies nothing;
+4. `mod` labels the second post "nsfw": `cal` receives the label and hides the
+   post, naming `mod`; `dee` receives no label at all (the follow gate);
+5. lifting the cap is refused at 2 of 3 deciders and accepted at 3; the newer
+   policy is carried and replaces `cal`'s, and the third post shows;
+6. the roll unseats `mod`; the next policy lists no moderators, and `mod`'s
+   labels reach `cal` and count for nothing.
+
+A label backfilled after a partition, and the reader's own "apply this policy"
+switch, are covered by conformance and by `test/community_policy_test.dart`.
+netns only.
+
+```
+sudo -E env "PATH=$PATH" ./test/cohort/community_policy_cohort.sh
 ```
 
 ## Options
@@ -217,9 +265,9 @@ All options are environment variables.
 | `SUBNET` | per script, below | all but `drive_ethne_half` | First three octets of the /24. Each script has its own subnet and bridge name. |
 | `GEO` | `u4pruy` | 3-node cohorts | The shared coarse geohash bucket the nodes advertise |
 | `AGORA_DIR` | the script's `../..` | all | The agora checkout to test |
-| `AGORA_ETHNE_PATH` | `native/build/libethne_agora.so` | business, business_post, staff, drive_ethne_half | The Ethne cdylib |
+| `AGORA_ETHNE_PATH` | `native/build/libethne_agora.so` | business, business_post, staff, drive_ethne_half, community_policy | The Ethne cdylib |
 | `DOCKER_IMAGE` | `ubuntu:26.04` | 3-node cohorts | Image for the docker backend. The host-built `agorad` is bind-mounted and its non-base libraries are staged beside it, so a stock image works. `Dockerfile.node` builds an alternative with those libraries installed. Either way, the base must match the host's Ubuntu release. |
-| `AGORA_COHORT_RUN` | see below | business_post, reputation, moderation, partition, staff | Run directory. Set a short path (e.g. `/tmp/ag-$$`) when a deep checkout makes the node socket paths exceed 108 bytes; the preflight refuses and says so. netns only: docker can bind-mount only paths it shares with the daemon. |
+| `AGORA_COHORT_RUN` | see below | business_post, reputation, moderation, partition, staff, community_policy | Run directory. Set a short path (e.g. `/tmp/ag-$$`) when a deep checkout makes the node socket paths exceed 108 bytes; the preflight refuses and says so. netns only: docker can bind-mount only paths it shares with the daemon. |
 
 ### Per script
 
@@ -232,6 +280,7 @@ All options are environment variables.
 | `business_post_cohort.sh` | 90 | `10.9.3` | `GATE_WINDOW` (how long bob must stay silent, default 45) |
 | `reputation_cohort.sh` | 90 | `10.9.4` | `CHECKPOINT_SEC` (the nodes' `AT_REP_CHECKPOINT_SEC`, default 20; production is 300) |
 | `partition_cohort.sh` | 120 | `10.9.6` | `GATE_WINDOW` (default 20); `DIGEST_SEC` (the nodes' `AT_SOCIAL_DIGEST_SEC`, default 10; the digest rides identity's ~20 s sweep, so ~20 s is the real floor); `NEUTRAL`, `RESCORE_SEC`, `CHECKPOINT_SEC` (as moderation) |
+| `community_policy_cohort.sh` | 120 | `10.9.7` | `GATE_WINDOW` (how long `dee` must see no label, default 30); `POLICY_SEC` (the nodes' `AT_SOCIAL_POLICY_SEC`, how often a follower re-carries its policy, default 10); `LOG_LEVEL` (default 2) |
 | `moderation_cohort.sh` | 90 | `10.9.5` | `GATE_WINDOW` (how long a negative waits, default 20); `NEUTRAL` (`AT_REP_NEUTRAL`, default 0.70); `RESCORE_SEC` (`AT_REP_RESCORE_SEC`, default 5); `CHECKPOINT_SEC` (default 20) |
 
 ## Where the evidence goes

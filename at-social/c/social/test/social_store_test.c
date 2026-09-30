@@ -221,9 +221,75 @@ DEFINE_TEST(test_an_unblock_is_a_delete_so_the_file_shrinks)
 }
 END_TEST_DEFINITION()
 
+/* Phase 4: the followed communities, beside the blocks. The same document
+ * with one community followed, byte for byte what Python writes for it. */
+#define DID_A "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+static const char GOLDEN_WITH_COMMUNITY[] =
+    "{\n"
+    "  \"blocks\": {\n"
+    "    \"" UUID_A "\": {\n"
+    "      \"at\": 1750000001.5,\n"
+    "      \"reason\": \"\"\n"
+    "    },\n"
+    "    \"" UUID_B "\": {\n"
+    "      \"at\": 1750000000.0,\n"
+    "      \"reason\": \"\"\n"
+    "    }\n"
+    "  },\n"
+    "  \"communities\": {\n"
+    "    \"" DID_A "\": {\n"
+    "      \"bundle\": \"{\\\"p\\\":1}\",\n"
+    "      \"seq\": 7\n"
+    "    }\n"
+    "  },\n"
+    "  \"version\": 1\n"
+    "}";
+
+static void _seed_communities(map_t *communities)
+{
+    ck_assert_ret_ok(map_init(communities));
+    const char *rec = "{\"bundle\":\"{\\\"p\\\":1}\",\"seq\":7}";
+    size_t len = strlen(rec);
+    char *dup = smrt_create(len + 1);
+    memcpy(dup, rec, len + 1);
+    map_set(communities, (map_key_t)DID_A, string_data(dup, len + 1));
+}
+
+DEFINE_TEST(test_followed_communities_are_written_and_read_back)
+{
+    _mkdir_tmp();
+    map_t blocks, communities;
+    _seed(&blocks);
+    _seed_communities(&communities);
+    ck_assert_int_eq(social_store_save_all(&blocks, &communities, g_dir), 0);
+    size_t len = 0;
+    char *got = _slurp(&len);
+    ck_assert_ptr_nonnull(got);
+    ck_assert_str_eq(got, GOLDEN_WITH_COMMUNITY);
+    free(got);
+
+    map_t b2, c2;
+    ck_assert_ret_ok(map_init(&b2));
+    ck_assert_ret_ok(map_init(&c2));
+    ck_assert_int_eq(social_store_load_all(g_dir, &b2, &c2), 0);
+    ck_assert_int_eq((int)map_size(&b2), 2);
+    ck_assert_int_eq((int)map_size(&c2), 1);
+
+    /* Following nothing writes the old document exactly. */
+    map_t none;
+    ck_assert_ret_ok(map_init(&none));
+    ck_assert_int_eq(social_store_save_all(&blocks, &none, g_dir), 0);
+    got = _slurp(&len);
+    ck_assert_str_eq(got, GOLDEN);
+    free(got);
+    _rm_tmp();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(SocialStore,
           test_the_bytes_are_what_python_writes,
           test_a_saved_set_loads_back_unchanged,
           test_no_file_is_an_empty_store_not_an_error,
           test_a_corrupt_file_yields_no_blocks_rather_than_some,
-          test_an_unblock_is_a_delete_so_the_file_shrinks)
+          test_an_unblock_is_a_delete_so_the_file_shrinks,
+          test_followed_communities_are_written_and_read_back)

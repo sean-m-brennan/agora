@@ -28,7 +28,7 @@
  * Registered with the core at load (utilities/msg_registry.h) rather than
  * compiled into `generic_msg_t`'s union, so the core does not change shape
  * with AT_SOCIAL. Payloads ride `generic_msg_t.info.payload`; read and write
- * them with AT_MSG_EXT(msg, T). All twelve are identity → app and app-bound.
+ * them with AT_MSG_EXT(msg, T). All fourteen are identity → app and app-bound.
  *
  * Ids are process-local and the NAMES are what cross IPC; do not rename a
  * type once it has shipped. Append a new id at the next offset.
@@ -63,6 +63,10 @@
 #define PEER_COSIGN_SIG_OBSERVED         ((message_type_t)(AT_MSG_TYPE_SOCIAL_MIN + 10))
 /** Identity → app: a signed business post — one opaque Ethne {post,delegation} bundle the ENVOY signed — received over the group channel (Phase 3 P3.4, @ref peer_business_post_msg_t). Local IPC only. Signature-verified, GATED on this node holding the polity's page, and content-id-deduped before emit; the BUNDLE is verified app-side, never by the core. */
 #define PEER_BUSINESS_POST_OBSERVED      ((message_type_t)(AT_MSG_TYPE_SOCIAL_MIN + 11))
+/** Identity → app: a community's content policy — one opaque, root-signed Ethne policy artifact — carried in the first person by a node that holds it (Phase 4, @ref peer_community_policy_msg_t). Local IPC only. Signature-verified and content-id-deduped before emit; the BUNDLE is verified app-side, never by the core, and the core never follows a policy on its own. */
+#define PEER_COMMUNITY_POLICY_OBSERVED   ((message_type_t)(AT_MSG_TYPE_SOCIAL_MIN + 12))
+/** Identity → app: a moderator's labels on one post — one opaque, member-signed Ethne label — received over the group channel (Phase 4, @ref peer_post_label_msg_t). Local IPC only. Signature-verified, GATED on this node following the community, and content-id-deduped before emit; whether the label COUNTS is the app's call, against the policy it holds. */
+#define PEER_POST_LABEL_OBSERVED         ((message_type_t)(AT_MSG_TYPE_SOCIAL_MIN + 13))
 
 /* Max geohash length carried across the AT->app boundary. The app shares a
  * ~5-char geohash (the ~5km "neighborhood" bucket); the buffer allows finer
@@ -165,6 +169,14 @@ typedef struct {
  * match AT_POST_ID_HEX_LEN in social/post.h, AT_APP_POST_ID_LEN in
  * at_agora.h, and AGORA_POST_ID_MAX in the shim / cohort ctypes. */
 #define AT_POST_ID_LEN 64
+/* The community a post names (Phase 4): a polity DID. MUST match
+ * AT_POST_COMMUNITY_MAX in social/post.h (and so AT_BUSINESS_DID_LEN),
+ * AT_APP_POST_COMMUNITY_LEN in at_agora.h, and the shim / cohort ctypes. */
+#define AT_POST_COMMUNITY_LEN 95
+/* A post's labels joined with ',' across the app boundary: eight of 32 bytes
+ * and seven commas. MUST match AT_APP_POST_LABELS_LEN in at_agora.h and the
+ * shim / cohort ctypes. */
+#define AT_POST_LABELS_LEN 263
 
 /**
  * @brief AT → app: one signed feed post received over the group channel
@@ -189,6 +201,11 @@ typedef struct {
     int32_t required_tier; /**< Audience floor 0..4. */
     /** NUL-terminated post body, bound-truncated to AT_POST_BODY_LEN bytes. */
     char    body[AT_POST_BODY_LEN + 1];
+    /** NUL-terminated polity DID the post is made in (Phase 4); "" = none.
+     *  APPENDED, so every earlier field keeps its offset. */
+    char    community[AT_POST_COMMUNITY_LEN + 1];
+    /** The author's own labels, joined with ','; "" = none. Signed with the post. */
+    char    labels[AT_POST_LABELS_LEN + 1];
 } peer_post_msg_t;
 
 /**
@@ -307,6 +324,71 @@ typedef struct {
     /** NUL-terminated opaque Ethne bundle, bound-truncated to AT_BUSINESS_POST_BUNDLE_LEN. */
     char    bundle[AT_BUSINESS_POST_BUNDLE_LEN + 1];
 } peer_business_post_msg_t;
+
+/* Max bytes of a community's opaque, root-signed policy artifact (Phase 4).
+ * MEASURED at every bound's maximum: 2980 bytes (ethne_ffi
+ * `the_worst_case_policy_fits_the_wire_bound`). MUST match
+ * AT_COMMUNITY_POLICY_BUNDLE_MAX in social/community.h,
+ * AT_APP_COMMUNITY_POLICY_BUNDLE_LEN in at_agora.h, COMMUNITY_POLICY_BUNDLE_MAX in
+ * the agora ethne_ffi crate, and the shim / cohort ctypes. */
+#define AT_COMMUNITY_POLICY_BUNDLE_LEN 4096
+/* Policy-ad content id: blake2b-256 lowercase hex. */
+#define AT_COMMUNITY_POLICY_ID_LEN 64
+
+/**
+ * @brief AT → app: one community's content policy, carried by a node that holds
+ * it (Phase 4). @c peer_uuid is the CARRIER — signature-bound, and only ever
+ * speaking for itself, since a policy ad is never relayed. It is not the
+ * authority: the policy's authority is the community's ROOT signature inside
+ * @c bundle, which only the app can check, and a reader keeps the highest seq
+ * that verifies. @c seq is the carrier's claim of which version it holds, never
+ * trusted over the bundle. The core never follows a policy on its own. Local IPC
+ * only; the on-wire form is the group-encrypted peer_community_policy verb.
+ */
+typedef struct {
+    uuid_t  peer_uuid;   /**< The CARRIER (signature-bound). */
+    /** NUL-terminated community DID the policy is for. */
+    char    community[AT_BUSINESS_DID_LEN + 1];
+    /** NUL-terminated blake2b content id of the ad (lowercase hex). */
+    char    policy_id[AT_COMMUNITY_POLICY_ID_LEN + 1];
+    int64_t seq;         /**< The version the carrier says it holds. */
+    double  ts;          /**< The carrier's send time (epoch seconds). */
+    /** NUL-terminated opaque Ethne policy artifact. */
+    char    bundle[AT_COMMUNITY_POLICY_BUNDLE_LEN + 1];
+} peer_community_policy_msg_t;
+
+/* Max bytes of a moderator's opaque, member-signed label (Phase 4). MEASURED
+ * worst case 969 bytes (ethne_ffi `the_worst_case_label_fits_the_wire_bound`).
+ * MUST match AT_POST_LABEL_BUNDLE_MAX in social/community.h,
+ * AT_APP_POST_LABEL_BUNDLE_LEN in at_agora.h, POST_LABEL_BUNDLE_MAX in the agora
+ * ethne_ffi crate, and the shim / cohort ctypes. */
+#define AT_POST_LABEL_BUNDLE_LEN 1536
+/* Label content id: blake2b-256 lowercase hex. */
+#define AT_POST_LABEL_ID_LEN 64
+
+/**
+ * @brief AT → app: one moderator's labels on one post, received over the group
+ * channel (Phase 4). @c peer_uuid is the node that PUBLISHED these bytes (a
+ * relay forwards them untouched), never the authority: that is the moderator's
+ * member signature inside @c bundle, which counts only while the policy the app
+ * holds lists that moderator. @c community and @c post_id say what the label is
+ * about; @c label_id is the dedup key. Reaches the app only because this node
+ * follows @c community. Local IPC only; the on-wire form is the group-encrypted
+ * peer_post_label verb.
+ */
+typedef struct {
+    uuid_t  peer_uuid;   /**< The PUBLISHER (signature-bound). */
+    char    community[AT_BUSINESS_DID_LEN + 1];
+    /** NUL-terminated content id of the post labelled. */
+    char    post_id[AT_POST_ID_LEN + 1];
+    /** NUL-terminated content id of this label (the dedup key). */
+    char    label_id[AT_POST_LABEL_ID_LEN + 1];
+    int64_t seq;         /**< The moderator's label sequence, as carried. */
+    double  ts;          /**< The publisher's send time. */
+    int32_t hops;        /**< How far this copy has travelled. */
+    /** NUL-terminated opaque Ethne label. */
+    char    bundle[AT_POST_LABEL_BUNDLE_LEN + 1];
+} peer_post_label_msg_t;
 
 /* Max hex characters of a detached exchange's exported canonical bytes (Phase 3
  * P3.3). MUST match AT_COSIGN_BYTES_MAX in social/cosign.h,
@@ -441,7 +523,9 @@ typedef struct {
 #define AT_APP_SEND_DM "app_send_dm"
 
 /* App→AT: publish a feed post to the local group (Increment 7). The payload is
- * {"body": "<body>", "tier": <int 0..4>}; identity signs the post with this
+ * {"body": "<body>", "tier": <int 0..4>}, plus optionally (Phase 4)
+ * "community": "<did>" and "labels": ["<label>", …] for a post made in a
+ * community's name; identity signs the post, scope included, with this
  * node's Ed25519 key, group-encrypts it and multicasts it on the group channel.
  * The app echoes the outgoing post locally (the core does not echo it back).
  * Forwarded only to the identity process. Seventh verb on the app→AT allowlist. */
@@ -575,6 +659,30 @@ typedef struct {
  * two verbs, and "Block · Report · Both" is the app sending both. Forwarded
  * only to the identity process. Twentieth verb on the app→AT allowlist. */
 #define AT_APP_REPORT_PEER "app_report_peer"
+
+/* App→AT: follow a community (Phase 4). The payload is {"community": "<did>",
+ * "bundle": "<opaque root-signed policy>", "seq": <int>}; identity holds the
+ * bundle, persists the follow in social.cfg.json, and carries the policy in the
+ * FIRST PERSON — now and on every resync. Following is also what lets this node
+ * receive and relay moderator labels for the community. The app verifies the
+ * bundle before calling this, and calls it again with a newer one to replace
+ * it: the core never replaces a held policy from the wire. Locally originated
+ * only. Twenty-first verb on the app→AT allowlist. */
+#define AT_APP_FOLLOW_COMMUNITY "app_follow_community"
+
+/* App→AT: stop following a community (Phase 4). The payload is {"community":
+ * "<did>"}; identity drops the held policy and the follow, and stops carrying
+ * it. Locally originated only. Twenty-second verb on the app→AT allowlist. */
+#define AT_APP_UNFOLLOW_COMMUNITY "app_unfollow_community"
+
+/* App→AT: publish a moderator's label on a post (Phase 4). The payload is
+ * {"community": "<did>", "post_id": "<hex>", "bundle": "<opaque member-signed
+ * label>", "seq": <int>}; identity signs the canonical label with this node's
+ * key and group-multicasts it, and inbound copies are relayed a bounded number
+ * of hops by nodes that follow the community. The authority is the moderator's
+ * signature inside the bundle; this verb confers none. Twenty-third verb on the
+ * app→AT allowlist. */
+#define AT_APP_PUBLISH_POST_LABEL "app_publish_post_label"
 
 /**
  * @brief Pull the social type registrations into a static link.

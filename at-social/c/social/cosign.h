@@ -89,7 +89,8 @@ size_t at_cosign_bound(const char *in, char *out, size_t out_sz, size_t max);
 bool at_cosign_bytes_ok(const char *s);
 
 /* Whether (@p record, @p op) name an exchange this build understands:
- * "membership" with admit/expel, or "guardian" with designate/rotate/release.
+ * "membership" with admit/expel, "guardian" with designate/rotate/release,
+ * "content_policy" with amend, or "office" with confer/revoke (Phase 4).
  * A voluntary departure is self-signed by one person and never exchanged. */
 bool at_cosign_op_ok(const char *record, const char *op);
 

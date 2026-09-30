@@ -118,9 +118,24 @@ _Static_assert(AGORA_BUSINESS_POST_ID_MAX == AT_APP_BUSINESS_POST_ID_LEN,
  * at_app_cosign_request_t's 6145, so the batch budget is untouched a second
  * time. Offsets, measured not assumed: blocked 22149, rep_tier 22152,
  * rep_ceiling 22160. */
-_Static_assert(sizeof(agora_event_t) == 22168,
+_Static_assert(AGORA_POST_LABELS_MAX == AT_APP_POST_LABELS_LEN,
+               "AGORA_POST_LABELS_MAX out of sync with AT_APP_POST_LABELS_LEN");
+_Static_assert(AGORA_BUSINESS_DID_MAX == AT_APP_POST_COMMUNITY_LEN,
+               "a community DID is bounded as a business's (AT_APP_POST_COMMUNITY_LEN)");
+_Static_assert(AGORA_COMMUNITY_POLICY_BUNDLE_MAX == AT_APP_COMMUNITY_POLICY_BUNDLE_LEN,
+               "AGORA_COMMUNITY_POLICY_BUNDLE_MAX out of sync with "
+               "AT_APP_COMMUNITY_POLICY_BUNDLE_LEN");
+_Static_assert(AGORA_POST_LABEL_BUNDLE_MAX == AT_APP_POST_LABEL_BUNDLE_LEN,
+               "AGORA_POST_LABEL_BUNDLE_MAX out of sync with AT_APP_POST_LABEL_BUNDLE_LEN");
+/* 22168 -> 28600 at Phase 4 communities (post_community, post_labels, the
+ * policy_* tail and the label_* tail); every prior offset is unchanged
+ * (post_community lands at 22168, label_bundle at 27060). The union again did
+ * NOT grow: at_app_community_policy_t (~4.3 KB) stays under
+ * at_app_cosign_request_t's 6145, so the batch budget is untouched. Measured,
+ * not assumed. */
+_Static_assert(sizeof(agora_event_t) == 28600,
                "agora_event_t size changed — update the Dart struct and ALL "
-               "SIX cohort ctypes Ev asserts in lockstep");
+               "SEVEN cohort ctypes Ev asserts in lockstep");
 
 /* This file reads at_app_event_t through at_agora.h's accessors; a change to
  * that layout is announced by a bump of AT_APP_ABI_VERSION. Pinned here so the
@@ -254,6 +269,37 @@ int agora_publish_business_post(void *handle, const char *send_queue,
     return at_app_events_publish_business_post((at_app_events_t *)handle,
                                                send_queue, polity_did, bundle,
                                                seq);
+}
+
+int agora_publish_post_scoped(void *handle, const char *send_queue,
+                              const char *body, int required_tier,
+                              const char *community, const char *labels_csv)
+{
+    return at_app_events_publish_post_scoped((at_app_events_t *)handle, send_queue,
+                                             body, required_tier, community,
+                                             labels_csv);
+}
+
+int agora_follow_community(void *handle, const char *send_queue,
+                           const char *community, const char *bundle, int64_t seq)
+{
+    return at_app_events_follow_community((at_app_events_t *)handle, send_queue,
+                                          community, bundle, seq);
+}
+
+int agora_unfollow_community(void *handle, const char *send_queue,
+                             const char *community)
+{
+    return at_app_events_unfollow_community((at_app_events_t *)handle, send_queue,
+                                            community);
+}
+
+int agora_publish_post_label(void *handle, const char *send_queue,
+                             const char *community, const char *post_id,
+                             const char *bundle, int64_t seq)
+{
+    return at_app_events_publish_post_label((at_app_events_t *)handle, send_queue,
+                                            community, post_id, bundle, seq);
 }
 
 int agora_set_exact_position(void *handle, const char *send_queue, int opt_in,
@@ -422,6 +468,45 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             e->post_required_tier = ev->required_tier;
             memcpy(e->post_body, ev->body, AGORA_POST_BODY_MAX);
             e->post_body[AGORA_POST_BODY_MAX] = '\0';
+            memcpy(e->post_community, ev->community, AGORA_BUSINESS_DID_MAX);
+            e->post_community[AGORA_BUSINESS_DID_MAX] = '\0';
+            memcpy(e->post_labels, ev->labels, AGORA_POST_LABELS_MAX);
+            e->post_labels[AGORA_POST_LABELS_MAX] = '\0';
+            w++;
+            break;
+        }
+
+        case AT_APP_EVENT_COMMUNITY_POLICY: {
+            const at_app_community_policy_t *ev = at_agora_event_community_policy(&raw[i]);
+            e->kind = AGORA_EVENT_COMMUNITY_POLICY;
+            memcpy(e->peer_uuid, ev->carrier_uuid, AGORA_UUID_LEN);
+            memcpy(e->policy_community, ev->community, AGORA_BUSINESS_DID_MAX);
+            e->policy_community[AGORA_BUSINESS_DID_MAX] = '\0';
+            memcpy(e->policy_id, ev->policy_id, AGORA_POST_ID_MAX);
+            e->policy_id[AGORA_POST_ID_MAX] = '\0';
+            e->policy_seq = ev->seq;
+            e->policy_ts = ev->ts;
+            memcpy(e->policy_bundle, ev->bundle, AGORA_COMMUNITY_POLICY_BUNDLE_MAX);
+            e->policy_bundle[AGORA_COMMUNITY_POLICY_BUNDLE_MAX] = '\0';
+            w++;
+            break;
+        }
+
+        case AT_APP_EVENT_POST_LABEL: {
+            const at_app_post_label_t *ev = at_agora_event_post_label(&raw[i]);
+            e->kind = AGORA_EVENT_POST_LABEL;
+            memcpy(e->peer_uuid, ev->publisher_uuid, AGORA_UUID_LEN);
+            memcpy(e->label_community, ev->community, AGORA_BUSINESS_DID_MAX);
+            e->label_community[AGORA_BUSINESS_DID_MAX] = '\0';
+            memcpy(e->label_post_id, ev->post_id, AGORA_POST_ID_MAX);
+            e->label_post_id[AGORA_POST_ID_MAX] = '\0';
+            memcpy(e->label_id, ev->label_id, AGORA_POST_ID_MAX);
+            e->label_id[AGORA_POST_ID_MAX] = '\0';
+            e->label_seq = ev->seq;
+            e->label_ts = ev->ts;
+            e->label_hops = ev->hops;
+            memcpy(e->label_bundle, ev->bundle, AGORA_POST_LABEL_BUNDLE_MAX);
+            e->label_bundle[AGORA_POST_LABEL_BUNDLE_MAX] = '\0';
             w++;
             break;
         }

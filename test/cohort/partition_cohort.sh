@@ -4,11 +4,16 @@
 # partition_cohort.sh — Phase 4 DDIL: split a live cohort into two islands,
 # keep both working, heal it, and prove the heal loses nothing.
 #
-# Five real agorad nodes on one virtual L2 segment (bridge + netns, as the
+# Seven real agorad nodes on one virtual L2 segment (bridge + netns, as the
 # sibling cohorts), driven through the real app-event queues:
 #
-#   island A: ada, amy, and cal, who first starts WHILE the network is split
-#   island B: bob, ben
+#   island A: ada, amy, dee, and cal, who first starts WHILE the network is split
+#   island B: bob, ben, and eve, who first starts while split and must be refused
+#
+# THE SPLIT IS 3+2 ON PURPOSE. Admission and checkpoint finality both need a
+# majority of the WHOLE group (ISSUES §2.22, §2.26), so an even split leaves
+# neither half able to grow or finalize. Three of five can do both, and two of
+# five can do neither. The test needs one island of each kind.
 #
 # THE SPLIT moves island B's host-side veths from the bridge to a second one
 # (`ip link set V nomaster; ip link set V master agbr6b`). Inside the
@@ -18,21 +23,20 @@
 # its group key; nothing detects the split, and nothing needs to.
 #
 # WHAT IT PROVES, in order:
-#   1. discovery, and the group channel is live across all four;
-#   2. baseline: ada's post reaches amy, bob and ben;
-#   3. THE SPLIT IS REAL: ada's post reaches amy and neither of bob and ben, and
-#      bob's reaches ben and neither of ada and amy. These two posts are the
-#      ones the heal must not lose;
-#   4. BOTH ISLANDS KEEP WORKING:
-#      - cal starts in A and joins it (a key rotation in A, and it makes the
-#        islands 3 against 2);
+#   1. discovery, and the group channel is live across the five founders;
+#   2. baseline: ada's post reaches amy, dee, bob and ben;
+#   3. THE SPLIT IS REAL: ada's post reaches amy and dee and neither of bob and
+#      ben, and bob's reaches ben and none of A. These two posts are the ones
+#      the heal must not lose;
+#   4. BOTH ISLANDS KEEP WORKING, AND ONLY THE MAJORITY GROWS:
+#      - cal starts in A and A admits it (three of five votes; a key rotation
+#        in A). eve starts in B, B proposes it and must refuse it (two of five);
 #      - a reaction commits bilaterally in EACH island;
-#      - island B must NOT finalize a checkpoint: two of a five-member group is
-#        no majority. Finalizing in both islands would leave two finalized
-#        windows that no heal could reconcile. That was reachable until the
-#        checkpoint quorum counted the whole group (2026-09-25).
-#   5. THE HEAL: B's veths go back. Fresh posts cross both ways, and cal, who
-#      has never met bob or ben, sees them;
+#      - A (four of six, with cal) finalizes a checkpoint; B must NOT, since two
+#        of five is no majority. Finalizing in both islands would leave two
+#        finalized windows that no heal could reconcile.
+#   5. THE HEAL: B's veths go back. Fresh posts cross both ways, B learns cal,
+#      and the whole group takes in eve, which can then read it;
 #   6. STORE-AND-FORWARD: the two split posts cross the healed network, each
 #      exactly once, with its original content id. Nobody re-sends them by
 #      hand: each node's periodic digest offers them and the other island asks
@@ -54,7 +58,7 @@
 # each island commits alone (which is what makes the chains fork, and is fine
 # here); §2.18, a group_key_update that arrives early is dropped and never
 # re-sent, which phase 5 may surface as a node that cannot decrypt after the
-# heal. Phase 7 asserts on AT LEAST ONE node, as the sibling cohorts do.
+# heal. Phase 7 reads every through-split member's persisted chain.
 #
 # Requirements: root, iproute2, python3, and the built native layer
 # (./build.sh). Nothing is minted, so no dart/Flutter/Ethne here.
@@ -101,7 +105,9 @@ SUBNET="${SUBNET:-10.9.6}"
 GEO="${GEO:-u4pruy}"
 PREFIX=24
 
-NODES=(ada amy bob ben cal)
+# Order fixes the addresses (.11 upward); the last two joined in 2026-09-28 and
+# go at the end so the original five keep theirs.
+NODES=(ada amy bob ben cal dee eve)
 declare -A IP NS V VB ROOT PID
 i=11
 for n in "${NODES[@]}"; do
@@ -111,8 +117,9 @@ done
 declare -A UUID_OF
 BR=agbr6
 BR2=agbr6b          # island B's bridge while split
-ISLAND_A=(ada amy)  # cal joins A later
-ISLAND_B=(bob ben)
+FOUNDERS=(ada amy dee bob ben)
+ISLAND_A=(ada amy dee)  # cal joins A while split
+ISLAND_B=(bob ben eve)  # eve asks B while split, and must be refused
 
 RUN="${AGORA_COHORT_RUN:-$AGORA_DIR/.coh/part-$$}"
 LIBSTAGE="$RUN/lib"
@@ -197,7 +204,7 @@ net_reset() {
 
 net_up() {
   net_reset
-  log "Creating bridges $BR (+ $BR2 for the split) and five namespaces on $SUBNET.0/$PREFIX"
+  log "Creating bridges $BR (+ $BR2 for the split) and ${#NODES[@]} namespaces on $SUBNET.0/$PREFIX"
   ip link add "$BR" type bridge && ip link set "$BR" up || return 1
   ip link add "$BR2" type bridge && ip link set "$BR2" up || return 1
   local n
@@ -214,7 +221,7 @@ net_up() {
   if [ -e /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
     echo 0 > /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || true
   fi
-  for n in amy bob ben cal; do
+  for n in "${NODES[@]:1}"; do
     ip netns exec "${NS[ada]}" ping -c1 -W2 "${IP[$n]}" >/dev/null 2>&1 \
       || { err "no L2 path from ada to $n"; return 1; }
   done
@@ -237,12 +244,22 @@ split_net() {
 }
 
 heal_net() {
-  local n
+  local n i
   for n in "${ISLAND_B[@]}"; do
     ip link set "${VB[$n]}" nomaster && ip link set "${VB[$n]}" master "$BR" || return 1
   done
-  reachable ada bob || { err "heal: ada cannot reach bob"; return 1; }
-  return 0
+  # Not one ping: the re-enslaved ports and a neighbour entry that went FAILED
+  # during a long split can take a moment (part-3471189 failed a single 1 s
+  # ping here). Ten seconds, then show the L2 state rather than guess.
+  for i in $(seq 1 10); do
+    reachable ada bob && reachable bob ada && return 0
+    sleep 1
+  done
+  err "heal: ada and bob still cannot reach each other after 10 s. L2 state:"
+  { bridge link show; ip -br link show master "$BR"; ip -br link show master "$BR2"
+    ip -n "${NS[ada]}" neigh show; ip -n "${NS[bob]}" neigh show
+    ip -n "${NS[bob]}" -br addr show; } >&2 2>&1
+  return 1
 }
 
 node_start() { # name
@@ -373,11 +390,29 @@ class Ev(ctypes.Structure):
         ("blocked", ctypes.c_uint8),
         ("rep_tier", ctypes.c_int32),
         ("rep_ceiling", ctypes.c_double),
+        # Communities (Phase 4), appended LAST so every prior offset is
+        # unchanged. post_community/post_labels ride the POST event;
+        # policy_* the COMMUNITY_POLICY event (16); label_* the POST_LABEL
+        # event (17). Both bundles are OPAQUE: only the app verifies them.
+        ("post_community", ctypes.c_char * (BDID + 1)),
+        ("post_labels", ctypes.c_char * (263 + 1)),
+        ("policy_community", ctypes.c_char * (BDID + 1)),
+        ("policy_id", ctypes.c_char * (64 + 1)),
+        ("policy_seq", ctypes.c_int64),
+        ("policy_ts", ctypes.c_double),
+        ("policy_bundle", ctypes.c_char * (4096 + 1)),
+        ("label_community", ctypes.c_char * (BDID + 1)),
+        ("label_post_id", ctypes.c_char * (64 + 1)),
+        ("label_id", ctypes.c_char * (64 + 1)),
+        ("label_seq", ctypes.c_int64),
+        ("label_ts", ctypes.c_double),
+        ("label_hops", ctypes.c_int32),
+        ("label_bundle", ctypes.c_char * (1536 + 1)),
     ]
 
 # ABI guard: MUST equal sizeof(agora_event_t) in at_agora_shim.h. A silent drift
 # here would decode every field past the drift point as garbage.
-assert ctypes.sizeof(Ev) == 22168, f"Ev size {ctypes.sizeof(Ev)} != 22168 (ABI drift)"
+assert ctypes.sizeof(Ev) == 28600, f"Ev size {ctypes.sizeof(Ev)} != 28600 (ABI drift)"
 
 def connect(lib, timeout):
     """Open the app-event channel, retrying until the daemon binds its queue."""
@@ -527,6 +562,7 @@ def cmd_observe_body(shim, root, marker, timeout):
         return 5
     print(f"got '{marker}' ({got['post_id'][:16]}…, tier {got['tier']}) "
           f"from {got['author'][:12]}…")
+    print(f"post_id={got['post_id']}")
     return 0
 
 
@@ -569,39 +605,6 @@ def cmd_observe_saw(shim, root, marker, timeout, out_path):
     return 0
 
 
-def cmd_observe_once(shim, root, marker, timeout, settle, out_path):
-    """A post carrying `marker` arrives, and then no SECOND copy of it for
-    `settle` seconds: a backfilled post is deduplicated in the core, and this
-    is the app-side check that it was."""
-    lib = open_lib(shim, root)
-    h = connect(lib, timeout)
-    if not h:
-        return 2
-    cap = 64
-    buf = (Ev * cap)()
-    seen = []
-    deadline = time.time() + timeout
-    first_at = None
-    while time.time() < deadline:
-        for e in drain(lib, h, buf, cap, deadline):
-            if e.kind == EV_POST and marker in e.post_body.decode(errors="replace"):
-                seen.append(e.post_id.decode(errors="replace"))
-                if first_at is None:
-                    first_at = time.time()
-                    deadline = min(deadline, first_at + settle)
-        time.sleep(0.5)
-    lib.agora_events_close(h)
-    if not seen:
-        print(f"observe-once: no post carrying '{marker}' in {timeout}s", file=sys.stderr)
-        return 5
-    json.dump({"post_ids": seen}, open(out_path, "w"))
-    if len(seen) != 1:
-        print(f"observe-once: '{marker}' arrived {len(seen)} times", file=sys.stderr)
-        return 6
-    print(f"got '{marker}' once ({seen[0][:16]}…)")
-    return 0
-
-
 def cmd_react(shim, root, saw_path, timeout):
     """React to a recorded post: the bilateral act (reactor and author both
     score the same task), which is what a Paxos round needs to commit."""
@@ -619,30 +622,6 @@ def cmd_react(shim, root, saw_path, timeout):
     print(f"react rc={rc} to {saw['post_id'][:16]}…")
     lib.agora_events_close(h)
     return 0 if rc == 0 else 4
-
-
-def cmd_peers_absent(shim, root, uuids, seconds):
-    """No PEER event for any of `uuids` in `seconds`: cal, started inside
-    island A, must not learn of island B while the network is split."""
-    lib = open_lib(shim, root)
-    h = connect(lib, seconds)
-    if not h:
-        return 2
-    want = {_norm(u) for u in uuids.split(",") if u}
-    cap = 64
-    buf = (Ev * cap)()
-    deadline = time.time() + seconds
-    while time.time() < deadline:
-        lib.agora_events_request_roster(h, b"extern_to_at")
-        for e in drain(lib, h, buf, cap, deadline):
-            if e.kind == EV_PEER and bytes(e.peer_uuid).hex() in want:
-                lib.agora_events_close(h)
-                print(f"peers-absent: saw {bytes(e.peer_uuid).hex()[:12]}…", file=sys.stderr)
-                return 7
-        time.sleep(1.0)
-    lib.agora_events_close(h)
-    print(f"none of {len(want)} peer(s) seen in {seconds}s, as required")
-    return 0
 
 
 def cmd_observe_plain(shim, root, timeout):
@@ -676,15 +655,10 @@ def main(argv):
         return cmd_observe_none_body(shim, root, argv[4], float(argv[5]))
     if verb == "observe-saw":
         return cmd_observe_saw(shim, root, argv[4], float(argv[5]), argv[6])
-    if verb == "observe-once":
-        return cmd_observe_once(shim, root, argv[4], float(argv[5]),
-                                float(argv[6]), argv[7])
     if verb == "observe-plain":
         return cmd_observe_plain(shim, root, float(argv[4]))
     if verb == "react":
         return cmd_react(shim, root, argv[4], float(argv[5]))
-    if verb == "peers-absent":
-        return cmd_peers_absent(shim, root, argv[4], float(argv[5]))
     print(f"unknown verb {verb}", file=sys.stderr)
     return 64
 
@@ -714,6 +688,35 @@ node_uuid() { # node
 plain_log() { sed -e 's/\x1b\[[0-9;]*m//g' "${ROOT[$1]}/agorad.log" 2>/dev/null; }
 saw() { plain_log "$1" | grep -q "$2"; }
 count_in() { local c; c="$(plain_log "$1" | grep -c "$2")" || true; printf '%s' "${c:-0}"; }
+
+# Nothing crossed the split to or from a node that started during it.
+# Membership is not reachability: cal learns island B's members from A's
+# histories (ISSUES §2.23, a joiner learns every member) and SENDS to them, so a
+# PEER event for bob proves nothing. What must hold is that every one of those
+# frames died at the split: the far island's logs never name the joiner or its
+# address, and the joiner never logs anything received from the far island.
+# Outbound lines on the joiner's side ("sent ... to <far address>") are
+# expected and ignored.
+no_crosstalk() { # joiner "far nodes" -> 0 when nothing crossed
+  local j="$1" far="$2" n c rc=0 pat names="" addrs=""
+  sleep "$GATE_WINDOW"
+  for n in $far; do
+    pat="${IP[$j]//./\\.}\\| from $j\\b\\| by $j\\b\\|added peer $j "
+    c=$(count_in "$n" "$pat")
+    if [ "$c" -gt 0 ]; then
+      err "  $n logged $c line(s) naming $j or ${IP[$j]} while split:"
+      plain_log "$n" | grep "$pat" | head -3 >&2; rc=1
+    fi
+    names="${names:+$names\\|}$n"; addrs="$addrs\\|from ${IP[$n]//./\\.}"
+  done
+  pat="\\(from\\|by\\) \\($names\\)\\b$addrs"
+  c=$(count_in "$j" "$pat")
+  if [ "$c" -gt 0 ]; then
+    err "  $j logged $c line(s) received from the far island while split:"
+    plain_log "$j" | grep "$pat" | head -3 >&2; rc=1
+  fi
+  return $rc
+}
 
 # The app-driven task a node submitted most recently (`cap -` is the marker of
 # an app interaction, never one of AT's probes).
@@ -748,7 +751,7 @@ deliver() { # pub marker "pos nodes" "neg nodes"
   local pub="$1" marker="$2" n rc=0
   local -a pids=() names=() kinds=()
   for n in $3; do
-    drive "$n" observe-body "$marker" "$WAIT" >/dev/null & pids+=($!); names+=("$n"); kinds+=(pos)
+    drive "$n" observe-body "$marker" "$WAIT" >"$RUN/obs-$marker-$n.out" & pids+=($!); names+=("$n"); kinds+=(pos)
   done
   for n in $4; do
     drive "$n" observe-none-body "$marker" "$GATE_WINDOW" >/dev/null & pids+=($!); names+=("$n"); kinds+=(neg)
@@ -778,11 +781,11 @@ decrypt_report() {
 }
 
 # --------------------------------------------------------------------------- #
-# Phase 1 — four nodes discover each other; the group channel is live
+# Phase 1 — five founders discover each other; the group channel is live
 # --------------------------------------------------------------------------- #
-log "Phase 1: starting ada, amy, bob, ben one at a time (cal waits for the split)"
+log "Phase 1: starting ${FOUNDERS[*]} one at a time (cal and eve wait for the split)"
 started=()
-for n in ada amy bob ben; do
+for n in "${FOUNDERS[@]}"; do
   node_start "$n"
   sleep 3
   kill -0 "${PID[$n]}" 2>/dev/null || { err "FAIL (phase 1): $n died at start"; dump_logs; exit 1; }
@@ -796,17 +799,37 @@ for n in ada amy bob ben; do
   fi
   started+=("$n")
 done
-for n in ada amy bob ben; do
-  drive "$n" peers 3 "$WAIT" >/dev/null \
-    || { err "FAIL (phase 1): $n did not discover three peers in ${WAIT}s"; dump_logs; exit 1; }
+# Which founders a node's APP never saw, by name. part-3486847 failed here with
+# the network layer complete on every node, and the discarded output was the
+# only record of who was missing.
+missing_from_app() { # node -> names absent from its last `peers` output
+  local n="$1" m u out=""
+  for m in "${FOUNDERS[@]}"; do
+    [ "$m" = "$n" ] && continue
+    u="$(node_uuid "$m" 2>/dev/null | tr -d '-')"
+    grep -q "^  $u\$" "$RUN/peers-$n.out" 2>/dev/null || out="$out $m"
+  done
+  echo "${out# }"
+}
+for n in "${FOUNDERS[@]}"; do
+  if ! drive "$n" peers $(( ${#FOUNDERS[@]} - 1 )) "$WAIT" >"$RUN/peers-$n.out"; then
+    err "FAIL (phase 1): $n did not discover every other founder in ${WAIT}s"
+    err "  $n's app never saw: $(missing_from_app "$n")"
+    err "  $n's identity roster replay: $(count_in "$n" 'peer roster replay reached the app') refused replay(s)"
+    for m in "${FOUNDERS[@]}"; do
+      [ "$m" = "$n" ] && continue
+      saw "$n" "Network: added peer $m " || err "  $n never added $m at the network layer"
+    done
+    dump_logs; exit 1
+  fi
 done
 # Admitted at the NETWORK layer too, by name: the defect this boot order avoids
 # (ISSUES.md §2.23) shows exactly as a missing "Network: added peer <name>".
 deadline=$(( SECONDS + WAIT ))
 while :; do
   missing=""
-  for n in ada amy bob ben; do
-    for m in ada amy bob ben; do
+  for n in "${FOUNDERS[@]}"; do
+    for m in "${FOUNDERS[@]}"; do
       [ "$n" = "$m" ] && continue
       saw "$n" "Network: added peer $m " || missing="$missing $n->$m"
     done
@@ -819,45 +842,78 @@ while :; do
   fi
   sleep 2
 done
-for n in ada amy bob ben; do UUID_OF[$n]="$(node_uuid "$n")"; done
+for n in "${FOUNDERS[@]}"; do UUID_OF[$n]="$(node_uuid "$n")"; done
 converge_gate ada bob "ada->bob" && converge_gate bob ada "bob->ada" \
   || { err "FAIL (phase 1): the group channel never settled"; dump_logs; exit 1; }
-ok "phase 1: four nodes, one group"
+ok "phase 1: five founders, one group"
 
 # --------------------------------------------------------------------------- #
 # Phase 2 — baseline
 # --------------------------------------------------------------------------- #
-log "Phase 2: ada posts; amy, bob and ben must all receive it"
-deliver ada "baseline-$$" "amy bob ben" "" \
+log "Phase 2: ada posts; amy, dee, bob and ben must all receive it"
+deliver ada "baseline-$$" "amy dee bob ben" "" \
   || { err "FAIL (phase 2): the connected group does not deliver"; dump_logs; exit 1; }
 ok "phase 2: the connected group delivers"
 
 # --------------------------------------------------------------------------- #
 # Phase 3 — the split, and the two posts the heal must not lose
 # --------------------------------------------------------------------------- #
-log "Phase 3: splitting {ada, amy} from {bob, ben}"
+log "Phase 3: splitting {ada, amy, dee} from {bob, ben}"
 split_net || { err "FAIL (phase 3): could not split the segment"; exit 1; }
 SPLIT_A="split-A-$$"; SPLIT_B="split-B-$$"
-deliver ada "$SPLIT_A" "amy" "bob ben" \
+deliver ada "$SPLIT_A" "amy dee" "bob ben" \
   || { err "FAIL (phase 3): island A's post did not stay in island A"; dump_logs; exit 1; }
-deliver bob "$SPLIT_B" "ben" "ada amy" \
+deliver bob "$SPLIT_B" "ben" "ada amy dee" \
   || { err "FAIL (phase 3): island B's post did not stay in island B"; dump_logs; exit 1; }
 ok "phase 3: the split is real; '$SPLIT_A' is only in A, '$SPLIT_B' only in B"
-CKPT_B0=$(( $(count_in bob 'checkpoint stored') + $(count_in ben 'checkpoint stored') ))
+# Their content ids, as the island that saw them computed them: phase 6 finds
+# the backfill by id in the other island's logs.
+post_id_of() { sed -n 's/^post_id=//p' "$RUN/obs-$1-$2.out" 2>/dev/null | head -1; }
+SPLIT_A_ID="$(post_id_of "$SPLIT_A" amy)"; SPLIT_B_ID="$(post_id_of "$SPLIT_B" ben)"
+[ -n "$SPLIT_A_ID" ] && [ -n "$SPLIT_B_ID" ] \
+  || { err "FAIL (phase 3): could not read the split posts' content ids"; dump_logs; exit 1; }
+ckpts_of() { local n t=0; for n in "$@"; do t=$(( t + $(count_in "$n" 'checkpoint stored') )); done; echo "$t"; }
+CKPT_A0=$(ckpts_of ada amy dee); CKPT_B0=$(ckpts_of bob ben)
 
 # --------------------------------------------------------------------------- #
 # Phase 4 — both islands keep working
 # --------------------------------------------------------------------------- #
-log "Phase 4a: cal starts inside island A"
+# Admission needs a majority of the WHOLE group (ISSUES §2.26). A holds three
+# of five and can admit; B holds two and must not. One joiner on each side.
+log "Phase 4a: cal starts inside island A (3 of 5) and must be admitted"
 node_start cal
-drive cal peers 2 "$WAIT" >/dev/null \
+drive cal peers 3 "$WAIT" >/dev/null \
   || { err "FAIL (phase 4a): cal did not join island A in ${WAIT}s"; dump_logs; exit 1; }
 UUID_OF[cal]="$(node_uuid cal)"
-drive cal peers-absent "${UUID_OF[bob]},${UUID_OF[ben]}" "$GATE_WINDOW" >/dev/null \
-  || { err "FAIL (phase 4a): cal learned of island B through the split"; dump_logs; exit 1; }
+no_crosstalk cal "bob ben" \
+  || { err "FAIL (phase 4a): traffic crossed the split to or from cal"; dump_logs; exit 1; }
 converge_gate ada amy "ada->amy (after cal)" \
   || { err "FAIL (phase 4a): island A's group never settled after cal joined"; dump_logs; exit 1; }
-ok "phase 4a: cal joined A and knows nothing of B"
+ok "phase 4a: A admitted cal; nothing crossed the split to or from it"
+
+log "Phase 4a: eve starts inside island B (2 of 5) and must be refused"
+node_start eve
+sleep 3
+kill -0 "${PID[eve]}" 2>/dev/null || { err "FAIL (phase 4a): eve died at start"; dump_logs; exit 1; }
+UUID_OF[eve]="$(node_uuid eve)"
+# The refusal is only evidence if B actually considered eve.
+deadline=$(( SECONDS + WAIT ))
+until saw bob "proposed peer eve for voting" || saw ben "proposed peer eve for voting"; do
+  [ "$SECONDS" -lt "$deadline" ] \
+    || { err "FAIL (phase 4a): neither bob nor ben ever proposed eve, so a refusal would prove nothing"; dump_logs; exit 1; }
+  sleep 2
+done
+no_crosstalk eve "ada amy dee cal" \
+  || { err "FAIL (phase 4a): traffic crossed the split to or from eve"; dump_logs; exit 1; }
+for n in bob ben; do
+  if saw "$n" "majority vote reached for ${UUID_OF[eve]}" || saw "$n" "Network: added peer eve "; then
+    err "FAIL (phase 4a): $n admitted eve with two of five. Admission must count"
+    err "  the whole group: ADMISSION_QUORUM (id_proc.c), ISSUES §2.26."
+    plain_log "$n" | grep "majority vote reached for ${UUID_OF[eve]}\\|added peer eve " | head -3 >&2
+    dump_logs; exit 1
+  fi
+done
+ok "phase 4a: B proposed eve and refused (2 of 5 is no majority)"
 
 island_commit() { # author reactor island-label -> sets ISLAND_TASK
   local author="$1" reactor="$2" label="$3" saw_json="$RUN/saw-$3.json"
@@ -889,17 +945,24 @@ island_commit bob ben B || { err "FAIL (phase 4b): island B cannot commit"; dump
 TASK_B="$ISLAND_TASK"
 ok "phase 4b: A committed $TASK_A, B committed $TASK_B, apart"
 
-log "Phase 4c: island B must not finalize a checkpoint (2 of 5 is no majority)"
+log "Phase 4c: A (4 of 6) must finalize a checkpoint; B (2 of 5 in its view) must not"
 sleep $(( CHECKPOINT_SEC * 2 + 5 ))
-CKPT_B1=$(( $(count_in bob 'checkpoint stored') + $(count_in ben 'checkpoint stored') ))
+CKPT_B1=$(ckpts_of bob ben)
 if [ "$CKPT_B1" -gt "$CKPT_B0" ]; then
   err "FAIL (phase 4c): island B finalized $(( CKPT_B1 - CKPT_B0 )) checkpoint(s) while"
   err "  split. Two finalized windows cannot be reconciled at the heal: check"
   err "  _ckpt_quorum_for_group (rep_proc.c) counts the whole group."
   dump_logs; exit 1
 fi
-CKPT_A=$(( $(count_in ada 'checkpoint stored') + $(count_in amy 'checkpoint stored') + $(count_in cal 'checkpoint stored') ))
-ok "phase 4c: B finalized nothing while split (A stored $CKPT_A checkpoint line(s))"
+# The positive control: without it, "B finalized nothing" could just mean
+# nobody finalized anything.
+CKPT_A1=$(ckpts_of ada amy dee)
+if [ "$CKPT_A1" -le "$CKPT_A0" ]; then
+  err "FAIL (phase 4c): island A (ada, amy, dee, cal: 4 of 6) finalized no checkpoint"
+  err "  while split, so B's silence proves nothing."
+  dump_logs; exit 1
+fi
+ok "phase 4c: A finalized ($(( CKPT_A1 - CKPT_A0 )) new checkpoint line(s)); B finalized nothing"
 
 # --------------------------------------------------------------------------- #
 # Phase 5 — the heal
@@ -907,6 +970,10 @@ ok "phase 4c: B finalized nothing while split (A stored $CKPT_A checkpoint line(
 log "Phase 5: healing the segment"
 heal_net || { err "FAIL (phase 5): could not heal the segment"; exit 1; }
 HEAL_AT=$SECONDS
+# Where each log stood at the heal: phase 7 reads only what came after, since
+# every node also adopts chains while booting and joining.
+declare -A HEAL_LINE
+for n in "${NODES[@]}"; do HEAL_LINE[$n]=$(plain_log "$n" | wc -l); done
 converge_gate ada bob "ada->bob (healed)" && converge_gate bob cal "bob->cal (healed)" || {
   err "FAIL (phase 5): the healed network does not deliver across the old split."
   err "  A rotated its key when cal joined; B must detect the mismatch (group"
@@ -914,72 +981,116 @@ converge_gate ada bob "ada->bob (healed)" && converge_gate bob cal "bob->cal (he
   err "  §2.18 (a missed group_key_update is never re-sent) is the prime suspect."
   decrypt_report; dump_logs; exit 1
 }
-drive cal peers 4 "$WAIT" >/dev/null \
+# cal already lists bob and ben from A's histories (phase 4a), so its PEER
+# count proves nothing here; the heal's news is island B learning cal, and the
+# whole group taking in eve, whom B alone could not admit.
+drive cal peers 5 "$WAIT" >/dev/null \
   || { err "FAIL (phase 5): cal never discovered bob and ben"; dump_logs; exit 1; }
-ok "phase 5: healed in $(( SECONDS - HEAL_AT ))s; posts cross, cal knows all four"
+added_or_fail() { # node peer
+  local deadline=$(( SECONDS + WAIT ))
+  until saw "$1" "Network: added peer $2 "; do
+    [ "$SECONDS" -lt "$deadline" ] \
+      || { err "FAIL (phase 5): $1 never added $2 as a network peer"; dump_logs; exit 1; }
+    sleep 2
+  done
+}
+for n in bob ben; do added_or_fail "$n" cal; done
+for n in ada amy dee bob ben cal; do added_or_fail "$n" eve; done
+converge_gate ada eve "ada->eve (healed)" || {
+  err "FAIL (phase 5): eve is listed but cannot read the group after the heal."
+  decrypt_report; dump_logs; exit 1
+}
+ok "phase 5: healed in $(( SECONDS - HEAL_AT ))s; posts cross, B added cal, and everyone added eve"
 
 # --------------------------------------------------------------------------- #
 # Phase 6 — store-and-forward: the split posts cross, once, unchanged
 # --------------------------------------------------------------------------- #
 log "Phase 6: the split posts must reach the other island by backfill"
+# Checked in each daemon's log, not by an app observer. The digest that
+# triggers a backfill can land while phase 5 is still probing, and a node has
+# one app queue: a POST event emitted before phase 6's observer attaches went
+# nowhere, and the dedup ring (rightly) never emits it again. That was
+# part-3330966 and part-3334323. The daemon's own "accepted (…, backfilled)"
+# line, keyed by the content id phase 3 recorded, is the durable evidence;
+# exactly one of them per node is the exactly-once check.
 SETTLE=$(( DIGEST_SEC + 25 ))
-declare -A SF_PID
-for n in bob ben; do
-  drive "$n" observe-once "$SPLIT_A" "$WAIT" "$SETTLE" "$RUN/sf-$n.json" & SF_PID[$n]=$!
-done
-for n in ada amy cal; do
-  drive "$n" observe-once "$SPLIT_B" "$WAIT" "$SETTLE" "$RUN/sf-$n.json" & SF_PID[$n]=$!
-done
+backfill_count() { count_in "$1" "Identity: post $2 from .* accepted (hops=[0-9]*, backfilled)"; }
+SF_PAIRS=("bob:$SPLIT_A_ID" "ben:$SPLIT_A_ID"
+          "ada:$SPLIT_B_ID" "amy:$SPLIT_B_ID" "dee:$SPLIT_B_ID" "cal:$SPLIT_B_ID")
 sf_rc=0
-for n in "${!SF_PID[@]}"; do
-  wait "${SF_PID[$n]}"; s=$?
-  [ "$s" -ne 0 ] && { err "  $n: rc=$s (5 = never arrived, 6 = arrived more than once)"; sf_rc=1; }
+deadline=$(( SECONDS + WAIT + DIGEST_SEC ))
+for pair in "${SF_PAIRS[@]}"; do
+  n="${pair%%:*}"; id="${pair#*:}"
+  until [ "$(backfill_count "$n" "$id")" -ge 1 ]; do
+    [ "$SECONDS" -lt "$deadline" ] || break
+    sleep 2
+  done
+done
+sleep "$SETTLE"
+for pair in "${SF_PAIRS[@]}"; do
+  n="${pair%%:*}"; id="${pair#*:}"; c="$(backfill_count "$n" "$id")"
+  if [ "$c" -ne 1 ]; then
+    err "  $n: accepted ${id:0:16}… by backfill $c time(s) (want exactly 1)"; sf_rc=1
+  fi
 done
 if [ "$sf_rc" -ne 0 ]; then
   err "FAIL (phase 6): a post made during the split did not reach the healed"
   err "  network exactly once."
   decrypt_report; dump_logs; exit 1
 fi
-ok "phase 6: '$SPLIT_A' reached bob and ben, '$SPLIT_B' reached ada, amy and cal, once each"
+ok "phase 6: '$SPLIT_A' reached bob and ben, '$SPLIT_B' reached ada, amy, dee and cal, once each, by backfill"
 
 # --------------------------------------------------------------------------- #
 # Phase 7 — reputation carried forward
 # --------------------------------------------------------------------------- #
-log "Phase 7: the losing island's split-time task must survive the chain adoption"
-island_of() { case "$1" in bob|ben) echo B ;; *) echo A ;; esac; }
-deadline=$(( SECONDS + WAIT ))
-loser=""; adopter=""; reproposed=""; carried=""; lose_task=""
+log "Phase 7: both islands' split-time tasks must survive the heal, two-sided, on every node"
+# THE CHAIN ITSELF IS THE EVIDENCE, read from each node's persisted
+# reputation-history (rewritten on every stored checkpoint). An earlier version
+# looked for "task T is bilateral" on the other island, but that line is logged
+# only where the second half is COMMITTED; a node that receives the finished
+# entry through a chain adoption logs nothing about it. part-3632221
+# (2026-09-29) had both tasks two-sided at the same index in all seven chains
+# and still failed here. Checking both tasks on every member is also stronger:
+# the old check followed one "losing" island's task, chosen from an adoption
+# line that routine churn logs on every node.
+chain_has_both() { # node task... -> 0 iff every task has both halves
+  local f="${ROOT[$1]}/etc/at/reputation-history.cfg.json"; shift
+  [ -s "$f" ] || return 1
+  python3 - "$f" "$@" <<'PY'
+import json, sys
+try:
+    chain = json.load(open(sys.argv[1])).get('chain') or []
+except Exception:
+    sys.exit(1)
+full = {e.get('task_id') for e in chain if e.get('p1_id') and e.get('p2_id')}
+sys.exit(0 if all(t in full for t in sys.argv[2:]) else 1)
+PY
+}
+MEMBERS=(ada amy dee cal bob ben)   # through the split; eve joined after it
+deadline=$(( SECONDS + WAIT )); missing=""
 while [ "$SECONDS" -lt "$deadline" ]; do
-  if [ -z "$loser" ]; then
-    for n in "${NODES[@]}"; do
-      if saw "$n" "adopted .*chain .*dropped [1-9]"; then
-        adopter="$n"; loser="$(island_of "$n")"; break
-      fi
-    done
-  fi
-  if [ -n "$loser" ]; then
-    if [ "$loser" = B ]; then lose_task="$TASK_B"; others="ada amy cal"; mine="bob ben"
-    else lose_task="$TASK_A"; others="bob ben"; mine="ada amy cal"; fi
-    for n in $mine; do saw "$n" "re-proposing [0-9]* dropped transaction" && reproposed="$n"; done
-    for n in $others; do saw "$n" "task $lose_task is bilateral" && carried="$n"; done
-    [ -n "$carried" ] && break
-  fi
+  missing=""
+  for n in "${MEMBERS[@]}"; do chain_has_both "$n" "$TASK_A" "$TASK_B" || missing="$missing $n"; done
+  [ -z "$missing" ] && break
   sleep 3
 done
-if [ -z "$loser" ]; then
-  err "FAIL (phase 7): no node adopted the other island's chain in ${WAIT}s,"
-  err "  so the forked chains never met (a Paxos grant needs equal lengths, and"
-  err "  catch-up runs only when one is refused)."
+# Informational: how the tasks got there.
+healed_saw() { plain_log "$1" | tail -n +$(( HEAL_LINE[$1] + 1 )) | grep -q "$2"; }
+reproposed=""
+for n in "${MEMBERS[@]}"; do healed_saw "$n" "re-proposing [0-9]* dropped transaction" && reproposed="$reproposed $n"; done
+if [ -n "$missing" ]; then
+  err "FAIL (phase 7): after ${WAIT}s the persisted chain on:$missing lacks a"
+  err "  two-sided entry for A's $TASK_A or B's $TASK_B."
+  err "  re-proposals after the heal on:${reproposed:- none}."
+  for n in $missing; do
+    f="${ROOT[$n]}/etc/at/reputation-history.cfg.json"
+    for t in "$TASK_A" "$TASK_B"; do
+      grep -q "$t" "$f" 2>/dev/null && echo "  $n: $t present, one-sided" >&2 || echo "  $n: $t absent" >&2
+    done
+  done
   dump_logs; exit 1
 fi
-if [ -z "$carried" ]; then
-  err "FAIL (phase 7): island $loser adopted (on $adopter), but its split-time task"
-  err "  $lose_task never committed where the other island can see it."
-  err "  re-proposal on $loser: ${reproposed:-none seen}. None means"
-  err "  _repropose_dropped found nothing of its own to re-submit."
-  dump_logs; exit 1
-fi
-ok "phase 7: island $loser adopted (on $adopter), re-proposed (on ${reproposed:-?}), and its task $lose_task is bilateral on $carried"
+ok "phase 7: A's $TASK_A and B's $TASK_B are two-sided in all ${#MEMBERS[@]} members' chains (re-proposals after the heal on:${reproposed:- none})"
 
 log "PASS: two islands kept working apart, and the heal lost neither a post nor a transaction."
 log "  evidence: $RUN (kept with KEEP=1)"

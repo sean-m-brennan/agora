@@ -1,0 +1,26 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: post-digest-offers-a-stored-label
+byte_pinning: false
+description: |
+    A moderator's own label is kept for backfill and offered in the next
+    digest.
+participants:
+  - id: node
+    role: border_guard
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: trigger_publish_post_label
+    payload: {"community": "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ", "post_id": "1111111111111111111111111111111111111111111111111111111111111111", "seq": 1, "bundle": "{\"label\":\"stub\",\"labels\":[\"nsfw\"]}"}
+  - id: 2
+    from: node
+    to: node
+    function: trigger_post_digest
+    payload: {}
+expected_state:
+  node:
+    post_labels_emitted: 1
+    post_digests_emitted: 1

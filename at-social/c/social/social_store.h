@@ -94,4 +94,20 @@ int social_store_load(const char *cfg_dir, map_t *blocks);
  */
 int social_store_save(const map_t *blocks, const char *cfg_dir);
 
+/**
+ * The communities this node FOLLOWS (Phase 4), beside the blocks: the sibling
+ * key the schema above was shaped for. `"communities": {"<did>": {"bundle":
+ * "<opaque policy>", "seq": <int>}}`, written ONLY when non-empty, so a node
+ * that follows nothing writes the same bytes as before and the golden document
+ * both runtimes pin is unchanged.
+ *
+ * @p communities maps a DID to string_data(compact JSON {"bundle","seq"}). A
+ * malformed "communities" key fails the whole load, as a malformed "blocks"
+ * does: moderation state is restored whole or not at all.
+ * @return as social_store_load / social_store_save.
+ */
+int social_store_load_all(const char *cfg_dir, map_t *blocks, map_t *communities);
+int social_store_save_all(const map_t *blocks, const map_t *communities,
+                          const char *cfg_dir);
+
 #endif /* AUTONOMOUS_TRUST_IDENTITY_SOCIAL_STORE_H */
