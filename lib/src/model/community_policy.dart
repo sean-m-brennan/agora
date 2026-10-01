@@ -52,6 +52,7 @@ class CommunityPolicy {
     required this.bundle,
     this.hubRoster,
     this.hubAreas = const {},
+    this.standing = const {},
   });
 
   /// From what `EthneFfi.verifyContentPolicy` returned for [bundle]:
@@ -82,6 +83,10 @@ class CommunityPolicy {
         for (final e in ((read['hub_areas'] as Map?) ?? const {}).entries)
           '${e.key}': [for (final a in (e.value as List? ?? const [])) '$a'],
       },
+      standing: {
+        for (final e in ((p['standing'] as Map?) ?? const {}).entries)
+          '${e.key}': LabelAction.parse(e.value),
+      },
     );
   }
 
@@ -111,6 +116,23 @@ class CommunityPolicy {
   /// serves. Empty when the community runs none.
   final Map<String, List<String>> hubAreas;
 
+  /// What a post made in ANOTHER community's name does, by that community's
+  /// standing in this community's compacts (Ethne D39), keyed by Ethne's
+  /// `CommunityStanding` names: `Probationary`, `Denied`, `Anathema`, `Outside`.
+  final Map<String, LabelAction> standing;
+
+  /// What this policy does to a post made in the name of a community that stands
+  /// at [word] (`ethne_compact_view_verify`'s words) in this community's view. A
+  /// community in compact with this one is not judged; a standing the policy
+  /// does not name is allowed.
+  LabelAction actionForStanding(String word) => switch (word) {
+        'probationary' => standing['Probationary'] ?? LabelAction.allow,
+        'denied' => standing['Denied'] ?? LabelAction.allow,
+        'anathema' => standing['Anathema'] ?? LabelAction.allow,
+        'outside' => standing['Outside'] ?? LabelAction.allow,
+        _ => LabelAction.allow,
+      };
+
   /// Every area any of the community's hubs serves, sorted, without repeats.
   List<String> get areas =>
       ({for (final l in hubAreas.values) ...l}.toList()..sort());
@@ -121,6 +143,9 @@ class CommunityPolicy {
         'min_tier': minTier,
         'daily_post_cap': dailyPostCap,
         'labels': {for (final e in labels.entries) e.key: e.value.wire},
+        // Carried through an amendment, or editing the labels would drop them,
+        // which is a loosening (D39).
+        if (standing.isNotEmpty) 'standing': {for (final e in standing.entries) e.key: e.value.wire},
       };
 }
 
@@ -151,6 +176,8 @@ class PolicyReason {
         'label' => labelledBy == 'author'
             ? 'labelled "${detail['label']}" by its author'
             : 'labelled "${detail['label']}" by a moderator',
+        'compact_standing' =>
+          'it was made in a community that is ${detail['standing']} in your community\'s compacts',
         _ => code,
       };
 }

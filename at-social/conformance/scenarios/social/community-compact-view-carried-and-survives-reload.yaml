@@ -1,0 +1,36 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: community-compact-view-carried-and-survives-reload
+byte_pinning: false
+description: |
+    A community's compact view (Phase 5, Ethne D39) rides the policy carrier
+    under its own key, "<did>#compact", so a follower carries the policy and the
+    view side by side and keeps both across a restart.
+participants:
+  - id: node
+    role: border_guard
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: trigger_follow_community
+    payload: {"community": "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ", "bundle": "{\"policy\":\"stub\",\"seq\":3}", "seq": 3}
+  - id: 2
+    from: node
+    to: node
+    function: trigger_follow_community
+    payload: {"community": "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ#compact", "bundle": "{\"view\":\"stub\",\"seq\":9}", "seq": 9}
+  - id: 3
+    from: node
+    to: node
+    function: trigger_social_reload
+    payload: {}
+    description: |
+        Save and load back: the round trip a restart performs.
+expected_state:
+  node:
+    communities_followed:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ": {"seq": 3, "bundle": "{\"policy\":\"stub\",\"seq\":3}"}
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ#compact": {"seq": 9, "bundle": "{\"view\":\"stub\",\"seq\":9}"}
+    community_policies_emitted: 2

@@ -197,7 +197,7 @@ signature is re-verified, the tier gate or the business page gate applies, and
 dedup is by the same content id. The node serving it vouches for nothing. Two
 things only the group channel does: record co-membership (a backfill did not
 decrypt with the group key) and relay (a backfill is terminal, or every heal
-would re-flood the group). A digest or a want is honoured only from an admitted
+would re-flood the group). A digest or a want is honored only from an admitted
 peer, and a post is never backfilled to its own author.
 
 **Bounds.**
@@ -215,7 +215,7 @@ peer, and a post is never backfilled to its own author.
 - The store is in memory. A restarted node cannot backfill what it held before
   the restart.
 - A blocked author's posts are stored and served (a personal block governs what
-  we see, not what our neighbours may: the reason the relay still runs).
+  we see, not what our neighbors may: the reason the relay still runs).
 - Python has no feed publish verb, so its store holds received posts only.
 - The digest is a group multicast, so it reaches the other island only once
   both hold one group key again: posts are the group's, and this is by design.
@@ -285,3 +285,37 @@ conformance scenarios (`community-*`, `post-label-*`, `post-digest-label-*`,
 to prove that its node is a member, which nothing yet builds. The label store is
 in memory, like the post store.
 
+
+## Compacts between communities (Phase 5, Ethne D39/D40)
+
+Communities enter relations with each other through kith-covenant compacts.
+This library carries every step of that and judges none of it. KC's archive,
+its rules and every signature are checked in the app (Agora's cdylib,
+`native/ethne_ffi/src/kc.rs`). The design is in `../doc/agora/federation.md`.
+
+**Co-signing.** The courier's allowlist gains:
+
+| `record` | `op` | What travels |
+|---|---|---|
+| `compact` | `join`, `admit`, `sponsor`, `refuse`, `anathema`, `lift` | the roll's compact act (D40), for the deciders' signatures |
+| `rite` | `movement`, `affirm` | the polity's own rite in its charter log |
+| `commitment` | `amend` | a charter commitment (a founding needs one in force) |
+| `kc_record` | `deliver` | one KC record to a member community's governance node or an examiner's node; the answer is a receipt, never a signature over the record |
+| `kc_attest` | `attest`, `recite` | a rite attestation for a witness; the recitation for the Inductor, who is never the envoy |
+| `kc_seal` | `sign`, `sealed` | a seal's CBOR manifest, which each replica rebuilds and signs; then the manifest with every signature |
+| `kc_conduct` | `sign` | a conduct record (anathema, lift) for a co-reporter |
+
+The bytes are opaque here and bounded like every co-sign ask
+(`AT_COSIGN_BYTES_MAX`, 6144 hex characters).
+
+**The compact view** rides the policy carrier under the key `"<did>#compact"`:
+the community's root-signed account of the compacts it sits in and how each
+community it knows stands with it. The core carries it as it carries a
+policy, opaque, and the newer seq replaces the older. Each followed community
+can now use two slots, so `COMMUNITIES_MAX` is 64 in C and Python.
+
+**Tests.** `cosign_test.c` asserts every pair above and its near-misses. Nine
+conformance scenarios (`cosign-ask-{compact-act,rite,commitment,kc-record,
+kc-seal,kc-attest,kc-recite,kc-conduct}-delivered` and
+`community-compact-view-carried-and-survives-reload`) cover them on both
+runtimes. `../test/cohort/compact_cohort.sh` runs it live.

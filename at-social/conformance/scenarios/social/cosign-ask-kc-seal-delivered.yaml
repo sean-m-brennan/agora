@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: cosign-ask-kc-seal-delivered
+byte_pinning: false
+description: |
+    A sealed manifest (Phase 5) rides the carrier: the content addresses and
+    signatures every replica rebuilds the same seal from, never the seal.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_cosign_request
+    payload:
+      record: kc_seal
+      op: sealed
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      cid: "b3:7d3f1c9a2b4e6f80112233445566778899aabbccddeeff00123456789abc1500"
+      bytes: "a3011a0066"
+      seq: 1
+      ts: 0
+    description: |
+        bg's ask, carrying the exported canonical bytes the newcomer's app
+        reads before it signs.
+
+expected_state:
+  newcomer:
+    cosign_request_last:
+      bg:
+        record: kc_seal
+        op: sealed
+        cid: "b3:7d3f1c9a2b4e6f80112233445566778899aabbccddeeff00123456789abc1500"
+        bytes: "a3011a0066"
+        seq: 1

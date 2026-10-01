@@ -19,8 +19,10 @@ import 'package:flutter/material.dart';
 
 import '../ffi/at_peer.dart';
 import '../model/community_policy.dart';
+import '../model/compact_book.dart';
 import '../model/staff_roster.dart';
 import '../node/peer_stream.dart';
+import 'compacts_view.dart';
 
 class CommunitiesPage extends StatelessWidget {
   const CommunitiesPage({super.key, required this.service});
@@ -49,9 +51,28 @@ class CommunitiesPage extends StatelessWidget {
               ),
             );
           }
+          final mates = service.compactMates
+              .where((d) => !book.followed.containsKey(d) && !book.heard.containsKey(d))
+              .toList()
+            ..sort();
           return ListView(
             padding: const EdgeInsets.all(8),
             children: [
+              if (mates.isNotEmpty)
+                Card(
+                  key: const Key('compact-mates'),
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Text('In compact with your communities'),
+                      const Text(
+                          'Their policies reach you once one of their members carries it near you.',
+                          style: TextStyle(fontSize: 12)),
+                      for (final d in mates)
+                        Text(d, style: const TextStyle(fontFamily: 'monospace', fontSize: 11)),
+                    ]),
+                  ),
+                ),
               for (final did in dids)
                 _CommunityCard(
                   service: service,
@@ -103,6 +124,16 @@ class _CommunityCard extends StatelessWidget {
                 '${member ? ' · you are a member' : ''}'
                 '${service.canModerate(did) ? ' · you moderate' : ''}',
                 style: small),
+            if (standingBadge(service.standingOfCommunity(did) ?? CompactStanding.outside)
+                case final badge?)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Chip(
+                  key: Key('standing-$did'),
+                  label: Text(badge, style: const TextStyle(fontSize: 12)),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
             const SizedBox(height: 8),
             ..._rules(shown, small),
             const SizedBox(height: 8),
@@ -145,6 +176,12 @@ class _CommunityCard extends StatelessWidget {
                         (followed ?? heard)?.moderators ?? const []),
                     child: const Text('Moderators…'),
                   ),
+                  OutlinedButton(
+                    key: const Key('open-compacts'),
+                    onPressed: () => Navigator.of(context).push(MaterialPageRoute<void>(
+                        builder: (_) => CompactsPage(service: service))),
+                    child: const Text('Compacts…'),
+                  ),
                 ],
               ),
           ],
@@ -176,8 +213,9 @@ class _CommunityCard extends StatelessWidget {
 }
 
 /// The deciders and whom to ask, the two picks every roll act needs.
-class _Signers extends StatefulWidget {
-  const _Signers({
+class Signers extends StatefulWidget {
+  const Signers({
+    super.key,
     required this.service,
     required this.roster,
     required this.need,
@@ -194,10 +232,10 @@ class _Signers extends StatefulWidget {
   final VoidCallback onChanged;
 
   @override
-  State<_Signers> createState() => _SignersState();
+  State<Signers> createState() => _SignersPickState();
 }
 
-class _SignersState extends State<_Signers> {
+class _SignersPickState extends State<Signers> {
   static String _hex(List<int> u) =>
       u.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
 
@@ -238,7 +276,7 @@ class _SignersState extends State<_Signers> {
   }
 }
 
-List<AgoraPeer> _askPeers(PeerService service, Set<String> ask) {
+List<AgoraPeer> askPeersOf(PeerService service, Set<String> ask) {
   String hex(List<int> u) =>
       u.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
   return service.peers.where((p) => ask.contains(hex(p.uuid))).toList();
@@ -278,6 +316,11 @@ class _PolicyDialogState extends State<_PolicyDialog> {
   late final Map<String, LabelAction> _labels = {
     ...?widget.current?.labels,
   };
+  // What posts from other communities do, by their standing in our compacts
+  // (Ethne D39). Seeded from the policy in force: leaving one out would loosen it.
+  late final Map<String, LabelAction> _standing = {
+    ...?widget.current?.standing,
+  };
   final _newLabel = TextEditingController();
   final _rationale = TextEditingController();
   final Set<String> _deciders = {};
@@ -307,10 +350,15 @@ class _PolicyDialogState extends State<_PolicyDialog> {
         'min_tier': _minTier,
         'daily_post_cap': cap,
         'labels': {for (final e in _labels.entries) e.key: e.value.wire},
+        if (_standing.values.any((a) => a != LabelAction.allow))
+          'standing': {
+            for (final e in _standing.entries)
+              if (e.value != LabelAction.allow) e.key: e.value.wire,
+          },
       },
       rationale: _rationale.text.trim(),
       deciderDids: _deciders.toList(),
-      askPeers: _askPeers(widget.service, _ask),
+      askPeers: askPeersOf(widget.service, _ask),
     );
     if (ax == null) {
       setState(() => _error = widget.service.lastCommunityError);
@@ -405,13 +453,33 @@ class _PolicyDialogState extends State<_PolicyDialog> {
                 },
               ),
             ]),
+            const SizedBox(height: 8),
+            const Text('Posts made in other communities, by their standing in our compacts'),
+            for (final (key, label) in const [
+              ('Probationary', 'probationary'),
+              ('Denied', 'refused by our compact'),
+              ('Anathema', 'anathema'),
+              ('Outside', 'outside our compacts'),
+            ])
+              Row(children: [
+                Expanded(child: Text(label)),
+                DropdownButton<LabelAction>(
+                  key: Key('policy-standing-$key'),
+                  value: _standing[key] ?? LabelAction.allow,
+                  items: [
+                    for (final a in LabelAction.values)
+                      DropdownMenuItem(value: a, child: Text(a.name)),
+                  ],
+                  onChanged: (v) => setState(() => _standing[key] = v ?? LabelAction.allow),
+                ),
+              ]),
             TextField(
               key: const Key('policy-rationale'),
               controller: _rationale,
               decoration: const InputDecoration(labelText: 'Why (recorded)'),
             ),
             const SizedBox(height: 8),
-            _Signers(
+            Signers(
               service: widget.service,
               roster: widget.roster,
               need: '$majority to tighten, ${majority + 1} to loosen',
@@ -485,7 +553,7 @@ class _ModeratorDialogState extends State<_ModeratorDialog> {
       confer: _confer,
       rationale: _rationale.text.trim(),
       deciderDids: _deciders.toList(),
-      askPeers: _askPeers(widget.service, _ask),
+      askPeers: askPeersOf(widget.service, _ask),
     );
     if (ax == null) {
       setState(() => _error = widget.service.lastCommunityError);
@@ -530,7 +598,7 @@ class _ModeratorDialogState extends State<_ModeratorDialog> {
               controller: _rationale,
               decoration: const InputDecoration(labelText: 'Why (recorded)'),
             ),
-            _Signers(
+            Signers(
               service: widget.service,
               roster: widget.roster,
               need: '$majority needed',

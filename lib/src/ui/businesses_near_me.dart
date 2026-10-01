@@ -17,6 +17,7 @@
 import 'package:flutter/material.dart' hide ConnectionState;
 
 import '../model/business.dart';
+import '../model/compact_book.dart';
 import '../node/peer_stream.dart';
 import 'staff_roster.dart';
 
@@ -46,13 +47,31 @@ class BusinessesNearMePage extends StatelessWidget {
       body: ListenableBuilder(
         listenable: service,
         builder: (context, _) {
-          final businesses = service.businesses;
+          // Reach (Phase 5): businesses that sit in a compact with a community
+          // this reader follows come first, under their own heading.
+          final mates = service.compactMates;
+          final all = service.businesses;
+          final fromCompact = [for (final b in all) if (mates.contains(b.polity)) b];
+          final businesses = [for (final b in all) if (!mates.contains(b.polity)) b];
           return ListView(
             children: [
               const _DirectoryLegend(),
               if (service.businessesUnverified > 0)
                 _UnverifiedNotice(count: service.businessesUnverified),
-              if (businesses.isEmpty) const _EmptyDirectory(),
+              if (all.isEmpty) const _EmptyDirectory(),
+              if (fromCompact.isNotEmpty)
+                const Padding(
+                  key: Key('from-your-compact'),
+                  padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
+                  child: Text('From your compact'),
+                ),
+              for (final b in fromCompact)
+                _BusinessTile(business: b, service: service),
+              if (fromCompact.isNotEmpty && businesses.isNotEmpty)
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
+                  child: Text('Near you'),
+                ),
               for (final b in businesses)
                 _BusinessTile(business: b, service: service),
             ],
@@ -158,6 +177,13 @@ class _BusinessTile extends StatelessWidget {
                         fontWeight: FontWeight.bold, fontSize: 16),
                   ),
                 ),
+                if (standingBadge(service.standingOfCommunity(business.polity) ?? CompactStanding.outside)
+                    case final badge?)
+                  Chip(
+                    key: Key('business-standing-${business.polity}'),
+                    visualDensity: VisualDensity.compact,
+                    label: Text(badge, style: const TextStyle(fontSize: 11)),
+                  ),
                 if (mySat != null)
                   Chip(
                     key: const Key('business-my-vouch'),

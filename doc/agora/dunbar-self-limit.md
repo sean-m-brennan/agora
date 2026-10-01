@@ -37,7 +37,7 @@ deterministic given a seed. Each simulated day the agent:
 3. reads the `BudgetLedger` and records the **affordable** strong-tie count
    (strong ties within `B`) — the active network, the quantity that self-limits.
 
-`test/dunbar_self_limit_test.dart` asserts the behaviour and prints the curve.
+`test/dunbar_self_limit_test.dart` asserts the behavior and prints the curve.
 
 ## Result
 

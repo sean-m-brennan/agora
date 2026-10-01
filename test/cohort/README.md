@@ -66,6 +66,7 @@ exists.
 | `community_policy_cohort.sh` | 4 | Ethne | Phase 4 communities: a policy the roll set is carried by members, verified on arrival, and applied only by a follower; a moderator's label reaches followers only; loosening needs more than a majority; an unseated moderator stops counting |
 | `hub_cohort.sh` | 5, two segments | Ethne | Phase 4 proximity hubs: two islands with no route between them meet at their community's area hub. The roll seats the hub, its roster rides inside the policy, only people listed in the area see who is, a listing outside the hub's area is refused, a request becomes a direct peer only on the other's yes, and withdrawing takes effect at once |
 | `device_cohort.sh` | 5, routed /30 links | libsodium | Phase 4 multi-device: a contact added and verified by safety number, a pairing refused across operators and accepted within one, the address book following to the new device, the contact filing it under the same person (live and in the list), a DM reaching the other device, and a lost-both restore from a 0600 backup that keeps the contact verified and links a third device |
+| `compact_cohort.sh` | 5 | Ethne | Phase 5 federation: three communities seal their kith-covenant rites (one recited by an Inductor on its own device), two found a compact by detached co-signing, the third is sponsored, examined by a panel of 3 and admitted, two anathematize it, a policy hides its posts by standing (D39), and a forged or older compact view is refused |
 
 ### `two_node_cohort.sh`
 
@@ -253,7 +254,7 @@ the Flutter app makes. The phases:
 2. policy v1 (daily cap 2, "spoiler" warns, "nsfw" hides) is carried by
    `keeper`, reaches `cal` and `dee`, and verifies out of the received bytes;
    `cal` follows, `dee` does not;
-3. `keeper` posts three times in the community's name, the first labelled
+3. `keeper` posts three times in the community's name, the first labeled
    "spoiler": at `cal` the first is behind a warning, the second shows, and the
    third is over the cap and hidden; `dee` receives all three with their scope
    intact and applies nothing;
@@ -270,6 +271,49 @@ netns only.
 
 ```
 sudo -E env "PATH=$PATH" ./test/cohort/community_policy_cohort.sh
+```
+
+### `compact_cohort.sh`
+
+Five nodes on one segment, three communities (Alpha, Beta, Gamma), each founded
+by its own three-member roll. `agov`, `bgov` and `cgov` are the governance
+nodes: each holds its community's root key and its envoy. `awit` holds Alpha's
+second member, who is Alpha's Inductor and, later, one of its seated examiners.
+`reader` hears every policy and compact view. The driver plays the app: each
+node runs one agent, the Python twin of `lib/src/node/compact_engine.dart`,
+which keeps the node's KC replica and does every KC step through the Ethne
+cdylib. Records travel as `kc_record/deliver` asks and come back as receipts.
+Seals travel as CBOR manifests that each replica rebuilds and signs
+(`kc_seal/sign`), then as the assembled note (`kc_seal/sealed`). No private key
+leaves its node. The phases:
+
+1. three foundings, discovery, and three sealed KC rites. Alpha's recitation is
+   signed on `awit` by its Inductor (`kc_attest/recite`), never by the envoy:
+   KC holds one delegation per speaker;
+2. both rolls decide Join (D40). The envoys exchange anti-spiral claims and
+   verdicts and co-sign the founding seal. Both replicas, and Alpha's signed
+   view as the reader holds it, say `in_compact`;
+3. Gamma's roll joins, Alpha's sponsors, and both sitting rolls admit. Alpha
+   seats two examiners (one on `awit`) and Beta one, a panel of 3 from 2
+   communities. Alpha relays its whole replica to `awit`, so the examiner can
+   rebuild the seal it signs. The seal lands with four signatures, and Gamma
+   reads `probationary` everywhere;
+4. both rolls decide Anathematize at majority + 1. Beta co-signs Alpha's
+   SecondClass conduct record, and Gamma is `anathema` in every replica and in
+   Alpha's view;
+5. Gamma posts. Under Alpha's policy (`standing: {Anathema: Hide}`) and Alpha's
+   view, the reader's verdict on that post is Hide; on a post in Beta's name it
+   is Allow;
+6. a view edited after signing does not verify, and Alpha's founding view,
+   offered again, does not replace the newest one.
+
+Reach (compact-mates' businesses and the "In compact with your communities"
+card) and the badges are app-side reads of the same view and are pinned by
+`test/compact_test.dart`. A refused ceremony (Denied) is pinned in-process by
+`native/ethne_ffi`'s kc tests. netns only.
+
+```
+sudo -E env "PATH=$PATH" ./test/cohort/compact_cohort.sh
 ```
 
 
@@ -314,9 +358,9 @@ All options are environment variables.
 | `SUBNET` | per script, below | all but `drive_ethne_half` | First three octets of the /24. Each script has its own subnet and bridge name. |
 | `GEO` | `u4pruy` | 3-node cohorts | The shared coarse geohash bucket the nodes advertise |
 | `AGORA_DIR` | the script's `../..` | all | The agora checkout to test |
-| `AGORA_ETHNE_PATH` | `native/build/libethne_agora.so` | business, business_post, staff, drive_ethne_half, community_policy, hub | The Ethne cdylib |
+| `AGORA_ETHNE_PATH` | `native/build/libethne_agora.so` | business, business_post, staff, drive_ethne_half, community_policy, hub, compact | The Ethne cdylib |
 | `DOCKER_IMAGE` | `ubuntu:26.04` | 3-node cohorts | Image for the docker backend. The host-built `agorad` is bind-mounted and its non-base libraries are staged beside it, so a stock image works. `Dockerfile.node` builds an alternative with those libraries installed. Either way, the base must match the host's Ubuntu release. |
-| `AGORA_COHORT_RUN` | see below | business_post, reputation, moderation, partition, staff, community_policy, hub, device | Run directory. Set a short path (e.g. `/tmp/ag-$$`) when a deep checkout makes the node socket paths exceed 108 bytes; the preflight refuses and says so. netns only: docker can bind-mount only paths it shares with the daemon. |
+| `AGORA_COHORT_RUN` | see below | business_post, reputation, moderation, partition, staff, community_policy, hub, device, compact | Run directory. Set a short path (e.g. `/tmp/ag-$$`) when a deep checkout makes the node socket paths exceed 108 bytes; the preflight refuses and says so. netns only: docker can bind-mount only paths it shares with the daemon. |
 
 ### Per script
 
@@ -333,13 +377,14 @@ All options are environment variables.
 | `hub_cohort.sh` | 120 | `10.9.8` + `10.9.9` (`SUBNET_A`, `SUBNET_B`) | `POLICY_SEC` (as community_policy, default 10); `LOG_LEVEL` (default 2). Bridges `agbr8` + `agbr9`; the hub has a leg on each with `ip_forward=0` |
 | `moderation_cohort.sh` | 90 | `10.9.5` | `GATE_WINDOW` (how long a negative waits, default 20); `NEUTRAL` (`AT_REP_NEUTRAL`, default 0.70); `RESCORE_SEC` (`AT_REP_RESCORE_SEC`, default 5); `CHECKPOINT_SEC` (default 20) |
 | `device_cohort.sh` | 120 | `10.9.10` (one /30 per node behind router netns `agdvrouter`) | `LOG_LEVEL` (default 2). Operator keys are random per run and never written to a node |
+| `compact_cohort.sh` | 180 | `10.9.11` (bridge `agbr11`) | `POLICY_SEC` (as community_policy, default 10; the compact view rides the same carrier); `LOG_LEVEL` (default 2). Each node's app log is `<run>/<node>.agent.log` |
 
 ## Where the evidence goes
 
 Each run writes its node roots, `agorad.log` files and driver logs to a run
 directory:
 
-- `business_post`, `reputation`, `moderation`, `partition`, `staff`, `hub`, `device`: `.coh/<tag>-<pid>/`
+- `business_post`, `reputation`, `moderation`, `partition`, `staff`, `hub`, `device`, `compact`: `.coh/<tag>-<pid>/`
   under the agora directory (`staff` falls back to `/tmp/ag-<pid>` under netns
   when the checkout is too deep). **These are kept on failure** as well as with
   `KEEP=1`, so a failed host run can be read afterwards.

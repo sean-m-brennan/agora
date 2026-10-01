@@ -26,6 +26,11 @@ en-archive = { path = "../../../../lib/ethne/src/rust/en-archive" }
 en-uplift = { path = "../../../../lib/ethne/src/rust/en-uplift" }
 kc-core = { path = "../../../../lib/kith-covenant/src/rust/kc-core" }
 kc-identity = { path = "../../../../lib/kith-covenant/src/rust/kc-identity" }
+# Phase 5 (Ethne D39, D40): the community at KC's border as a member of compacts.
+kc-ceremony = { path = "../../../../lib/kith-covenant/src/rust/kc-ceremony" }
+kc-archive = { path = "../../../../lib/kith-covenant/src/rust/kc-archive" }
+kc-reputation = { path = "../../../../lib/kith-covenant/src/rust/kc-reputation" }
+kc-conduct = { path = "../../../../lib/kith-covenant/src/rust/kc-conduct" }
 # S3 detached signing moves canonical CBOR across the C ABI as hex.
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }

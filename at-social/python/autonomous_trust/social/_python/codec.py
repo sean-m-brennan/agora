@@ -398,7 +398,7 @@ COMMUNITY_DID_MAX = 95
 COMMUNITY_POLICY_BUNDLE_MAX = 4096
 POST_LABEL_BUNDLE_MAX = 1536
 COMMUNITY_ID_HEX_LEN = 64
-COMMUNITIES_MAX = 32
+COMMUNITIES_MAX = 64
 
 
 def community_post_id_valid(pid) -> bool:
@@ -781,6 +781,17 @@ COSIGN_OPS = {
     # offered, as a departure is not. Twin of C at_cosign_op_ok.
     'content_policy': ('amend',),
     'office': ('confer', 'revoke'),
+    # Phase 5 federation (Ethne D39, D40): compact acts, the rite and the
+    # commitments behind it, and the KC records (a delivery, a seal ask and the
+    # sealed manifest, a witness attestation, a reporter's conduct signature).
+    # Twin of C at_cosign_op_ok.
+    'compact': ('join', 'admit', 'sponsor', 'refuse', 'anathema', 'lift'),
+    'rite': ('movement', 'affirm'),
+    'commitment': ('amend',),
+    'kc_record': ('deliver',),
+    'kc_seal': ('sign', 'sealed'),
+    'kc_attest': ('attest', 'recite'),
+    'kc_conduct': ('sign',),
 }
 
 _COSIGN_HEX = frozenset('0123456789abcdef')

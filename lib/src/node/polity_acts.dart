@@ -44,6 +44,23 @@ abstract class PolityActs {
 ///
 /// A separate interface from [PolityActs] so an expulsion-only fake need not
 /// grow; the production implementation serves both.
+/// The roll's compact acts (SOCIAL_APP_PLAN Phase 5; Ethne D40), on the same
+/// detached co-signing exchange, under the record class `compact`. Its own
+/// interface so a policy-only fake need not grow.
+abstract class CompactGovernance {
+  /// Begin a compact act: [kind] is `Join`, `Admit`, `Sponsor`, `Refuse`,
+  /// `Anathematize` or `Lift`. A sponsorship names [probationDays].
+  Map<String, dynamic> pendingCompactAct({
+    required String polityDid,
+    required String kind,
+    required String compact,
+    required List<String> counterparties,
+    int? probationDays,
+    required String rationale,
+    required List<String> deciderDids,
+  });
+}
+
 abstract class CommunityGovernance {
   /// Begin replacing the policy of [polityDid] with [policy] (Ethne
   /// `ContentPolicy` JSON). A majority tightens; loosening needs more.

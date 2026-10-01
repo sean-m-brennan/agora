@@ -19,6 +19,7 @@ import '../model/business.dart';
 import '../model/business_directory.dart';
 import '../model/business_post.dart';
 import '../model/community_policy.dart';
+import '../model/compact_book.dart';
 import '../model/community_policy_store.dart';
 import '../model/cosign_exchanges.dart';
 import '../model/device_cert.dart';
@@ -35,6 +36,8 @@ import '../model/staff_roster.dart';
 import '../model/tie_settings.dart';
 import '../model/tie_strength.dart';
 import 'agora_daemon.dart';
+import 'compact_border.dart';
+import 'compact_engine.dart';
 import 'moderation_verbs.dart';
 import 'polity_acts.dart';
 
@@ -56,7 +59,9 @@ class PeerService extends ChangeNotifier {
     @visibleForTesting PolityActs? polityActs,
     @visibleForTesting CommunityCrypto? communityCrypto,
     @visibleForTesting CommunityGovernance? communityGovernance,
+    @visibleForTesting ViewVerifier? viewVerifier,
   })  : _daemon = daemon ?? _defaultDaemon(),
+        _viewVerifierOverride = viewVerifier,
         _communityCryptoOverride = communityCrypto,
         _governanceOverride = communityGovernance,
         _polityActsOverride = polityActs,
@@ -99,6 +104,10 @@ class PeerService extends ChangeNotifier {
   /// Test-only stand-ins for the community-policy crypto and the roll acts
   /// behind it (Phase 4). Null in the app, where the cdylib does both.
   final CommunityCrypto? _communityCryptoOverride;
+
+  /// Test-only stand-in for verifying a compact view (Phase 5). Null in the
+  /// app, where the cdylib checks the community's root signature.
+  final ViewVerifier? _viewVerifierOverride;
   final CommunityGovernance? _governanceOverride;
 
   /// Build the default daemon. When $AGORA_EXTERNAL_DAEMON is set (to a non-empty
@@ -1052,6 +1061,14 @@ class PeerService extends ChangeNotifier {
   bool _ingestCosignRequest(AtRawEvent e) {
     if (e.kind != agoraEventCosignRequest) return false;
     _peers.putIfAbsent(_hex(e.uuid), () => _newPeer(e.uuid));
+    // A compact ask the roll already decided is answered by the engine (Phase 5).
+    final engine = compactEngine;
+    if (engine != null &&
+        engine.onRequest(
+            fromNode: _hex(e.uuid), record: e.cosignRecord, op: e.cosignOp, cid: e.cosignCid, bytes: e.cosignBytes)) {
+      notifyListeners();
+      return true;
+    }
     _cosign.addRequest(CosignExchange.fromEvent(e));
     return true;
   }
@@ -1062,6 +1079,12 @@ class PeerService extends ChangeNotifier {
   bool _ingestCosignSignature(AtRawEvent e) {
     if (e.kind != agoraEventCosignSignature) return false;
     _peers.putIfAbsent(_hex(e.uuid), () => _newPeer(e.uuid));
+    final engine = compactEngine;
+    if (engine != null &&
+        engine.onSignature(fromNode: _hex(e.uuid), cid: e.cosignCid, signerDid: e.cosignSignerDid, sig: e.cosignSig)) {
+      notifyListeners();
+      return true;
+    }
     _cosign.addSignature(CosignSignature.fromEvent(e));
     return true;
   }
@@ -1511,6 +1534,8 @@ class PeerService extends ChangeNotifier {
   /// policy of the community this node is a member of is followed on sight.
   bool _ingestCommunityPolicy(AtRawEvent e) {
     if (e.kind != agoraEventCommunityPolicy) return false;
+    final viewOf = communityOfViewKey(e.policyCommunity);
+    if (viewOf != null) return _ingestCompactView(e, viewOf);
     final read = _crypto?.verifyPolicy(e.policyBundle);
     if (read == null) return true;
     final policy = CommunityPolicy.fromVerified(read, e.policyBundle);
@@ -1552,6 +1577,51 @@ class PeerService extends ChangeNotifier {
   /// a non-follower would.
   PolicyVerdict? verdictFor(Post p) {
     if (p.community.isEmpty) return null;
+    final own = _ownVerdictFor(p);
+    final byStanding = standingVerdictFor(p);
+    if (byStanding == null) return own;
+    if (own == null || byStanding.action.index > own.action.index) return byStanding;
+    return own;
+  }
+
+  /// What the communities this reader follows say about a post made in ANOTHER
+  /// community's name, by that community's standing in their compacts (Ethne
+  /// D39). The strictest applies. Null when none of them has a rule for it.
+  PolicyVerdict? standingVerdictFor(Post p) {
+    if (p.community.isEmpty) return null;
+    PolicyVerdict? strictest;
+    for (final did in communities.followed.keys) {
+      if (did == p.community) continue;
+      final policy = communities.applying(did);
+      final view = compactBook.views[did];
+      if (policy == null || view == null || policy.standing.isEmpty) continue;
+      final standing = view.standings[p.community] ?? CompactStanding.outside;
+      final word = switch (standing) {
+        CompactStanding.inCompact => 'in_compact',
+        CompactStanding.probationary => 'probationary',
+        CompactStanding.denied => 'denied',
+        CompactStanding.anathema => 'anathema',
+        CompactStanding.outside => 'outside',
+      };
+      final action = switch (policy.actionForStanding(word)) {
+        LabelAction.hide => PolicyAction.hide,
+        LabelAction.warn => PolicyAction.warn,
+        LabelAction.allow => PolicyAction.show,
+      };
+      if (action == PolicyAction.show) continue;
+      if (strictest == null || action.index > strictest.action.index) {
+        strictest = PolicyVerdict(
+          communityDid: did,
+          action: action,
+          reasons: [PolicyReason('compact_standing', {'standing': word, 'community': p.community})],
+          tags: const [],
+        );
+      }
+    }
+    return strictest;
+  }
+
+  PolicyVerdict? _ownVerdictFor(Post p) {
     final policy = communities.applying(p.community);
     final crypto = _crypto;
     if (policy == null || crypto == null) return null;
@@ -1586,6 +1656,11 @@ class PeerService extends ChangeNotifier {
     final p = communities.follow(did);
     if (p == null) return false;
     _events?.followCommunity(_daemon.queues.appToAt, did, p.bundle, seq: p.seq);
+    // Carry its compact view beside its policy (Phase 5).
+    final v = compactBook.views[did];
+    if (v != null) {
+      _events?.followCommunity(_daemon.queues.appToAt, compactViewKey(did), v.bundle, seq: v.seq);
+    }
     _installHubRoster(p);
     _saveCommunities();
     notifyListeners();
@@ -1596,12 +1671,178 @@ class PeerService extends ChangeNotifier {
     final held = communities.followed[did];
     communities.unfollow(did);
     _events?.unfollowCommunity(_daemon.queues.appToAt, did);
+    _events?.unfollowCommunity(_daemon.queues.appToAt, compactViewKey(did));
     final issuer = held?.hubRoster == null ? null : _rosterIssuer(held!.hubRoster!);
     if (issuer != null) {
       _events?.relayRosterRemove(_daemon.queues.appToAt, 'roster', issuer);
     }
     _saveCommunities();
     notifyListeners();
+  }
+
+  // --- federation: kith-covenant compacts (Phase 5; Ethne D39, D40) ---------
+
+  /// Every compact view this reader has heard, the highest seq per community.
+  CompactBook compactBook = CompactBook();
+  File? _compactBookFile;
+
+  /// This staff node's part in its community's compacts; null on a node that is
+  /// staff of no polity, or where the cdylib is absent.
+  CompactEngine? compactEngine;
+  EthneKc? _kcReplica;
+  File? _compactEngineFile;
+  Timer? _compactSave;
+
+  Map<String, dynamic>? _verifyView(String bundle) {
+    final override = _viewVerifierOverride;
+    if (override != null) return override(bundle);
+    return _ethneLib()?.compactViewVerify(bundle);
+  }
+
+  /// The communities this reader reads standing through: the ones it follows,
+  /// and its own.
+  List<String> get readerCommunities => {
+        ...communities.followed.keys,
+        if (ownPolityDid != null) ownPolityDid!,
+      }.toList();
+
+  /// How [communityDid] stands with the communities this reader follows, or null
+  /// when none of them has said.
+  CompactStanding? standingOfCommunity(String communityDid) =>
+      compactBook.standingOf(communityDid, readerCommunities);
+
+  /// Communities sharing a compact with one this reader follows.
+  Set<String> get compactMates => compactBook.compactMates(readerCommunities);
+
+  bool _ingestCompactView(AtRawEvent e, String community) {
+    final read = _verifyView(e.policyBundle);
+    if (read == null || read['community_did'] != community) return true;
+    final v = CompactView.fromVerified(read, e.policyBundle);
+    if (compactBook.hear(v)) {
+      // Carry it on for a community this reader follows, as its policy is.
+      if (communities.followed.containsKey(community) || community == ownPolityDid) {
+        _events?.followCommunity(_daemon.queues.appToAt, compactViewKey(community), v.bundle, seq: v.seq);
+      }
+      if (community == ownPolityDid) {
+        compactEngine?.compactsWeSitIn = [for (final c in v.compacts) c.label];
+      }
+      _saveCompactBook();
+      notifyListeners();
+    }
+    return true;
+  }
+
+  void _saveCompactBook() {
+    final f = _compactBookFile;
+    if (f == null) return;
+    try {
+      f.writeAsStringSync(jsonEncode(compactBook.toJson()));
+    } on Object {
+      // Best-effort: the views are heard again.
+    }
+  }
+
+  void _scheduleCompactSave() {
+    _compactSave?.cancel();
+    _compactSave = Timer(const Duration(seconds: 1), _saveCompactEngine);
+  }
+
+  void _saveCompactEngine() {
+    final f = _compactEngineFile;
+    final engine = compactEngine;
+    if (f == null || engine == null) return;
+    try {
+      f.writeAsStringSync(engine.toJsonString());
+    } on Object {
+      // Best-effort; the next change saves again.
+    }
+  }
+
+  /// Where deliveries go: the governance nodes of the communities this one works
+  /// with (its partners, and every community its own view says it shares a
+  /// compact with), as their own views name them.
+  List<String> _compactRecipients() {
+    final own = ownPolityDid;
+    final dids = <String>{
+      ...?compactEngine?.partners,
+      if (own != null)
+        for (final e in (compactBook.views[own]?.standings ?? const <String, CompactStanding>{}).entries)
+          if (e.value == CompactStanding.inCompact || e.value == CompactStanding.probationary) e.key,
+    };
+    return [
+      for (final d in dids)
+        if (compactBook.nodeOf(d) != null) compactBook.nodeOf(d)!
+    ];
+  }
+
+  void _startCompactEngine() {
+    final self = staffIdentity;
+    final lib = _ethneLib();
+    final did = ownPolityDid;
+    if (self == null || _polityArchive == null || lib == null || did == null) return;
+    final file = File('${_daemon.root}/etc/at/agora.compact.json');
+    _compactEngineFile = file;
+    Map<String, dynamic> saved = const {};
+    EthneKc kc;
+    try {
+      saved = file.existsSync() ? jsonDecode(file.readAsStringSync()) as Map<String, dynamic> : const {};
+      final replica = saved['replica'];
+      kc = replica is String ? EthneKc.load(lib, replica) : EthneKc.create(lib);
+    } on Object {
+      // A replica that no longer verifies is not trusted; start afresh and let
+      // the members' re-sends fill it.
+      kc = EthneKc.create(lib);
+      saved = const {};
+    }
+    _kcReplica = kc;
+    final engine = CompactEngine(
+      border: EthneCompactBorder(
+          ffi: lib, charter: () => _polityArchive!, kc: kc, polityDid: did, self: self, root: polityRootKey),
+      transport: _PeerCompactTransport(this),
+      ownNode: _ownUuidHex,
+      members: _compactRecipients,
+      onChanged: _scheduleCompactSave,
+    )..restore(saved);
+    engine.compactsWeSitIn = [for (final c in compactBook.views[did]?.compacts ?? const []) c.label];
+    compactEngine = engine;
+  }
+
+  void _compactChanged() => notifyListeners();
+
+  /// Attach an engine built on fakes, for tests that drive [ingestEvents].
+  @visibleForTesting
+  void attachCompactEngineForTest(CompactEngine engine) => compactEngine = engine;
+
+  /// The roll deciding a compact act (Ethne D40): Join, Admit, Sponsor, Refuse,
+  /// Anathematize or Lift, in [compact], towards [counterparties]. Travels the
+  /// same co-signing exchange a policy amendment does; once it lands, the
+  /// compact panel carries out what it decided at KC's border.
+  AuthoredExchange? beginCompactAct({
+    required String kind,
+    required String compact,
+    required List<String> counterparties,
+    int? probationDays,
+    String rationale = '',
+    required List<String> deciderDids,
+    required List<AgoraPeer> askPeers,
+  }) {
+    if (_governance is! CompactGovernance) {
+      lastCommunityError = 'This node cannot decide compact acts.';
+      notifyListeners();
+      return null;
+    }
+    return _beginGovernanceAct(
+        (g, did) => (g as CompactGovernance).pendingCompactAct(
+              polityDid: did,
+              kind: kind,
+              compact: compact,
+              counterparties: counterparties,
+              probationDays: probationDays,
+              rationale: rationale,
+              deciderDids: deciderDids,
+            ),
+        subjectDid: counterparties.isEmpty ? '' : counterparties.first,
+        askPeers: askPeers);
   }
 
   // --- the address book and this person's devices (Phase 4 multi-device) ----
@@ -2264,6 +2505,18 @@ class PeerService extends ChangeNotifier {
     _communityStore = await CommunityPolicyStore(
             File('${_daemon.root}/etc/at/agora.communities.json'))
         .load((b) => _crypto?.verifyPolicy(b));
+    // The compact views this reader has heard (Phase 5), every one re-verified.
+    final compactsFile = File('${_daemon.root}/etc/at/agora.compacts.json');
+    _compactBookFile = compactsFile;
+    try {
+      if (compactsFile.existsSync()) {
+        compactBook = CompactBook.fromJson(
+            jsonDecode(compactsFile.readAsStringSync()) as Map<String, dynamic>, _verifyView);
+      }
+    } on Object {
+      compactBook = CompactBook();
+    }
+    _startCompactEngine();
 
     // Resolve our in-process event sockets under the same config root as the
     // daemon (Dart cannot setenv its own process; the shim does it in C).
@@ -2290,6 +2543,11 @@ class PeerService extends ChangeNotifier {
     for (final p in communities.followed.values) {
       _events!.followCommunity(_daemon.queues.appToAt, p.communityDid, p.bundle,
           seq: p.seq);
+      final v = compactBook.views[p.communityDid];
+      if (v != null) {
+        _events!.followCommunity(_daemon.queues.appToAt, compactViewKey(p.communityDid), v.bundle,
+            seq: v.seq);
+      }
     }
     publishOwnPolicy();
     // If the operator opted in before the channel was ready, push it now.
@@ -2316,6 +2574,7 @@ class PeerService extends ChangeNotifier {
       _ticksSinceRoster = 0;
       ev.requestRoster(_daemon.queues.appToAt);
     }
+    compactEngine?.tick();
     // Something changed the book behind our back (a sibling's sync, a pairing,
     // a restore, a link redeemed): re-list, at most once a tick.
     if (book.needsRefresh) {
@@ -2401,6 +2660,11 @@ class PeerService extends ChangeNotifier {
     // The staff identity is NOT rewritten here. S8 only reads the log and signs
     // with the key; nothing appends, so there is nothing to flush — and the file
     // holds a private key, which is not worth rewriting for no reason.
+    _compactSave?.cancel();
+    _saveCompactEngine();
+    compactEngine = null;
+    _kcReplica?.dispose();
+    _kcReplica = null;
     _polityArchive?.dispose();
     _polityArchive = null;
     _events?.close();
@@ -2512,7 +2776,7 @@ class _EthneCommunityCrypto implements CommunityCrypto {
 }
 
 /// The community's roll acts over this node's charter archive (Phase 4).
-class _ArchiveCommunityGovernance implements CommunityGovernance {
+class _ArchiveCommunityGovernance implements CommunityGovernance, CompactGovernance {
   _ArchiveCommunityGovernance(this._arc, this._lib, this._self, this._root);
   final EthneArchive _arc;
   final EthneFfi _lib;
@@ -2534,6 +2798,34 @@ class _ArchiveCommunityGovernance implements CommunityGovernance {
           rationale: rationale,
           deciderDids: deciderDids,
           policy: policy);
+
+  @override
+  Map<String, dynamic> pendingCompactAct({
+    required String polityDid,
+    required String kind,
+    required String compact,
+    required List<String> counterparties,
+    int? probationDays,
+    required String rationale,
+    required List<String> deciderDids,
+  }) =>
+      _arc.pendingChange(
+          record: 'compact',
+          op: switch (kind) {
+            'Anathematize' => 'anathema',
+            _ => kind.toLowerCase(),
+          },
+          polityDid: polityDid,
+          memberDid: '',
+          body: {
+            'polity': polityDid,
+            'kind': kind,
+            'compact': compact,
+            'counterparties': counterparties,
+            if (probationDays != null) 'probation_days': probationDays,
+            'rationale': rationale,
+            'deciders': deciderDids,
+          });
 
   @override
   Map<String, dynamic> pendingModerator({
@@ -2624,3 +2916,43 @@ class _ShimModerationVerbs implements ModerationVerbs {
           bytes: bytes) ??
       -1;
 }
+
+/// The co-sign carrier, as the compact engine uses it.
+class _PeerCompactTransport implements CompactTransport {
+  _PeerCompactTransport(this._svc);
+  final PeerService _svc;
+
+  @override
+  int ask(List<String> nodes,
+      {required String record, required String op, required String cid, required String bytes}) {
+    final did = _svc.ownPolityDid;
+    final uuids = [
+      for (final n in nodes)
+        if (_svc._peers[n] != null) _svc._peers[n]!.uuid
+    ];
+    if (did == null || uuids.isEmpty) return -1;
+    return _svc._moderationVerbs.requestCosign(uuids, record: record, op: op, polityDid: did, cid: cid, bytes: bytes);
+  }
+
+  @override
+  int answer(String node, {required String cid, required String signerDid, required String sig}) {
+    final peer = _svc._peers[node];
+    final ev = _svc._events;
+    if (peer == null || ev == null) return -1;
+    return ev.returnCosign(_svc._daemon.queues.appToAt, peer.uuid, cid: cid, signerDid: signerDid, sigHex: sig);
+  }
+
+  @override
+  void publishView(String bundle) {
+    final did = _svc.ownPolityDid;
+    final read = _svc._verifyView(bundle);
+    if (did == null || read == null) return;
+    final v = CompactView.fromVerified(read, bundle);
+    _svc.compactBook.hear(v);
+    _svc.compactEngine?.compactsWeSitIn = [for (final c in v.compacts) c.label];
+    _svc._events?.followCommunity(_svc._daemon.queues.appToAt, compactViewKey(did), bundle, seq: v.seq);
+    _svc._saveCompactBook();
+    _svc._compactChanged();
+  }
+}
+

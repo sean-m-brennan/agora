@@ -229,7 +229,7 @@ static char ID_APP_PUBLISH_POST_LABEL[] = AT_APP_PUBLISH_POST_LABEL;
  * $AT_SOCIAL_POLICY_SEC seconds (default POLICY_AD_DEFAULT_SEC). */
 #define COMMUNITY_POLICY_DEDUP_CAP 256
 #define POST_LABEL_DEDUP_CAP 256
-#define COMMUNITIES_MAX 32
+#define COMMUNITIES_MAX 64
 #define POLICY_AD_DEFAULT_SEC 300
 
 /* Forward decls: defined below beside the position handlers, but used earlier

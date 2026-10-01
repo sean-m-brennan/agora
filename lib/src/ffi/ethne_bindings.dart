@@ -13,6 +13,8 @@ import 'dart:io';
 
 import 'package:ffi/ffi.dart';
 
+part 'kc_bindings.dart';
+
 // --- Raw C signatures --------------------------------------------------------
 
 typedef _LastErrorC = Pointer<Utf8> Function();
@@ -74,7 +76,8 @@ class EthneKeypair {
 /// `$AGORA_ETHNE_PATH`, else a conventional `native/build/libethne_agora.so`.
 class EthneFfi {
   EthneFfi._(DynamicLibrary lib)
-      : _lastError =
+      : _lib = lib,
+        _lastError =
             lib.lookupFunction<_LastErrorC, _LastErrorC>('ethne_last_error'),
         _stringFree = lib
             .lookupFunction<_StringFreeC, _StringFreeDart>('ethne_string_free'),
@@ -227,6 +230,9 @@ class EthneFfi {
   final _HandleSpecDart _amendContentPolicy;
   final _HandleSpecDart _conferOffice;
   final _HandleSpecDart _revokeOffice;
+  /// The library itself, for the kith-covenant border (kc_bindings.dart), whose
+  /// calls are looked up on first use.
+  final DynamicLibrary _lib;
   final _HandleSpecDart _declareRelayEndpoint;
   final _StateDart _contentPolicyState;
   final _StateDart _contentPolicySign;
@@ -676,6 +682,7 @@ class EthneArchive {
     String? unbackedReason,
     Map<String, dynamic>? policy,
     String? office,
+    Map<String, dynamic>? body,
   }) =>
       jsonDecode(_callSpecOut(_ffi._pending, {
         'record': record,
@@ -689,6 +696,7 @@ class EthneArchive {
         if (unbackedReason != null) 'unbacked_reason': unbackedReason,
         if (policy != null) 'policy': policy,
         if (office != null) 'office': office,
+        if (body != null) 'body': body,
       })) as Map<String, dynamic>;
 
   /// Close a detached exchange: attach [signatures] and append.

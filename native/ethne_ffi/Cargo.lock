@@ -321,8 +321,12 @@ dependencies = [
  "en-core",
  "en-uplift",
  "hex",
+ "kc-archive",
+ "kc-ceremony",
+ "kc-conduct",
  "kc-core",
  "kc-identity",
+ "kc-reputation",
  "serde",
  "serde_json",
 ]
@@ -422,6 +426,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kc-archive"
+version = "0.1.0"
+dependencies = [
+ "kc-ceremony",
+ "kc-commons",
+ "kc-conduct",
+ "kc-constitution",
+ "kc-core",
+ "kc-escalation",
+ "kc-identity",
+ "kc-log",
+ "kc-mediation",
+ "kc-observer",
+ "kc-principal",
+ "kc-provenance",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "kc-ceremony"
 version = "0.1.0"
 dependencies = [
@@ -433,10 +458,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "kc-commons"
+version = "0.1.0"
+dependencies = [
+ "kc-conduct",
+ "kc-core",
+ "serde",
+]
+
+[[package]]
 name = "kc-conduct"
 version = "0.1.0"
 dependencies = [
  "kc-ceremony",
+ "kc-core",
+ "serde",
+]
+
+[[package]]
+name = "kc-constitution"
+version = "0.1.0"
+dependencies = [
+ "kc-conduct",
  "kc-core",
  "serde",
 ]
@@ -461,6 +504,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kc-escalation"
+version = "0.1.0"
+dependencies = [
+ "kc-ceremony",
+ "kc-conduct",
+ "kc-core",
+ "serde",
+]
+
+[[package]]
 name = "kc-identity"
 version = "0.1.0"
 dependencies = [
@@ -477,6 +530,58 @@ dependencies = [
  "kc-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "kc-mediation"
+version = "0.1.0"
+dependencies = [
+ "kc-conduct",
+ "kc-core",
+ "serde",
+]
+
+[[package]]
+name = "kc-observer"
+version = "0.1.0"
+dependencies = [
+ "kc-core",
+ "serde",
+]
+
+[[package]]
+name = "kc-principal"
+version = "0.1.0"
+dependencies = [
+ "kc-core",
+ "serde",
+]
+
+[[package]]
+name = "kc-provenance"
+version = "0.1.0"
+dependencies = [
+ "kc-core",
+ "serde",
+]
+
+[[package]]
+name = "kc-reputation"
+version = "0.1.0"
+dependencies = [
+ "kc-archive",
+ "kc-ceremony",
+ "kc-commons",
+ "kc-conduct",
+ "kc-constitution",
+ "kc-core",
+ "kc-escalation",
+ "kc-identity",
+ "kc-mediation",
+ "kc-observer",
+ "kc-principal",
+ "kc-provenance",
+ "serde",
 ]
 
 [[package]]

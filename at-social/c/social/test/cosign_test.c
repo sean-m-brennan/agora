@@ -81,6 +81,22 @@ DEFINE_TEST(test_only_known_acts_are_carried)
     ck_assert(!at_cosign_op_ok("membership", "designate"));
     ck_assert(!at_cosign_op_ok("guardian", "admit"));
     ck_assert(!at_cosign_op_ok("treaty", "sign"));
+    /* Phase 5 federation: the compact acts, the rite, the commitments, and the
+     * KC records, and nothing beside them. */
+    ck_assert(at_cosign_op_ok("compact", "join"));
+    ck_assert(at_cosign_op_ok("compact", "anathema"));
+    ck_assert(at_cosign_op_ok("rite", "movement"));
+    ck_assert(at_cosign_op_ok("rite", "affirm"));
+    ck_assert(at_cosign_op_ok("commitment", "amend"));
+    ck_assert(at_cosign_op_ok("kc_record", "deliver"));
+    ck_assert(at_cosign_op_ok("kc_seal", "sign"));
+    ck_assert(at_cosign_op_ok("kc_seal", "sealed"));
+    ck_assert(at_cosign_op_ok("kc_attest", "attest"));
+    ck_assert(at_cosign_op_ok("kc_attest", "recite"));
+    ck_assert(at_cosign_op_ok("kc_conduct", "sign"));
+    ck_assert(!at_cosign_op_ok("compact", "expel"));
+    ck_assert(!at_cosign_op_ok("kc_record", "sign"));
+    ck_assert(!at_cosign_op_ok("kc_seal", "deliver"));
     ck_assert(!at_cosign_op_ok(NULL, "admit"));
 
     /* Phase 4 communities: the roll replacing its content policy, and seating

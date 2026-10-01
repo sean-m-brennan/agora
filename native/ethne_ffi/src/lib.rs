@@ -40,12 +40,16 @@ use en_charter::{
     EnvoyKind, FoundingProposal, GuardianChange, GuardianEvidence, GuardianKind, MemberReading,
     MembershipChange, MembershipKind, Movement, Observation, PolityCharter, RelayEndpoint,
     RiteMovement, Substrate,
+    CommitmentAmendment, CompactAct, CompactActKind,
 };
 use en_core::{keys, time, Alg, Cid, DidKey, PrivKey, PubKey, Signed, Timestamp};
 use en_uplift::{community_identity, envoy_delegation, member_roll, rendezvous_roster};
 use kc_core::canonical;
 use kc_identity::{MemberRoll, SpeakerDelegation};
 use serde::{Deserialize, Serialize};
+
+/// The community at kith-covenant's border (Phase 5; Ethne D39, D40).
+mod kc;
 
 // ---------------------------------------------------------------------------
 // Error plumbing
@@ -489,6 +493,10 @@ struct PendingSpec {
     /// office exchanges: which office ("Moderator", …). `member_did` is the holder.
     #[serde(default)]
     office: Option<String>,
+    /// compact, rite and commitment exchanges (Phase 5): the record's own fields,
+    /// without its instant, which the authoring node stamps.
+    #[serde(default)]
+    body: Option<serde_json::Value>,
 }
 
 fn pending_impl(a: &EthneArchive, spec: &str) -> Result<String, String> {
@@ -501,9 +509,12 @@ fn pending_impl(a: &EthneArchive, spec: &str) -> Result<String, String> {
         "guardian" => pending_guardian(a, &s),
         "content_policy" => pending_content_policy(&s),
         "office" => pending_office(&s),
+        "compact" => pending_compact(&s),
+        "rite" => pending_rite(&s),
+        "commitment" => pending_commitment(&s),
         other => Err(format!(
             "unknown record class '{other}': detached signing covers 'membership', 'guardian', \
-             'content_policy' and 'office'"
+             'content_policy', 'office', 'compact', 'rite' and 'commitment'"
         )),
     }
 }
@@ -801,6 +812,27 @@ fn assemble_impl(a: &EthneArchive, spec: &str) -> Result<(), String> {
                 .map_err(|e| format!("payload is not an office change: {e}"))?;
             CharterEntry::OfficeChanged(assemble(payload, &sigs).map_err(|e| e.to_string())?)
         }
+        "compact" => {
+            let payload: CompactAct = serde_json::from_value(s.payload)
+                .map_err(|e| format!("payload is not a compact act: {e}"))?;
+            CharterEntry::CompactActDecided(assemble(payload, &sigs).map_err(|e| e.to_string())?)
+        }
+        "rite" => {
+            if s.payload.get("movement").is_some() {
+                let payload: RiteMovement = serde_json::from_value(s.payload)
+                    .map_err(|e| format!("payload is not a rite movement: {e}"))?;
+                CharterEntry::RiteMovementRecorded(assemble(payload, &sigs).map_err(|e| e.to_string())?)
+            } else {
+                let payload: Affirmation = serde_json::from_value(s.payload)
+                    .map_err(|e| format!("payload is not an affirmation: {e}"))?;
+                CharterEntry::MemberAffirmed(assemble(payload, &sigs).map_err(|e| e.to_string())?)
+            }
+        }
+        "commitment" => {
+            let payload: CommitmentAmendment = serde_json::from_value(s.payload)
+                .map_err(|e| format!("payload is not a commitment amendment: {e}"))?;
+            CharterEntry::CommitmentAmended(assemble(payload, &sigs).map_err(|e| e.to_string())?)
+        }
         other => return Err(format!("unknown record class '{other}'")),
     };
     a.0.lock().unwrap().append(entry).map_err(|e| e.to_string())?;
@@ -916,6 +948,64 @@ fn describe_impl(spec: &str) -> Result<String, String> {
         }
         "content_policy" => describe_content_policy_bytes(&bytes, &mut out)?,
         "office" => describe_office_bytes(&bytes, &mut out)?,
+        "compact" => {
+            let a: CompactAct = canonical::from_canonical_cbor(&bytes)
+                .map_err(|e| format!("these bytes are not a compact act: {e}"))?;
+            out.insert("op".into(), serde_json::json!(compact_op(a.kind)));
+            out.insert("polity_did".into(), serde_json::json!(a.polity.as_str()));
+            out.insert("deciders".into(), serde_json::json!(
+                a.deciders.iter().map(DidKey::as_str).collect::<Vec<_>>()
+            ));
+            out.insert("description".into(), serde_json::json!(describe_compact_act(&a)));
+        }
+        "rite" => describe_rite_bytes(&bytes, &mut out)?,
+        "commitment" => {
+            let a: CommitmentAmendment = canonical::from_canonical_cbor(&bytes)
+                .map_err(|e| format!("these bytes are not a commitment amendment: {e}"))?;
+            out.insert("op".into(), serde_json::json!("amend"));
+            out.insert("polity_did".into(), serde_json::json!(a.polity.as_str()));
+            out.insert("deciders".into(), serde_json::json!(
+                a.deciders.iter().map(DidKey::as_str).collect::<Vec<_>>()
+            ));
+            out.insert("description".into(), serde_json::json!(format!(
+                "{:?} the commitment '{}' ({}) of {}. Decided by {} member(s).",
+                a.kind, a.commitment.key, a.commitment.description, a.polity, a.deciders.len()
+            )));
+        }
+        "kc_attest" => {
+            // The Inductor's recitation, or a witness's attestation to it.
+            if let Ok(r) = canonical::from_canonical_cbor::<kc_ceremony::Recitation>(&bytes) {
+                out.insert("op".into(), serde_json::json!("recite"));
+                out.insert("member_did".into(), serde_json::json!(r.speaker_did.as_str()));
+                out.insert("description".into(), serde_json::json!(format!(
+                    "Recite, as {}, the rite of {} for kith-covenant: the five movements, \
+                     committing to {}.",
+                    r.speaker_did,
+                    r.community_did,
+                    r.movement_common_virtue.keys().join(", ")
+                )));
+                return serde_json::to_string(&serde_json::Value::Object(out)).map_err(|e| e.to_string());
+            }
+            let a: kc_ceremony::intra::InternalWitnessAttestation = canonical::from_canonical_cbor(&bytes)
+                .map_err(|e| format!("these bytes are not a rite attestation: {e}"))?;
+            out.insert("op".into(), serde_json::json!("attest"));
+            out.insert("member_did".into(), serde_json::json!(a.witness_did.as_str()));
+            out.insert("description".into(), serde_json::json!(format!(
+                "Witness, as {}, that the polity's rite {} was recited as you attended it, for \
+                 kith-covenant.",
+                a.witness_did, a.recitation_cid
+            )));
+        }
+        "kc_conduct" => {
+            let c: kc_conduct::ConductRecord = canonical::from_canonical_cbor(&bytes)
+                .map_err(|e| format!("these bytes are not a conduct record: {e}"))?;
+            out.insert("op".into(), serde_json::json!(format!("{:?}", c.kind)));
+            out.insert("member_did".into(), serde_json::json!(c.subject_community.as_str()));
+            out.insert("description".into(), serde_json::json!(format!(
+                "Report {} for {:?} in the compact, together with {} reporting communit(ies): {}",
+                c.subject_community, c.kind, c.reporters.len(), c.narrative
+            )));
+        }
         other => return Err(format!("unknown record class '{other}'")),
     }
     serde_json::to_string(&serde_json::Value::Object(out)).map_err(|e| e.to_string())
@@ -1172,7 +1262,7 @@ pub unsafe extern "C" fn ethne_recite_movement(
 /// Parse a CID string. `Cid`'s Display is `b3:<hex>` while its parser wants bare
 /// hex, so accept both — and accept exactly what en-pyo3's `parse_cid` accepts,
 /// since the two runtimes cite the same movement records.
-fn parse_cid(s: &str) -> Result<Cid, String> {
+pub(crate) fn parse_cid(s: &str) -> Result<Cid, String> {
     Cid::from_hex(s.strip_prefix("b3:").unwrap_or(s))
         .map_err(|e| format!("bad cid '{s}': {e}"))
 }
@@ -3041,6 +3131,18 @@ fn describe_policy_amendment(a: &ContentPolicyAmendment) -> String {
             LabelAction::Hide => "hidden",
         }));
     }
+    for (st, act) in &p.standing {
+        rules.push(format!("posts from {} communities {}", match st {
+            en_charter::CommunityStanding::Probationary => "probationary",
+            en_charter::CommunityStanding::Denied => "denied",
+            en_charter::CommunityStanding::Anathema => "anathema",
+            en_charter::CommunityStanding::Outside => "outside our compacts",
+        }, match act {
+            LabelAction::Allow => "allowed",
+            LabelAction::Warn => "behind a warning",
+            LabelAction::Hide => "hidden",
+        }));
+    }
     format!(
         "Set the content policy of {} to: {}. Decided by {} member(s).",
         a.polity,
@@ -3392,6 +3494,169 @@ fn describe_content_policy_bytes(
         a.deciders.iter().map(DidKey::as_str).collect::<Vec<_>>()
     ));
     out.insert("description".into(), serde_json::json!(describe_policy_amendment(&a)));
+    Ok(())
+}
+
+// --- Detached co-signing: compact acts, rites and commitments (Phase 5) ------
+
+fn compact_op(k: CompactActKind) -> &'static str {
+    match k {
+        CompactActKind::Join => "join",
+        CompactActKind::Admit => "admit",
+        CompactActKind::Sponsor => "sponsor",
+        CompactActKind::Refuse => "refuse",
+        CompactActKind::Anathematize => "anathema",
+        CompactActKind::Lift => "lift",
+    }
+}
+
+fn describe_compact_act(a: &CompactAct) -> String {
+    let who = a.counterparties.iter().map(DidKey::as_str).collect::<Vec<_>>().join(", ");
+    let what = match a.kind {
+        CompactActKind::Join => format!("found or join the compact '{}' with {who}", a.compact),
+        CompactActKind::Admit => format!("admit {who} into the compact '{}'", a.compact),
+        CompactActKind::Sponsor => format!(
+            "vouch for {who} entering '{}', staking our standing for {} day(s)",
+            a.compact,
+            a.probation_days.unwrap_or(0)
+        ),
+        CompactActKind::Refuse => format!("refuse {who} admission to '{}'", a.compact),
+        CompactActKind::Anathematize => format!("report {who} for designation anathema in '{}'", a.compact),
+        CompactActKind::Lift => format!("lift the designation of {who} in '{}'", a.compact),
+    };
+    format!(
+        "{} decides to {what}{}. Decided by {} member(s){}.",
+        a.polity,
+        if a.rationale.trim().is_empty() { String::new() } else { format!(" ({})", a.rationale) },
+        a.deciders.len(),
+        if a.kind.is_severe() { "; this needs more than a majority" } else { "" }
+    )
+}
+
+/// `body` with the instant `field` set to now: the authoring node stamps it.
+fn stamped(body: &Option<serde_json::Value>, field: &str) -> Result<serde_json::Value, String> {
+    let mut b = body.clone().ok_or("this exchange needs `body`")?;
+    let obj = b.as_object_mut().ok_or("`body` is an object")?;
+    obj.insert(field.into(), serde_json::to_value(time::now()).map_err(|e| e.to_string())?);
+    Ok(b)
+}
+
+fn pending_out<T: Serialize>(
+    record: &str,
+    op: &str,
+    polity: &DidKey,
+    payload: T,
+    description: String,
+    required: Vec<String>,
+) -> Result<String, String> {
+    let p = pending(payload, description).map_err(|e| e.to_string())?;
+    let bytes = hex::encode(&p.bytes);
+    check_wire_bound(&bytes)?;
+    serde_json::to_string(&serde_json::json!({
+        "record": record,
+        "op": op,
+        "polity_did": polity.as_str(),
+        "payload": p.payload,
+        "bytes": bytes,
+        "cid": p.cid.to_string(),
+        "description": p.description,
+        "signers_required": required,
+    }))
+    .map_err(|e| e.to_string())
+}
+
+fn pending_compact(s: &PendingSpec) -> Result<String, String> {
+    let act: CompactAct = serde_json::from_value(stamped(&s.body, "decided_at")?)
+        .map_err(|e| format!("body is not a compact act: {e}"))?;
+    act.check_shape()?;
+    if compact_op(act.kind) != s.op {
+        return Err(format!("op '{}' does not match the act's kind {:?}", s.op, act.kind));
+    }
+    let description = describe_compact_act(&act);
+    let required = act.deciders.iter().map(|d| d.as_str().to_string()).collect();
+    let polity = act.polity.clone();
+    pending_out("compact", &s.op, &polity, act, description, required)
+}
+
+fn pending_rite(s: &PendingSpec) -> Result<String, String> {
+    match s.op.as_str() {
+        "movement" => {
+            let m: RiteMovement = serde_json::from_value(stamped(&s.body, "recited_at")?)
+                .map_err(|e| format!("body is not a rite movement: {e}"))?;
+            // The reciter signs; everyone attending co-signs.
+            let mut required = vec![m.member.as_str().to_string()];
+            required.extend(m.attending.iter().map(|d| d.as_str().to_string()));
+            let description = format!(
+                "Record that {} recited {:?} of the rite of {}, with {} attending.",
+                m.member, m.movement, m.polity, m.attending.len()
+            );
+            let polity = m.polity.clone();
+            pending_out("rite", "movement", &polity, m, description, required)
+        }
+        "affirm" => {
+            // The movements are cited by the CIDs `ethne_recite_movement` returned,
+            // as strings; the record holds them in their binary form.
+            let mut body = stamped(&s.body, "affirmed_at")?;
+            if let Some(list) = body.get_mut("movements").and_then(|v| v.as_array_mut()) {
+                for m in list.iter_mut() {
+                    if let Some(text) = m.as_str() {
+                        *m = serde_json::to_value(parse_cid(text)?).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+            let a: Affirmation = serde_json::from_value(body)
+                .map_err(|e| format!("body is not an affirmation: {e}"))?;
+            let mut required: Vec<String> = Vec::new();
+            if a.kind == AffirmationKind::Induction {
+                required.extend(a.witnesses.iter().map(|d| d.as_str().to_string()));
+            }
+            required.push(a.member.as_str().to_string());
+            let description = format!(
+                "Complete the {:?} of {} in {}, citing {} movement(s), witnessed by {}.",
+                a.kind, a.member, a.polity, a.movements.len(), a.witnesses.len()
+            );
+            let polity = a.polity.clone();
+            pending_out("rite", "affirm", &polity, a, description, required)
+        }
+        other => Err(format!("unknown rite op '{other}': 'movement' or 'affirm'")),
+    }
+}
+
+fn pending_commitment(s: &PendingSpec) -> Result<String, String> {
+    let a: CommitmentAmendment = serde_json::from_value(stamped(&s.body, "decided_at")?)
+        .map_err(|e| format!("body is not a commitment amendment: {e}"))?;
+    let required = a.deciders.iter().map(|d| d.as_str().to_string()).collect();
+    let description = format!(
+        "{:?} the commitment '{}' ({}) of {}. Decided by {} member(s).",
+        a.kind, a.commitment.key, a.commitment.description, a.polity, a.deciders.len()
+    );
+    let polity = a.polity.clone();
+    pending_out("commitment", "amend", &polity, a, description, required)
+}
+
+fn describe_rite_bytes(
+    bytes: &[u8],
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    if let Ok(m) = canonical::from_canonical_cbor::<RiteMovement>(bytes) {
+        out.insert("op".into(), serde_json::json!("movement"));
+        out.insert("polity_did".into(), serde_json::json!(m.polity.as_str()));
+        out.insert("member_did".into(), serde_json::json!(m.member.as_str()));
+        out.insert("description".into(), serde_json::json!(format!(
+            "Record that {} recited {:?} of the rite of {} (\"{}\"), with {} attending.",
+            m.member, m.movement, m.polity, m.statement, m.attending.len()
+        )));
+        return Ok(());
+    }
+    let a: Affirmation = canonical::from_canonical_cbor(bytes)
+        .map_err(|e| format!("these bytes are not a rite record: {e}"))?;
+    out.insert("op".into(), serde_json::json!("affirm"));
+    out.insert("polity_did".into(), serde_json::json!(a.polity.as_str()));
+    out.insert("member_did".into(), serde_json::json!(a.member.as_str()));
+    out.insert("description".into(), serde_json::json!(format!(
+        "Complete the {:?} of {} in {}, citing {} movement(s).",
+        a.kind, a.member, a.polity, a.movements.len()
+    )));
     Ok(())
 }
 
@@ -5525,6 +5790,16 @@ mod tests {
                 min_tier: 4,
                 daily_post_cap: Some(u32::MAX),
                 labels,
+                // D39: every standing rule, so the worst case stays the worst case.
+                standing: [
+                    en_charter::CommunityStanding::Probationary,
+                    en_charter::CommunityStanding::Denied,
+                    en_charter::CommunityStanding::Anathema,
+                    en_charter::CommunityStanding::Outside,
+                ]
+                .into_iter()
+                .map(|st| (st, LabelAction::Hide))
+                .collect(),
             },
             moderators,
             hubs: None,

@@ -30,7 +30,7 @@ AGORA_DIR="${AGORA_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 # Cheapest and most basic first, so a broken build shows up in seconds; the
 # Ethne pre-flight runs before the staff cohort it stands in for.
 ORDER=(two_node reputation moderation business business_post drive_ethne_half
-       staff partition community_policy hub device)
+       staff partition community_policy hub device compact)
 
 script_of() {
   case "$1" in

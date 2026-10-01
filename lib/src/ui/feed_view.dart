@@ -34,6 +34,7 @@ import 'package:flutter/material.dart';
 
 import '../model/business_post.dart';
 import '../model/community_policy.dart';
+import '../model/compact_book.dart';
 import '../model/feed_entry.dart';
 import '../model/post.dart';
 import '../model/tie_strength.dart';
@@ -519,8 +520,12 @@ class _PostTileState extends State<_PostTile> {
         !post.outgoing && post.authorUuid.isNotEmpty && post.postId.isNotEmpty;
     // The community and every label that applies, shown as tags (Phase 4).
     final tags = verdict?.tags ?? post.labels;
-    final where =
-        post.community.isEmpty ? '' : ' · in ${shortDid(post.community)}';
+    final standing = post.community.isEmpty
+        ? null
+        : standingBadge(service.standingOfCommunity(post.community) ?? CompactStanding.outside);
+    final where = post.community.isEmpty
+        ? ''
+        : ' · in ${shortDid(post.community)}${standing == null ? '' : ' ($standing)'}';
     final warned = verdict?.action == PolicyAction.warn && !_revealed;
     final canLabel = !post.outgoing &&
         post.postId.isNotEmpty &&

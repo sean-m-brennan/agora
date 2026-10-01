@@ -80,6 +80,28 @@ bool at_cosign_op_ok(const char *record, const char *op)
         return strcmp(op, "amend") == 0;
     if (strcmp(record, "office") == 0)
         return strcmp(op, "confer") == 0 || strcmp(op, "revoke") == 0;
+    /* Phase 5 federation (Ethne D39, D40). The roll's compact acts, the rite and
+     * the commitments a community must hold before it can cross KC's border, and
+     * the KC records themselves: a delivery to a member's replica (answered with
+     * a receipt), a seal ask (a manifest, never the seal, which is too large to
+     * carry) and the sealed manifest, a witness's attestation, and a reporter's
+     * signature on a conduct record. The core carries every one opaque. */
+    if (strcmp(record, "compact") == 0)
+        return strcmp(op, "join") == 0 || strcmp(op, "admit") == 0
+            || strcmp(op, "sponsor") == 0 || strcmp(op, "refuse") == 0
+            || strcmp(op, "anathema") == 0 || strcmp(op, "lift") == 0;
+    if (strcmp(record, "rite") == 0)
+        return strcmp(op, "movement") == 0 || strcmp(op, "affirm") == 0;
+    if (strcmp(record, "commitment") == 0)
+        return strcmp(op, "amend") == 0;
+    if (strcmp(record, "kc_record") == 0)
+        return strcmp(op, "deliver") == 0;
+    if (strcmp(record, "kc_seal") == 0)
+        return strcmp(op, "sign") == 0 || strcmp(op, "sealed") == 0;
+    if (strcmp(record, "kc_attest") == 0)
+        return strcmp(op, "attest") == 0 || strcmp(op, "recite") == 0;
+    if (strcmp(record, "kc_conduct") == 0)
+        return strcmp(op, "sign") == 0;
     return false;
 }
 
