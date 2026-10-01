@@ -6,7 +6,7 @@ identity provider, or policy authority.
 
 > **A person is an AutonomousTrust node. A business is an Ethne polity.**
 
-Full design: [`SOCIAL_APP_PLAN.md`](SOCIAL_APP_PLAN.md).
+Full design: [`doc/agora/design.md`](doc/agora/design.md).
 
 ## Status
 
@@ -21,7 +21,7 @@ the gap note under Architecture.
 
 Agora drives the **AutonomousTrust C core directly (no Python)** behind a
 **Flutter** UI via `dart:ffi`. The authoritative record of this decision and its
-constraints is **[`SOCIAL_APP_PLAN.md` §5.1](SOCIAL_APP_PLAN.md)**
+constraints is **[`doc/agora/design.md` §5.1](doc/agora/design.md)**
 ("Runtime & client architecture (decided)"). In brief:
 
 - **`native/agorad`** — a standalone daemon that runs the AT node in its own
@@ -41,7 +41,7 @@ and **RTT** events (`AT_APP_EVENT_PEER_RTT` — the first proximity increment, a
 network-latency proxy). Still deferred to AT-core: `agora.profile` fields and
 **true geographic position/distance**, so the plan's geographic Dunbar mechanism
 still waits on a further AT-core event kind. RTT is a latency proxy, never
-surfaced as distance. (`SOCIAL_APP_PLAN.md` §5.1.)
+surfaced as distance. (`doc/agora/design.md` §5.1.)
 
 Windows, iOS, and Android are follow-on ports gated on AT-core changes
 (`FORK=0` in-process runtime + a portable IPC transport).

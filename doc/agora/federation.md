@@ -1,6 +1,6 @@
 # Communities in compact
 
-**Claim (SOCIAL_APP_PLAN.md Phase 5):** communities enter relations with each
+**Claim (Agora Phase 5; [design](design.md) §6):** communities enter relations with each
 other through kith-covenant (KC) compacts, over the wire, without a private key
 leaving its node. A reader sees how the communities they follow stand with
 every other one, and a community's own policy can act on that standing.

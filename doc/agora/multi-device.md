@@ -1,6 +1,6 @@
 # One person, several devices
 
-**Claim (SOCIAL_APP_PLAN.md Phase 4):** a person can carry Agora on more than
+**Claim (Agora Phase 4; [design](design.md) §4):** a person can carry Agora on more than
 one device, replace a lost one, and still be one person to everyone who knows
 them.
 

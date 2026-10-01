@@ -220,7 +220,7 @@ peer, and a post is never backfilled to its own author.
 - The digest is a group multicast, so it reaches the other island only once
   both hold one group key again: posts are the group's, and this is by design.
 - A digest per node per minute is fine at Dunbar scale. Its cost at city scale
-  belongs to the relay work (SOCIAL_APP_PLAN.md Phase 4).
+  belongs to the relay work (Agora Phase 4, `../doc/agora/design.md` §4.1).
 
 **Tests.**
 - `c/social/test/post_store_test.c` and `python/tests/a_unit/test_post_store.py`

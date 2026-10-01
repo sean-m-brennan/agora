@@ -1,6 +1,6 @@
 # Dunbar self-limit — Phase 2 exit artifact
 
-**Claim (SOCIAL_APP_PLAN.md §6, Phase 2 exit):** *the graph demonstrably
+**Claim (Agora Phase 2 exit; [design](design.md) §3.3):** *the graph demonstrably
 self-limits near ~150 strong ties in simulation.*
 
 This is the **simulation** half of that exit criterion. (The **pilot-cohort**
