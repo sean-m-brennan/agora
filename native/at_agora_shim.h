@@ -123,7 +123,10 @@ extern "C" {
 /* Proximity hubs (Phase 4, SOCIAL_APP_PLAN §4.1). fc_kind is the AT
  * first-contact kind (at_first_contact.h) the event came from. */
 #define AGORA_EVENT_AREA               18  /* fc_kind 1023..1030: listings, cards, rosters */
-#define AGORA_EVENT_CONTACT            19  /* fc_kind 1000..1003, 1009..1017: asking, answering */
+#define AGORA_EVENT_CONTACT            19  /* fc_kind 1000..1022: links, the address book,
+                                              asking/answering, devices, siblings */
+/* The encrypted backup (Phase 4, multi-device). fc_kind is 1031..1033. */
+#define AGORA_EVENT_BACKUP             20
 
 /* First-contact field bounds; MUST match at_first_contact.h. */
 #define AGORA_FC_REF_MAX      63
@@ -134,6 +137,17 @@ extern "C" {
 #define AGORA_AREA_MAX        7
 #define AGORA_AREA_NAME_MAX   64
 #define AGORA_FC_ISSUER_MAX   64
+/* Address book, devices and backup (Phase 4 multi-device); MUST match
+ * at_first_contact.h (AT_FC_BLOB_LEN, _SAFETY_NUMBER_LEN, _PATH_LEN,
+ * _PASSPHRASE_LEN, each a NUL past these). */
+#define AGORA_FC_BLOB_MAX          7679
+#define AGORA_FC_SAFETY_NUMBER_MAX 71
+#define AGORA_BACKUP_PATH_MAX      4095
+#define AGORA_BACKUP_PASSPHRASE_MAX 31
+/* fc_origin: where an address-book change came from. */
+#define AGORA_FC_ORIGIN_LOCAL   0
+#define AGORA_FC_ORIGIN_SIBLING 1   /* another of our own devices */
+#define AGORA_FC_ORIGIN_BACKUP  2   /* a restored backup */
 
 /**
  * One flattened app event. Field order is ABI-significant: the Dart
@@ -377,6 +391,51 @@ typedef struct {
     char    area_issuer[AGORA_FC_ISSUER_MAX + 1];
     int64_t fc_seq;
     int32_t fc_count;
+    /* Address book, devices and backup (Phase 4 multi-device). Appended LAST
+     * after fc_count, so every prior offset is unchanged; the Dart AgoraEvent
+     * and the cohort ctypes Ev mirror this order and re-check the new sizeof.
+     *
+     * AGORA_EVENT_CONTACT, fc_kind AT_APP_EVENT_FC_*:
+     *   INVITATION: fc_blob is the link to share (`at+contact:`), fc_expiry
+     *     when it stops working (0 = never). A pairing link looks the same.
+     *   REFUSED: fc_count is the at_fc_reason_t (NOT_SIBLING = a pairing that
+     *     did not make two siblings); ESTABLISHED / REFUSED carry fc_role.
+     *   CONTACT / VERIFIED / SAFETY_NUMBER / REMOVED / DEVICE_LINKED: peer_uuid
+     *     is the record (its first device), fc_nickname / fc_petname /
+     *     fc_verified / fc_provenance / fc_added_at / fc_verified_at describe
+     *     it. fc_safety_number on SAFETY_NUMBER, fc_method on VERIFIED,
+     *     fc_peer_dropped on REMOVED, fc_device_uuid on DEVICE_LINKED (the
+     *     further device; a list sends one per device after the record),
+     *     fc_origin on CONTACT / REMOVED (AGORA_FC_ORIGIN_*). CONTACTS_DONE:
+     *     fc_count records.
+     *   SIBLING_PAIRED: peer_uuid / fc_nickname the device paired. SIBLING:
+     *     one of ours (fc_added_at). SIBLINGS_DONE: fc_count. SIBLING_REMOVED:
+     *     fc_peer_dropped.
+     * AGORA_EVENT_BACKUP, fc_kind AT_APP_EVENT_BACKUP_*: backup_path; on
+     *   WRITTEN, backup_passphrase if the node made one (show it ONCE; it is
+     *   never stored) and backup_contacts / _siblings in the file; on RESTORED,
+     *   backup_added / _updated / _removed / _siblings and backup_contacts now
+     *   in the book; on REFUSED, fc_reason ("weak_passphrase", ...). */
+    char    fc_blob[AGORA_FC_BLOB_MAX + 1];
+    int64_t fc_expiry;
+    int32_t fc_role;
+    char    fc_petname[AGORA_FC_NICKNAME_MAX + 1];
+    uint8_t fc_verified;                       /* 0/1 */
+    int32_t fc_provenance;                     /* 0 in person .. 5 backup */
+    double  fc_added_at;
+    double  fc_verified_at;
+    char    fc_safety_number[AGORA_FC_SAFETY_NUMBER_MAX + 1];
+    int32_t fc_method;
+    uint8_t fc_peer_dropped;                   /* 0/1 */
+    uint8_t fc_device_uuid[AGORA_UUID_LEN];
+    int32_t fc_origin;
+    char    backup_path[AGORA_BACKUP_PATH_MAX + 1];
+    char    backup_passphrase[AGORA_BACKUP_PASSPHRASE_MAX + 1];
+    int32_t backup_contacts;
+    int32_t backup_siblings;
+    int32_t backup_added;
+    int32_t backup_updated;
+    int32_t backup_removed;
 } agora_event_t;
 
 /* ---- Proximity hubs (Phase 4, §4.1). Each needs first contact on in the
@@ -400,6 +459,38 @@ int agora_relay_roster_install(void *handle, const char *send_queue, const char 
                                const char *roster);
 int agora_relay_roster_remove(void *handle, const char *send_queue, const char *ref,
                               const char *issuer);
+
+/* ---- Address book, devices and backup (Phase 4 multi-device). Each needs
+ * first contact on in the daemon and answers with AGORA_EVENT_CONTACT /
+ * _BACKUP, tagged with @p ref. A peer is its 16-byte uuid. */
+/** Mint a link for someone to add us; @p ttl_seconds <0 = a week, 0 = never. */
+int agora_fc_invite(void *handle, const char *send_queue, const char *ref,
+                    long ttl_seconds);
+/** Mint a PAIRING link for another device of ours (needs a device cert). */
+int agora_fc_pair_invite(void *handle, const char *send_queue, const char *ref,
+                         long ttl_seconds);
+/** Redeem a link (a contact's, or our own device's pairing link). @p in_person
+ *  ONLY when it crossed face to face; @p petname NULL = derived. */
+int agora_fc_initiate(void *handle, const char *send_queue, const char *ref,
+                      const char *invitation, int in_person, const char *petname);
+int agora_fc_list(void *handle, const char *send_queue, const char *ref);
+int agora_fc_safety_number(void *handle, const char *send_queue, const char *ref,
+                           const uint8_t *peer_uuid);
+/** @p presented: digits typed from their screen; or NULL with @p confirmed 1. */
+int agora_fc_verify(void *handle, const char *send_queue, const char *ref,
+                    const uint8_t *peer_uuid, const char *presented, int confirmed);
+int agora_fc_rename(void *handle, const char *send_queue, const char *ref,
+                    const uint8_t *peer_uuid, const char *petname);
+int agora_fc_remove(void *handle, const char *send_queue, const char *ref,
+                    const uint8_t *peer_uuid);
+int agora_sibling_list(void *handle, const char *send_queue, const char *ref);
+int agora_sibling_remove(void *handle, const char *send_queue, const char *ref,
+                         const uint8_t *peer_uuid);
+/** Seal the book to @p path (absolute); @p passphrase NULL = the node makes one. */
+int agora_backup_export(void *handle, const char *send_queue, const char *ref,
+                        const char *path, const char *passphrase);
+int agora_backup_import(void *handle, const char *send_queue, const char *ref,
+                        const char *path, const char *passphrase);
 
 /** Set $AUTONOMOUS_TRUST_ROOT for THIS process, so the app-events client below
  *  resolves its queue sockets under the same $root/var/at/ as the `agorad`

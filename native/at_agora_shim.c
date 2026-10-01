@@ -149,9 +149,23 @@ _Static_assert(AGORA_FC_REF_MAX + 1 == AT_FC_REF_LEN
                "the first-contact bounds are out of sync with at_first_contact.h");
 /* 28600 -> 29200 at proximity hubs (the fc_* / area_* tail: fc_kind at 28600,
  * fc_count at 29192); every prior offset is unchanged. */
-_Static_assert(sizeof(agora_event_t) == 29200,
+_Static_assert(AGORA_FC_BLOB_MAX + 1 == AT_FC_BLOB_LEN
+               && AGORA_FC_SAFETY_NUMBER_MAX + 1 == AT_FC_SAFETY_NUMBER_LEN
+               && AGORA_BACKUP_PATH_MAX + 1 == AT_FC_PATH_LEN
+               && AGORA_BACKUP_PASSPHRASE_MAX + 1 == AT_FC_PASSPHRASE_LEN,
+               "the address-book / backup bounds are out of sync with at_first_contact.h");
+_Static_assert(AGORA_FC_ORIGIN_SIBLING == AT_FC_ORIGIN_SIBLING
+               && AGORA_FC_ORIGIN_BACKUP == AT_FC_ORIGIN_BACKUP,
+               "AGORA_FC_ORIGIN_* out of sync with AT_FC_ORIGIN_*");
+/* 29200 -> 41296 at multi-device (the address-book / device / backup tail:
+ * fc_blob at 29196, fc_petname 36892, fc_device_uuid 37125, backup_path 37148,
+ * backup_removed 41292); every prior offset is unchanged. Measured, not
+ * assumed. The union did not grow on AT's side: these payloads were already
+ * in at_app_event_t. A batch of 16 is now ~660 KB, still heap-allocated by
+ * every caller. */
+_Static_assert(sizeof(agora_event_t) == 41296,
                "agora_event_t size changed — update the Dart struct and ALL "
-               "SEVEN cohort ctypes Ev asserts in lockstep");
+               "NINE cohort ctypes Ev asserts in lockstep");
 
 /* This file reads at_app_event_t through at_agora.h's accessors; a change to
  * that layout is announced by a bump of AT_APP_ABI_VERSION. Pinned here so the
@@ -364,6 +378,85 @@ int agora_relay_roster_remove(void *handle, const char *send_queue, const char *
                               const char *issuer)
 {
     return at_app_relay_roster_remove((at_app_events_t *)handle, send_queue, ref, issuer);
+}
+
+int agora_fc_invite(void *handle, const char *send_queue, const char *ref,
+                    long ttl_seconds)
+{
+    return at_app_first_contact_invite((at_app_events_t *)handle, send_queue, ref,
+                                       ttl_seconds, NULL, 0);
+}
+
+int agora_fc_pair_invite(void *handle, const char *send_queue, const char *ref,
+                         long ttl_seconds)
+{
+    return at_app_first_contact_pair_invite((at_app_events_t *)handle, send_queue,
+                                            ref, ttl_seconds);
+}
+
+int agora_fc_initiate(void *handle, const char *send_queue, const char *ref,
+                      const char *invitation, int in_person, const char *petname)
+{
+    return at_app_first_contact_initiate((at_app_events_t *)handle, send_queue, ref,
+                                         invitation, NULL, in_person != 0, petname);
+}
+
+int agora_fc_list(void *handle, const char *send_queue, const char *ref)
+{
+    return at_app_first_contact_list((at_app_events_t *)handle, send_queue, ref);
+}
+
+int agora_fc_safety_number(void *handle, const char *send_queue, const char *ref,
+                           const uint8_t *peer_uuid)
+{
+    return at_app_first_contact_safety_number((at_app_events_t *)handle, send_queue,
+                                              ref, peer_uuid);
+}
+
+int agora_fc_verify(void *handle, const char *send_queue, const char *ref,
+                    const uint8_t *peer_uuid, const char *presented, int confirmed)
+{
+    return at_app_first_contact_verify((at_app_events_t *)handle, send_queue, ref,
+                                       peer_uuid, presented, confirmed != 0);
+}
+
+int agora_fc_rename(void *handle, const char *send_queue, const char *ref,
+                    const uint8_t *peer_uuid, const char *petname)
+{
+    return at_app_first_contact_rename((at_app_events_t *)handle, send_queue, ref,
+                                       peer_uuid, petname);
+}
+
+int agora_fc_remove(void *handle, const char *send_queue, const char *ref,
+                    const uint8_t *peer_uuid)
+{
+    return at_app_first_contact_remove((at_app_events_t *)handle, send_queue, ref,
+                                       peer_uuid);
+}
+
+int agora_sibling_list(void *handle, const char *send_queue, const char *ref)
+{
+    return at_app_sibling_list((at_app_events_t *)handle, send_queue, ref);
+}
+
+int agora_sibling_remove(void *handle, const char *send_queue, const char *ref,
+                         const uint8_t *peer_uuid)
+{
+    return at_app_sibling_remove((at_app_events_t *)handle, send_queue, ref, peer_uuid);
+}
+
+int agora_backup_export(void *handle, const char *send_queue, const char *ref,
+                        const char *path, const char *passphrase)
+{
+    return at_app_backup_export((at_app_events_t *)handle, send_queue, ref, path,
+                                passphrase);
+}
+
+int agora_backup_import(void *handle, const char *send_queue, const char *ref,
+                        const char *path, const char *passphrase)
+{
+    return at_app_backup_import((at_app_events_t *)handle, send_queue, ref, path,
+                                passphrase);
 }
 
 int agora_set_exact_position(void *handle, const char *send_queue, int opt_in,
@@ -707,16 +800,72 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             break;
         }
         case AT_APP_EVENT_FC_INVITATION: case AT_APP_EVENT_FC_HELLO_SENT:
-        case AT_APP_EVENT_FC_REFUSED: case AT_APP_EVENT_FC_ESTABLISHED: {
+        case AT_APP_EVENT_FC_REFUSED: case AT_APP_EVENT_FC_ESTABLISHED:
+        case AT_APP_EVENT_FC_SIBLING_PAIRED: {
             const at_app_first_contact_t *f = at_first_contact_event(&raw[i]);
             if (f != NULL) {
+                w++;
                 e->kind = AGORA_EVENT_CONTACT;
                 e->fc_kind = raw[i].kind;
                 memcpy(e->peer_uuid, f->peer_uuid, 16);
                 memcpy(e->fc_ref, f->ref, sizeof(e->fc_ref));
                 memcpy(e->fc_nickname, f->nickname, sizeof(e->fc_nickname));
                 e->fc_count = f->reason;    /* at_fc_reason_t on a REFUSED event */
+                e->fc_role = f->role;
+                e->fc_expiry = f->expiry;
+                memcpy(e->fc_blob, f->blob, sizeof(e->fc_blob));
+                e->fc_blob[AGORA_FC_BLOB_MAX] = '\0';
+            }
+            break;
+        }
+        case AT_APP_EVENT_FC_CONTACT: case AT_APP_EVENT_FC_CONTACTS_DONE:
+        case AT_APP_EVENT_FC_SAFETY_NUMBER: case AT_APP_EVENT_FC_VERIFIED:
+        case AT_APP_EVENT_FC_REMOVED: case AT_APP_EVENT_FC_DEVICE_LINKED:
+        case AT_APP_EVENT_FC_SIBLING: case AT_APP_EVENT_FC_SIBLINGS_DONE:
+        case AT_APP_EVENT_FC_SIBLING_REMOVED: {
+            const at_app_contact_t *c = at_first_contact_contact_event(&raw[i]);
+            if (c != NULL) {
                 w++;
+                e->kind = AGORA_EVENT_CONTACT;
+                e->fc_kind = raw[i].kind;
+                memcpy(e->peer_uuid, c->peer_uuid, 16);
+                memcpy(e->fc_ref, c->ref, sizeof(e->fc_ref));
+                memcpy(e->fc_nickname, c->nickname, sizeof(e->fc_nickname));
+                memcpy(e->fc_petname, c->petname, sizeof(e->fc_petname));
+                e->fc_verified = c->verified ? 1 : 0;
+                e->fc_provenance = c->provenance;
+                e->fc_added_at = c->added_at;
+                e->fc_verified_at = c->verified_at;
+                memcpy(e->fc_safety_number, c->safety_number,
+                       sizeof(e->fc_safety_number));
+                e->fc_safety_number[AGORA_FC_SAFETY_NUMBER_MAX] = '\0';
+                e->fc_method = c->method;
+                e->fc_peer_dropped = c->peer_dropped ? 1 : 0;
+                e->fc_count = c->count;
+                memcpy(e->fc_device_uuid, c->device_uuid, 16);
+                e->fc_origin = c->origin;
+            }
+            break;
+        }
+        case AT_APP_EVENT_BACKUP_WRITTEN: case AT_APP_EVENT_BACKUP_RESTORED:
+        case AT_APP_EVENT_BACKUP_REFUSED: {
+            const at_app_backup_t *b = at_first_contact_backup_event(&raw[i]);
+            if (b != NULL) {
+                w++;
+                e->kind = AGORA_EVENT_BACKUP;
+                e->fc_kind = raw[i].kind;
+                memcpy(e->fc_ref, b->ref, sizeof(e->fc_ref));
+                memcpy(e->fc_reason, b->reason, sizeof(e->fc_reason));
+                memcpy(e->backup_path, b->path, sizeof(e->backup_path));
+                e->backup_path[AGORA_BACKUP_PATH_MAX] = '\0';
+                memcpy(e->backup_passphrase, b->passphrase,
+                       sizeof(e->backup_passphrase));
+                e->backup_passphrase[AGORA_BACKUP_PASSPHRASE_MAX] = '\0';
+                e->backup_contacts = b->contacts;
+                e->backup_siblings = b->siblings;
+                e->backup_added = b->added;
+                e->backup_updated = b->updated;
+                e->backup_removed = b->removed;
             }
             break;
         }

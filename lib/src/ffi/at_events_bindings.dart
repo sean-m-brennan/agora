@@ -113,19 +113,36 @@ const int agoraEventPostLabel = 17;
 /// (the `atArea*` / `atRoster*` kinds below).
 const int agoraEventArea = 18;
 
-/// The contact flow: a request sent, one to answer, accepted, declined, or the
-/// handshake done ([AtRawEvent.fcKind] is one of the `atDir*` / `atFc*` kinds).
+/// The contact flow and the address book: a link minted, a request sent or to
+/// answer, the handshake done, a contact record, a device filed under one, one
+/// of our own devices paired ([AtRawEvent.fcKind] is an `atDir*` / `atFc*`
+/// kind).
 const int agoraEventContact = 19;
 
+/// The encrypted backup (Phase 4 multi-device): written, restored or refused
+/// ([AtRawEvent.fcKind] is an `atBackup*` kind).
+const int agoraEventBackup = 20;
+
 /// AT first-contact kinds (at_first_contact.h) carried in [AtRawEvent.fcKind].
+const int atFcInvitation = 1000;
 const int atFcHelloSent = 1001;
 const int atFcRefused = 1002;
 const int atFcEstablished = 1003;
+const int atFcContact = 1004;
+const int atFcContactsDone = 1005;
+const int atFcSafetyNumber = 1006;
+const int atFcVerified = 1007;
+const int atFcRemoved = 1008;
 const int atDirRefused = 1010;
 const int atDirRequestSent = 1014;
 const int atDirContactRequest = 1015;
 const int atDirAccepted = 1016;
 const int atDirDeclined = 1017;
+const int atFcDeviceLinked = 1018;
+const int atFcSiblingPaired = 1019;
+const int atFcSibling = 1020;
+const int atFcSiblingsDone = 1021;
+const int atFcSiblingRemoved = 1022;
 const int atAreaPublished = 1023;
 const int atAreaRefused = 1024;
 const int atAreaWithdrawn = 1025;
@@ -134,6 +151,19 @@ const int atAreaDone = 1027;
 const int atRosterInstalled = 1028;
 const int atRosterRefused = 1029;
 const int atRosterRemoved = 1030;
+const int atBackupWritten = 1031;
+const int atBackupRestored = 1032;
+const int atBackupRefused = 1033;
+
+/// at_fc_reason_t values carried in [AtRawEvent.fcCount] on an [atFcRefused].
+const int atFcReasonMismatch = 8;
+const int atFcReasonUnknownContact = 9;
+const int atFcReasonNotSibling = 10;
+
+/// [AtRawEvent.fcOrigin]: where an address-book change came from.
+const int atFcOriginLocal = 0;
+const int atFcOriginSibling = 1;
+const int atFcOriginBackup = 2;
 
 /// First-contact field bounds. MUST match AGORA_FC_* / AGORA_AREA_*.
 const int agoraFcRefMax = 63;
@@ -144,6 +174,10 @@ const int agoraFcReasonMax = 31;
 const int agoraAreaMax = 7;
 const int agoraAreaNameMax = 64;
 const int agoraFcIssuerMax = 64;
+const int agoraFcBlobMax = 7679;
+const int agoraFcSafetyNumberMax = 71;
+const int agoraBackupPathMax = 4095;
+const int agoraBackupPassphraseMax = 31;
 
 /// A post's labels joined with ','. MUST match AGORA_POST_LABELS_MAX.
 const int agoraPostLabelsMax = 263;
@@ -494,6 +528,68 @@ final class AgoraEvent extends Struct {
 
   @Int32()
   external int fcCount;
+
+  /// Address book, devices and backup (Phase 4 multi-device). Appended LAST,
+  /// so every prior offset is unchanged (the struct grew 29200 -> 41296).
+  @Array(agoraFcBlobMax + 1)
+  external Array<Uint8> fcBlob;
+
+  @Int64()
+  external int fcExpiry;
+
+  @Int32()
+  external int fcRole;
+
+  @Array(agoraFcNicknameMax + 1)
+  external Array<Uint8> fcPetname;
+
+  @Uint8()
+  external int fcVerified;
+
+  @Int32()
+  external int fcProvenance;
+
+  @Double()
+  external double fcAddedAt;
+
+  @Double()
+  external double fcVerifiedAt;
+
+  @Array(agoraFcSafetyNumberMax + 1)
+  external Array<Uint8> fcSafetyNumber;
+
+  @Int32()
+  external int fcMethod;
+
+  @Uint8()
+  external int fcPeerDropped;
+
+  @Array(agoraUuidLen)
+  external Array<Uint8> fcDeviceUuid;
+
+  @Int32()
+  external int fcOrigin;
+
+  @Array(agoraBackupPathMax + 1)
+  external Array<Uint8> backupPath;
+
+  @Array(agoraBackupPassphraseMax + 1)
+  external Array<Uint8> backupPassphrase;
+
+  @Int32()
+  external int backupContacts;
+
+  @Int32()
+  external int backupSiblings;
+
+  @Int32()
+  external int backupAdded;
+
+  @Int32()
+  external int backupUpdated;
+
+  @Int32()
+  external int backupRemoved;
 }
 
 /// A pure-Dart copy of one decoded event. Decoupled from native memory so it
@@ -576,6 +672,26 @@ class AtRawEvent {
     this.areaIssuer = '',
     this.fcSeq = 0,
     this.fcCount = 0,
+    this.fcBlob = '',
+    this.fcExpiry = 0,
+    this.fcRole = 0,
+    this.fcPetname = '',
+    this.fcVerified = false,
+    this.fcProvenance = 0,
+    this.fcAddedAt = 0,
+    this.fcVerifiedAt = 0,
+    this.fcSafetyNumber = '',
+    this.fcMethod = 0,
+    this.fcPeerDropped = false,
+    this.fcDeviceUuid = const [],
+    this.fcOrigin = 0,
+    this.backupPath = '',
+    this.backupPassphrase = '',
+    this.backupContacts = 0,
+    this.backupSiblings = 0,
+    this.backupAdded = 0,
+    this.backupUpdated = 0,
+    this.backupRemoved = 0,
   });
 
   final int kind;
@@ -771,6 +887,38 @@ class AtRawEvent {
   final String areaIssuer;
   final int fcSeq;
   final int fcCount;
+
+  /// The address book (Phase 4 multi-device), on [agoraEventContact]. On an
+  /// INVITATION, [fcBlob] is the link and [fcExpiry] when it stops working (0 =
+  /// never). On CONTACT / VERIFIED / SAFETY_NUMBER / REMOVED / DEVICE_LINKED,
+  /// [uuid] is the record (its first device); [fcDeviceUuid] is the further
+  /// device on DEVICE_LINKED (a list sends one per device after its record);
+  /// [fcOrigin] says whether a CONTACT / REMOVED came from another of our own
+  /// devices or a backup. CONTACTS_DONE / SIBLINGS_DONE: [fcCount].
+  final String fcBlob;
+  final int fcExpiry;
+  final int fcRole;
+  final String fcPetname;
+  final bool fcVerified;
+  final int fcProvenance;
+  final double fcAddedAt;
+  final double fcVerifiedAt;
+  final String fcSafetyNumber;
+  final int fcMethod;
+  final bool fcPeerDropped;
+  final List<int> fcDeviceUuid;
+  final int fcOrigin;
+
+  /// [agoraEventBackup]. [backupPassphrase] is set only on a WRITTEN the node
+  /// generated a code for: show it once, never store it. On REFUSED the reason
+  /// is in [fcReason].
+  final String backupPath;
+  final String backupPassphrase;
+  final int backupContacts;
+  final int backupSiblings;
+  final int backupAdded;
+  final int backupUpdated;
+  final int backupRemoved;
 }
 
 typedef _SetRootC = Void Function(Pointer<Utf8>);
@@ -873,6 +1021,30 @@ typedef _Str5C = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>,
     Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
 typedef _Str5Dart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>,
     Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _Str4C = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>,
+    Pointer<Utf8>, Pointer<Utf8>);
+typedef _Str4Dart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>,
+    Pointer<Utf8>, Pointer<Utf8>);
+typedef _InviteC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Long);
+typedef _InviteDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, int);
+typedef _InitiateC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>,
+    Pointer<Utf8>, Int32, Pointer<Utf8>);
+typedef _InitiateDart = int Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Utf8>, Pointer<Utf8>, int, Pointer<Utf8>);
+typedef _PeerVerbC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Uint8>);
+typedef _PeerVerbDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Uint8>);
+typedef _VerifyC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>,
+    Pointer<Uint8>, Pointer<Utf8>, Int32);
+typedef _VerifyDart = int Function(Pointer<Void>, Pointer<Utf8>,
+    Pointer<Utf8>, Pointer<Uint8>, Pointer<Utf8>, int);
+typedef _RenameC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>,
+    Pointer<Uint8>, Pointer<Utf8>);
+typedef _RenameDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Uint8>, Pointer<Utf8>);
 typedef _AreaRequestC = Int32 Function(Pointer<Void>, Pointer<Utf8>,
     Pointer<Utf8>, Pointer<Utf8>, Pointer<Uint8>);
 typedef _AreaRequestDart = int Function(Pointer<Void>, Pointer<Utf8>,
@@ -1121,6 +1293,30 @@ class AtEvents {
   static final _PublishPostLabelDart _publishPostLabel =
       _lib.lookupFunction<_PublishPostLabelC, _PublishPostLabelDart>(
           'agora_publish_post_label');
+  static final _InviteDart _fcInvite =
+      _lib.lookupFunction<_InviteC, _InviteDart>('agora_fc_invite');
+  static final _InviteDart _fcPairInvite =
+      _lib.lookupFunction<_InviteC, _InviteDart>('agora_fc_pair_invite');
+  static final _InitiateDart _fcInitiate =
+      _lib.lookupFunction<_InitiateC, _InitiateDart>('agora_fc_initiate');
+  static final _Str2Dart _fcList =
+      _lib.lookupFunction<_Str2C, _Str2Dart>('agora_fc_list');
+  static final _PeerVerbDart _fcSafetyNumber =
+      _lib.lookupFunction<_PeerVerbC, _PeerVerbDart>('agora_fc_safety_number');
+  static final _VerifyDart _fcVerify =
+      _lib.lookupFunction<_VerifyC, _VerifyDart>('agora_fc_verify');
+  static final _RenameDart _fcRename =
+      _lib.lookupFunction<_RenameC, _RenameDart>('agora_fc_rename');
+  static final _PeerVerbDart _fcRemove =
+      _lib.lookupFunction<_PeerVerbC, _PeerVerbDart>('agora_fc_remove');
+  static final _Str2Dart _siblingList =
+      _lib.lookupFunction<_Str2C, _Str2Dart>('agora_sibling_list');
+  static final _PeerVerbDart _siblingRemove =
+      _lib.lookupFunction<_PeerVerbC, _PeerVerbDart>('agora_sibling_remove');
+  static final _Str4Dart _backupExport =
+      _lib.lookupFunction<_Str4C, _Str4Dart>('agora_backup_export');
+  static final _Str4Dart _backupImport =
+      _lib.lookupFunction<_Str4C, _Str4Dart>('agora_backup_import');
   static final _PollDart _poll =
       _lib.lookupFunction<_PollC, _PollDart>('agora_events_poll');
   static final _CloseDart _close =
@@ -1440,6 +1636,97 @@ class AtEvents {
   int relayRosterInstall(String sendQueue, String ref, String roster) =>
       _withStrs([sendQueue, ref, roster],
           (p) => _rosterInstall(_handle, p[0], p[1], p[2]));
+
+  /// Run [f] over a native 16-byte copy of [peerUuid], freeing it after.
+  int _withUuid(List<int> peerUuid, int Function(Pointer<Uint8>) f) {
+    final u = calloc<Uint8>(16);
+    try {
+      for (var i = 0; i < 16; i++) {
+        u[i] = i < peerUuid.length ? peerUuid[i] : 0;
+      }
+      return f(u);
+    } finally {
+      calloc.free(u);
+    }
+  }
+
+  /// Mint a link for someone to add us ([ttlSeconds] < 0: a week; 0: never).
+  /// Answered with an INVITATION carrying [AtRawEvent.fcBlob], or REFUSED.
+  int fcInvite(String sendQueue, String ref, {int ttlSeconds = -1}) =>
+      _withStrs([sendQueue, ref], (p) => _fcInvite(_handle, p[0], p[1], ttlSeconds));
+
+  /// Mint a PAIRING link for another device of ours. Needs a device cert;
+  /// refused with [atFcReasonNotSibling] otherwise.
+  int fcPairInvite(String sendQueue, String ref, {int ttlSeconds = -1}) =>
+      _withStrs(
+          [sendQueue, ref], (p) => _fcPairInvite(_handle, p[0], p[1], ttlSeconds));
+
+  /// Redeem [invitation] (a contact's link, or our own device's pairing link).
+  /// [inPerson] ONLY when it crossed face to face: the contact is then verified
+  /// at once. [petname] '' lets the node derive one.
+  int fcInitiate(String sendQueue, String ref, String invitation,
+      {bool inPerson = false, String petname = ''}) {
+    final strs = [sendQueue, ref, invitation, if (petname.isNotEmpty) petname];
+    return _withStrs(
+        strs,
+        (p) => _fcInitiate(_handle, p[0], p[1], p[2], inPerson ? 1 : 0,
+            petname.isNotEmpty ? p[3] : nullptr));
+  }
+
+  /// The whole address book: CONTACT per record (each followed by a
+  /// DEVICE_LINKED per further device), then CONTACTS_DONE.
+  int fcList(String sendQueue, String ref) =>
+      _withStrs([sendQueue, ref], (p) => _fcList(_handle, p[0], p[1]));
+
+  int fcSafetyNumber(String sendQueue, String ref, List<int> peerUuid) =>
+      _withUuid(peerUuid, (u) => _withStrs([sendQueue, ref],
+          (p) => _fcSafetyNumber(_handle, p[0], p[1], u)));
+
+  /// Mark [peerUuid] verified: [presented] digits typed from THEIR screen (the
+  /// node compares), or [confirmed] when the user compared by eye.
+  int fcVerify(String sendQueue, String ref, List<int> peerUuid,
+      {String? presented, bool confirmed = false}) {
+    final strs = [sendQueue, ref, if (presented != null) presented];
+    return _withUuid(
+        peerUuid,
+        (u) => _withStrs(
+            strs,
+            (p) => _fcVerify(_handle, p[0], p[1], u,
+                presented != null ? p[2] : nullptr, confirmed ? 1 : 0)));
+  }
+
+  int fcRename(String sendQueue, String ref, List<int> peerUuid, String petname) =>
+      _withUuid(peerUuid, (u) => _withStrs([sendQueue, ref, petname],
+          (p) => _fcRename(_handle, p[0], p[1], u, p[2])));
+
+  int fcRemove(String sendQueue, String ref, List<int> peerUuid) =>
+      _withUuid(peerUuid, (u) => _withStrs([sendQueue, ref],
+          (p) => _fcRemove(_handle, p[0], p[1], u)));
+
+  /// Our own paired devices: SIBLING per device, then SIBLINGS_DONE.
+  int siblingList(String sendQueue, String ref) =>
+      _withStrs([sendQueue, ref], (p) => _siblingList(_handle, p[0], p[1]));
+
+  /// Unpair [peerUuid] on this device only.
+  int siblingRemove(String sendQueue, String ref, List<int> peerUuid) =>
+      _withUuid(peerUuid, (u) => _withStrs([sendQueue, ref],
+          (p) => _siblingRemove(_handle, p[0], p[1], u)));
+
+  /// Seal the address book and sibling list to [path] (absolute). A null
+  /// [passphrase] asks the node to generate one, returned once on WRITTEN.
+  int backupExport(String sendQueue, String ref, String path,
+      {String? passphrase}) {
+    final strs = [sendQueue, ref, path, if (passphrase != null) passphrase];
+    return _withStrs(
+        strs,
+        (p) => _backupExport(
+            _handle, p[0], p[1], p[2], passphrase != null ? p[3] : nullptr));
+  }
+
+  /// Merge the backup at [path] into the address book.
+  int backupImport(String sendQueue, String ref, String path, String passphrase) =>
+      _withStrs([sendQueue, ref, path, passphrase],
+          (p) => _backupImport(_handle, p[0], p[1], p[2], p[3]));
 
   /// Stop trusting [issuer]'s roster (hex key).
   int relayRosterRemove(String sendQueue, String ref, String issuer) =>
@@ -1789,6 +2076,28 @@ class AtEvents {
           areaIssuer: _boundedString(e.areaIssuer, agoraFcIssuerMax),
           fcSeq: e.fcSeq,
           fcCount: e.fcCount,
+          fcBlob: _boundedString(e.fcBlob, agoraFcBlobMax),
+          fcExpiry: e.fcExpiry,
+          fcRole: e.fcRole,
+          fcPetname: _boundedString(e.fcPetname, agoraFcNicknameMax),
+          fcVerified: e.fcVerified != 0,
+          fcProvenance: e.fcProvenance,
+          fcAddedAt: e.fcAddedAt,
+          fcVerifiedAt: e.fcVerifiedAt,
+          fcSafetyNumber:
+              _boundedString(e.fcSafetyNumber, agoraFcSafetyNumberMax),
+          fcMethod: e.fcMethod,
+          fcPeerDropped: e.fcPeerDropped != 0,
+          fcDeviceUuid: _copyArray(e.fcDeviceUuid, agoraUuidLen),
+          fcOrigin: e.fcOrigin,
+          backupPath: _boundedString(e.backupPath, agoraBackupPathMax),
+          backupPassphrase:
+              _boundedString(e.backupPassphrase, agoraBackupPassphraseMax),
+          backupContacts: e.backupContacts,
+          backupSiblings: e.backupSiblings,
+          backupAdded: e.backupAdded,
+          backupUpdated: e.backupUpdated,
+          backupRemoved: e.backupRemoved,
         );
       }, growable: false);
     } finally {

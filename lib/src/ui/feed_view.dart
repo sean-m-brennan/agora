@@ -509,11 +509,7 @@ class _PostTileState extends State<_PostTile> {
   Widget build(BuildContext context) {
     final verdict = widget.verdict;
     final scheme = Theme.of(context).colorScheme;
-    final who = post.outgoing
-        ? 'you'
-        : (post.authorHex.length <= 12
-            ? post.authorHex
-            : post.authorHex.substring(0, 12));
+    final who = service.authorLabel(post);
     final audience = audienceLabel(audienceForTier(post.requiredTier));
     // A received post (not our own echo) that carries an author + content id can
     // be reacted to (Increment 8): a reaction is the directed return signal that

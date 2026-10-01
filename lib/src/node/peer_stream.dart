@@ -13,6 +13,7 @@ import 'package:flutter/foundation.dart';
 import '../ffi/at_events_bindings.dart';
 import '../ffi/at_peer.dart';
 import '../ffi/ethne_bindings.dart';
+import '../model/address_book.dart';
 import '../model/attention_budget.dart';
 import '../model/business.dart';
 import '../model/business_directory.dart';
@@ -20,6 +21,7 @@ import '../model/business_post.dart';
 import '../model/community_policy.dart';
 import '../model/community_policy_store.dart';
 import '../model/cosign_exchanges.dart';
+import '../model/device_cert.dart';
 import '../model/dm.dart';
 import '../model/feed_entry.dart';
 import '../model/member_roll.dart';
@@ -138,9 +140,14 @@ class PeerService extends ChangeNotifier {
   /// tie we tended before this launch does not spuriously read as "cold".
   AgoraPeer _newPeer(List<int> uuid) {
     final p = AgoraPeer(uuid: uuid);
-    final durable = _settings?.lastInteractionFor(_hex(uuid));
-    if (durable != null && durable > p.lastInteractionAt) {
-      p.lastInteractionAt = durable;
+    // Recency is kept per person (Phase 4 multi-device); a key recorded for
+    // this device alone, before it was linked, still counts.
+    final hex = _hex(uuid);
+    for (final key in {hex, personKey(hex)}) {
+      final durable = key.isEmpty ? null : _settings?.lastInteractionFor(key);
+      if (durable != null && durable > p.lastInteractionAt) {
+        p.lastInteractionAt = durable;
+      }
     }
     return p;
   }
@@ -150,14 +157,106 @@ class PeerService extends ChangeNotifier {
   void _tend(AgoraPeer peer, [double? nowSec]) {
     // A blocked tie is not an attended tie (Phase 4 P4.1): nothing we do or
     // receive while they are blocked may warm it.
-    if (peer.blocked) return;
+    if (_personBlocked(peer)) return;
     final now = nowSec ?? DateTime.now().millisecondsSinceEpoch / 1000.0;
-    peer.markInteraction(now);
+    // One person, one tie: tending any of their devices tends them all.
+    for (final d in devicesOfPeer(peer)) {
+      d.markInteraction(now);
+    }
     final s = _settings;
-    if (s != null) {
-      s.recordInteraction(_hex(peer.uuid), now);
+    final key = personKey(_hex(peer.uuid));
+    if (s != null && key.isNotEmpty) {
+      s.recordInteraction(key, now);
       _scheduleSave();
     }
+  }
+
+  // --- one person, several devices (Phase 4 multi-device) -------------------
+
+  /// The person the device [hex] belongs to: '' for one of OUR OWN devices
+  /// (that is us, not a peer), else the address-book record it is filed under,
+  /// else the device itself.
+  String personKey(String hex) => book.isSibling(hex) ? '' : book.personOf(hex);
+
+  /// Every device of [peer]'s person that is a peer right now, [peer] first.
+  List<AgoraPeer> devicesOfPeer(AgoraPeer peer) {
+    final hex = _hex(peer.uuid);
+    return [
+      peer,
+      for (final d in book.devicesOf(hex))
+        if (d != hex && _peers[d] != null) _peers[d]!,
+    ];
+  }
+
+  /// How many devices [peer]'s person has in the address book (1 when none).
+  int deviceCountOf(AgoraPeer peer) =>
+      book.contactOf(_hex(peer.uuid))?.allDevices.length ?? 1;
+
+  /// The address-book record [peer] belongs to, if any.
+  Contact? contactOf(AgoraPeer peer) => book.contactOf(_hex(peer.uuid));
+
+  /// A block on any device is a block on the person.
+  bool _personBlocked(AgoraPeer peer) => devicesOfPeer(peer).any((d) => d.blocked);
+
+  /// The device that stands for a person in the roster: a blocked one if any
+  /// is (so the block shows), else a connected one, else the strongest.
+  AgoraPeer _representative(List<AgoraPeer> devices, double now) {
+    if (devices.length == 1) return devices.single;
+    double s(AgoraPeer p) => tieStrength(p,
+        ownGeohash: _ownGeohash, nowEpochSeconds: now, weights: _weights);
+    final sorted = List<AgoraPeer>.of(devices)
+      ..sort((a, b) {
+        if (a.blocked != b.blocked) return a.blocked ? -1 : 1;
+        if (a.isConnected != b.isConnected) return a.isConnected ? -1 : 1;
+        final bs = s(b).compareTo(s(a));
+        return bs != 0 ? bs : _hex(a.uuid).compareTo(_hex(b.uuid));
+      });
+    return sorted.first;
+  }
+
+  /// Devices whose person we are connected to, waiting to be seen as a peer so
+  /// the connection can be extended to them.
+  final Set<String> _extendConnectionTo = {};
+
+  /// Ask the core to connect to [device] quietly: no optimistic state, and no
+  /// "could not connect" message if it bounces, since the user asked for the
+  /// person, not this device.
+  void _autoConnect(AgoraPeer device) {
+    _events?.connectRequest(_daemon.queues.appToAt, device.uuid);
+  }
+
+  /// A device was filed under a person (Phase 4): it inherits their block, and
+  /// a connection we hold with them is extended to it.
+  void _onDeviceLinked(String personHex, String deviceHex) {
+    final rec = book.contacts[personHex];
+    if (rec == null) return;
+    final known = [
+      for (final d in rec.allDevices)
+        if (d != deviceHex && _peers[d] != null) _peers[d]!
+    ];
+    if (known.any((p) => p.blocked)) {
+      _moderationVerbs.block(bytesOfHex(deviceHex));
+      return;
+    }
+    if (!known.any((p) => p.isConnected)) return;
+    final dev = _peers[deviceHex];
+    if (dev == null) {
+      _extendConnectionTo.add(deviceHex);
+    } else if (!dev.isConnected && dev.connection != ConnectionState.pendingOut) {
+      _autoConnect(dev);
+    }
+  }
+
+  /// The name to show for a post's author.
+  String authorLabel(Post post) {
+    if (post.outgoing) return 'you';
+    final hex = post.authorHex;
+    if (book.isSibling(hex)) return 'you · other device';
+    final c = book.contactOf(hex);
+    if (c != null) return c.label;
+    final p = _peers[hex];
+    if (p != null) return p.displayLabel;
+    return hex.length <= 12 ? hex : hex.substring(0, 12);
   }
 
   void _scheduleSave() {
@@ -367,7 +466,7 @@ class PeerService extends ChangeNotifier {
   /// Peers with an inbound connection request awaiting our response
   /// (pending_in). The UI surfaces an accept/decline affordance for each.
   List<AgoraPeer> get inboundRequests =>
-      _peers.values.where((p) => p.hasInboundRequest).toList();
+      peers.where((p) => p.hasInboundRequest).toList();
 
   /// Ask to connect to [peer] (Increment 5). A connection is EXPLICIT and
   /// revocable, SEPARATE from reputation. Stamps a real interaction recency now
@@ -431,18 +530,27 @@ class PeerService extends ChangeNotifier {
   }
 
   /// The DM thread with [peer] (Increment 6), oldest first. Empty if none yet.
+  ///
+  /// One thread per PERSON (Phase 4 multi-device): what any of their devices
+  /// sent, and what we sent to them.
   List<DmMessage> messagesFor(AgoraPeer peer) =>
-      List<DmMessage>.unmodifiable(_dms[_hex(peer.uuid)] ?? const []);
+      List<DmMessage>.unmodifiable(_dms[_threadKey(peer)] ?? const []);
+
+  String _threadKey(AgoraPeer peer) {
+    final hex = _hex(peer.uuid);
+    final k = personKey(hex);
+    return k.isEmpty ? hex : k;
+  }
 
   /// True if [peer] has unread incoming DMs (cleared by [markThreadRead]).
-  bool hasUnread(AgoraPeer peer) => _unreadPeers.contains(_hex(peer.uuid));
+  bool hasUnread(AgoraPeer peer) => _unreadPeers.contains(_threadKey(peer));
 
   /// Total peers with unread DMs — a badge count for the roster.
   int get unreadPeerCount => _unreadPeers.length;
 
   /// Mark [peer]'s thread read (call when the operator opens it).
   void markThreadRead(AgoraPeer peer) {
-    if (_unreadPeers.remove(_hex(peer.uuid))) notifyListeners();
+    if (_unreadPeers.remove(_threadKey(peer))) notifyListeners();
   }
 
   /// Send a direct message to [peer] (Increment 6). A DM is one-way and
@@ -455,7 +563,7 @@ class PeerService extends ChangeNotifier {
     if (trimmed.isEmpty) return -1;
     final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
     _tend(peer, now);
-    (_dms[_hex(peer.uuid)] ??= <DmMessage>[]).add(DmMessage(
+    (_dms[_threadKey(peer)] ??= <DmMessage>[]).add(DmMessage(
       peerUuidHex: _hex(peer.uuid),
       seq: 0, // the wire seq is stamped by the core and never returns to the app
       ts: now,
@@ -467,7 +575,13 @@ class PeerService extends ChangeNotifier {
       notifyListeners();
       return -1;
     }
-    final rc = ev.sendDm(_daemon.queues.appToAt, peer.uuid, trimmed);
+    // To every device of theirs that is a peer now: whichever they are at
+    // reads it. 0 when any of them took it.
+    var rc = -1;
+    for (final d in devicesOfPeer(peer)) {
+      final r = ev.sendDm(_daemon.queues.appToAt, d.uuid, trimmed);
+      if (rc != 0) rc = r;
+    }
     notifyListeners();
     return rc;
   }
@@ -548,7 +662,13 @@ class PeerService extends ChangeNotifier {
   }
 
   /// True iff the peer with [uuid] is locally blocked, as the core reports it.
-  bool isBlockedUuid(List<int> uuid) => _peers[_hex(uuid)]?.blocked ?? false;
+  ///
+  /// A block on any of the person's devices hides all of them.
+  bool isBlockedUuid(List<int> uuid) {
+    final p = _peers[_hex(uuid)];
+    if (p != null) return _personBlocked(p);
+    return book.devicesOf(_hex(uuid)).any((d) => _peers[d]?.blocked ?? false);
+  }
 
   /// How many held posts the feed is hiding because their author is blocked —
   /// shown so a block never reads as "nothing arrived". Counted, not deleted:
@@ -588,7 +708,9 @@ class PeerService extends ChangeNotifier {
   /// them, else 0 (an author we cannot place is not "near"). Reuses the same
   /// [tieStrength] kernel the roster ranking uses.
   double _strengthOfAuthor(List<int> authorUuid) {
-    final peer = _peers[_hex(authorUuid)];
+    final hex = _hex(authorUuid);
+    final peer = _peers[hex] ??
+        [for (final d in book.devicesOf(hex)) _peers[d]].whereType<AgoraPeer>().firstOrNull;
     if (peer == null) return 0.0;
     return strengthOf(peer);
   }
@@ -711,16 +833,32 @@ class PeerService extends ChangeNotifier {
   /// the wire. The block becomes VISIBLE when the core re-emits the peer with
   /// `blocked` set — not here, so the UI never shows a block that did not land.
   /// Returns the shim rc (0 queued, -2 not ready, -1 no channel).
+  ///
+  /// A block is on the PERSON (Phase 4 multi-device): every device filed under
+  /// their record is blocked, and a device linked later inherits it.
   int blockPeer(AgoraPeer peer) {
-    final rc = _moderationVerbs.block(peer.uuid);
+    var rc = 0;
+    for (final d in _personDeviceUuids(peer)) {
+      final r = _moderationVerbs.block(d);
+      if (rc == 0) rc = r;
+    }
     notifyListeners();
     return rc;
   }
 
+  /// Every device uuid of [peer]'s person: the address book's, else [peer]'s.
+  List<List<int>> _personDeviceUuids(AgoraPeer peer) => [
+        for (final h in book.devicesOf(_hex(peer.uuid))) bytesOfHex(h),
+      ];
+
   /// Lift a local block. The peer is told nothing, as they were told nothing
   /// of the block. Returns the shim rc.
   int unblockPeer(AgoraPeer peer) {
-    final rc = _moderationVerbs.unblock(peer.uuid);
+    var rc = 0;
+    for (final d in _personDeviceUuids(peer)) {
+      final r = _moderationVerbs.unblock(d);
+      if (rc == 0) rc = r;
+    }
     notifyListeners();
     return rc;
   }
@@ -760,9 +898,8 @@ class PeerService extends ChangeNotifier {
   }
 
   /// Peers this node has blocked, for the blocked list.
-  List<AgoraPeer> get blockedPeers =>
-      _peers.values.where((p) => p.blocked).toList()
-        ..sort((a, b) => a.displayLabel.compareTo(b.displayLabel));
+  List<AgoraPeer> get blockedPeers => peers.where((p) => p.blocked).toList()
+    ..sort((a, b) => a.displayLabel.compareTo(b.displayLabel));
 
   /// Peers bounded by an authority finding — the only place the generalized
   /// ceiling is legible as itself rather than as a low tier.
@@ -1075,18 +1212,19 @@ class PeerService extends ChangeNotifier {
   bool _ingestDm(AtRawEvent e) {
     if (e.kind != agoraEventDm) return false;
     final key = _hex(e.uuid);
+    final peer = _peers.putIfAbsent(key, () => _newPeer(e.uuid));
     // The core drops a blocked peer's DMs before they get here; should one
-    // arrive anyway, it is dropped and COUNTED, never silently shown.
-    if (_peers[key]?.blocked ?? false) {
+    // arrive anyway (or from a device of a blocked person not yet blocked
+    // itself), it is dropped and COUNTED, never silently shown.
+    if (_personBlocked(peer)) {
       _dmsDroppedFromBlocked++;
       return true;
     }
-    final peer = _peers.putIfAbsent(key, () => _newPeer(e.uuid));
-    final thread = _dms[key] ??= <DmMessage>[];
-    // Dedup by seq: the core may re-deliver, but incoming seqs are monotone per
-    // sender (the freshness gate guarantees it), so an already-seen incoming
-    // seq is a duplicate.
-    final seen = thread.any((m) => !m.outgoing && m.seq == e.dmSeq);
+    final thread = _dms[_threadKey(peer)] ??= <DmMessage>[];
+    // Dedup by (sender, seq): the core may re-deliver, but incoming seqs are
+    // monotone per sending device (the freshness gate guarantees it).
+    final seen = thread.any(
+        (m) => !m.outgoing && m.peerUuidHex == key && m.seq == e.dmSeq);
     if (!seen) {
       thread.add(DmMessage(
         peerUuidHex: key,
@@ -1095,7 +1233,7 @@ class PeerService extends ChangeNotifier {
         text: e.dmText,
         outgoing: false,
       ));
-      _unreadPeers.add(key);
+      _unreadPeers.add(_threadKey(peer));
       _tend(peer);
     }
     return true;
@@ -1115,9 +1253,19 @@ class PeerService extends ChangeNotifier {
   /// Blocked peers STAY in the roster and sort last (Phase 4 P4.1). A blocked
   /// neighbour vanishing would be a lie about who is on the segment, and the
   /// operator has to be able to find them to unblock.
+  ///
+  /// ONE ENTRY PER PERSON (Phase 4 multi-device): a person's devices stand
+  /// behind one representative ([devicesOfPeer] has the rest), and our own
+  /// other devices are not peers at all.
   List<AgoraPeer> get peers {
     final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
-    final list = _peers.values.toList();
+    final groups = <String, List<AgoraPeer>>{};
+    for (final p in _peers.values) {
+      final k = personKey(_hex(p.uuid));
+      if (k.isEmpty) continue;
+      (groups[k] ??= <AgoraPeer>[]).add(p);
+    }
+    final list = [for (final g in groups.values) _representative(g, now)];
     list.sort((a, b) {
       if (a.blocked != b.blocked) return a.blocked ? 1 : -1;
       final sa = tieStrength(a,
@@ -1135,12 +1283,17 @@ class PeerService extends ChangeNotifier {
 
   /// Tie strength S ∈ [0,1] for [peer] from this node's viewpoint (own opt-in
   /// bucket + current time), for the UI to render alongside the roster.
-  double strengthOf(AgoraPeer peer) => tieStrength(
-        peer,
-        ownGeohash: _ownGeohash,
-        nowEpochSeconds: DateTime.now().millisecondsSinceEpoch / 1000.0,
-        weights: _weights,
-      );
+  /// A person's strength is their strongest device's.
+  double strengthOf(AgoraPeer peer) {
+    final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
+    var best = 0.0;
+    for (final d in devicesOfPeer(peer)) {
+      final s = tieStrength(d,
+          ownGeohash: _ownGeohash, nowEpochSeconds: now, weights: _weights);
+      if (s > best) best = s;
+    }
+    return best;
+  }
 
   /// The attention-budget ledger over this node's strong ties (§3.3): how much
   /// of the budget the tended, proximity-weighted connections consume, and which
@@ -1149,8 +1302,10 @@ class PeerService extends ChangeNotifier {
   ///
   /// Blocked peers are left out: a blocked tie is not an attended tie, and it
   /// must not spend budget or be the tie the ledger fades.
+  ///
+  /// One person is one tie, however many devices they carry.
   BudgetLedger get budgetLedger => BudgetLedger.compute(
-        _peers.values.where((p) => !p.blocked),
+        peers.where((p) => !p.blocked),
         ownGeohash: _ownGeohash,
         nowEpochSeconds: DateTime.now().millisecondsSinceEpoch / 1000.0,
         weights: _weights,
@@ -1447,6 +1602,103 @@ class PeerService extends ChangeNotifier {
     }
     _saveCommunities();
     notifyListeners();
+  }
+
+  // --- the address book and this person's devices (Phase 4 multi-device) ----
+
+  /// The people this reader added on purpose, each one record that may list
+  /// several devices, and this reader's own other devices. The node owns the
+  /// book; this mirrors what it said.
+  final AddressBook book = AddressBook();
+
+  /// This device's cert, read from the daemon's config at [start].
+  DeviceCertStatus deviceCert = DeviceCertStatus.unknown;
+
+  /// Where this node's daemon keeps its state (for showing paths and commands).
+  String get root => _daemon.root;
+
+  /// Re-read this device's cert (after the operator issued one).
+  Future<void> reloadDeviceCert() async {
+    deviceCert = await DeviceCertStatus.load(_daemon.root, _ownUuidHex);
+    notifyListeners();
+  }
+
+  String get _q => _daemon.queues.appToAt;
+
+  /// Ask the node for the whole address book and the sibling list. A list
+  /// answer replaces what is held.
+  void refreshBook() {
+    final ev = _events;
+    if (ev == null) return;
+    ev.fcList(_q, refBookList);
+    ev.siblingList(_q, refSiblingList);
+  }
+
+  /// Mint a link for someone to add us; it arrives as [AddressBook.invitation].
+  int createInvitation() => _events?.fcInvite(_q, refInvite) ?? -1;
+
+  /// Mint a pairing link for another device of ours; it arrives as
+  /// [AddressBook.pairInvitation]. Refused without a device cert.
+  int createPairInvitation() => _events?.fcPairInvite(_q, refPairInvite) ?? -1;
+
+  /// Redeem a link: a contact's, or our own other device's pairing link (the
+  /// node tells them apart). [inPerson] ONLY when the link crossed face to face.
+  int redeemInvitation(String link, {bool inPerson = false, String petname = ''}) {
+    final t = link.trim();
+    if (t.isEmpty) return -1;
+    book.lastRefusal = null;
+    return _events?.fcInitiate(_q, refRedeem, t,
+            inPerson: inPerson, petname: petname.trim()) ??
+        -1;
+  }
+
+  int requestSafetyNumber(Contact c) =>
+      _events?.fcSafetyNumber(_q, refSafetyNumber, c.uuid) ?? -1;
+
+  /// Mark [c] verified: by [presented] digits typed from THEIR screen, or by
+  /// [confirmed] when the two screens were compared by eye.
+  int verifyContact(Contact c, {String? presented, bool confirmed = false}) {
+    book.lastRefusal = null;
+    return _events?.fcVerify(_q, refVerify, c.uuid,
+            presented: presented, confirmed: confirmed) ??
+        -1;
+  }
+
+  int renameContact(Contact c, String petname) =>
+      _events?.fcRename(_q, refRename, c.uuid, petname.trim()) ?? -1;
+
+  int removeContact(Contact c) => _events?.fcRemove(_q, refRemove, c.uuid) ?? -1;
+
+  /// Unpair one of our own devices, here only.
+  int removeSibling(Sibling s) =>
+      _events?.siblingRemove(_q, refSiblingRemove, s.uuid) ?? -1;
+
+  /// Seal the address book and sibling list to [path]. A null [passphrase]
+  /// asks the node for a generated one, shown once in [AddressBook.lastBackup].
+  int exportBackup(String path, {String? passphrase}) {
+    book.lastBackup = null;
+    return _events?.backupExport(_q, refBackupExport, path,
+            passphrase: passphrase) ??
+        -1;
+  }
+
+  int importBackup(String path, String passphrase) {
+    book.lastBackup = null;
+    return _events?.backupImport(_q, refBackupImport, path, passphrase) ?? -1;
+  }
+
+  /// Where an exported backup goes unless the user names a place.
+  String defaultBackupPath([DateTime? now]) {
+    final d = (now ?? DateTime.now()).toIso8601String().substring(0, 10);
+    return '${_daemon.root}/var/agora/backups/agora-$d.atbk';
+  }
+
+  bool _ingestAddressBookEvent(AtRawEvent e) {
+    final r = book.ingest(e);
+    if (r.handled && e.kind == agoraEventContact && e.fcKind == atFcDeviceLinked) {
+      _onDeviceLinked(_hex(e.uuid), _hex(e.fcDeviceUuid));
+    }
+    return r.handled && r.consumed;
   }
 
   // --- proximity hubs (Phase 4, SOCIAL_APP_PLAN §4.1 band 2) -----------------
@@ -2030,6 +2282,8 @@ class PeerService extends ChangeNotifier {
     }
 
     _events!.requestRoster(_daemon.queues.appToAt);
+    deviceCert = await DeviceCertStatus.load(_daemon.root, _ownUuidHex);
+    refreshBook();
     // Hand the core what this reader follows, so it carries each policy even if
     // its own record was lost, and mint our own community's policy if this node
     // holds the polity's root key.
@@ -2062,6 +2316,12 @@ class PeerService extends ChangeNotifier {
       _ticksSinceRoster = 0;
       ev.requestRoster(_daemon.queues.appToAt);
     }
+    // Something changed the book behind our back (a sibling's sync, a pairing,
+    // a restore, a link redeemed): re-list, at most once a tick.
+    if (book.needsRefresh) {
+      book.needsRefresh = false;
+      refreshBook();
+    }
     if (hubs.listed.isNotEmpty && ++_ticksSinceHubLookup >= _hubLookupEveryTicks) {
       _ticksSinceHubLookup = 0;
       lookupNearby();
@@ -2091,6 +2351,9 @@ class PeerService extends ChangeNotifier {
       // A community's policy, and a moderator's label (Phase 4).
       if (_ingestCommunityPolicy(e)) continue;
       if (_ingestPostLabel(e)) continue;
+      // The address book first: a hub request's REFUSED / ESTABLISHED is seen
+      // by both, everything else is the book's alone.
+      if (_ingestAddressBookEvent(e)) continue;
       if (_ingestHubEvent(e)) continue;
       // A co-signature ask, and a signature coming back — a live exchange.
       if (_ingestCosignRequest(e)) continue;
@@ -2103,6 +2366,17 @@ class PeerService extends ChangeNotifier {
       if (_ownUuidHex.isNotEmpty && key == _ownUuidHex) continue;
       final peer = _peers.putIfAbsent(key, () => _newPeer(e.uuid));
       peer.applyEvent(e);
+      // One person, several devices: a device of someone we are connected to
+      // is connected to as well, in both directions, without asking again.
+      if (_extendConnectionTo.remove(key) &&
+          !peer.isConnected &&
+          peer.connection != ConnectionState.pendingOut) {
+        _autoConnect(peer);
+      }
+      if (peer.hasInboundRequest &&
+          devicesOfPeer(peer).skip(1).any((d) => d.isConnected)) {
+        _events?.connectRespond(_daemon.queues.appToAt, peer.uuid, true);
+      }
       // Resolve an optimistic connect (Increment 5 UX): the core echoes the real
       // edge state after handle_app_connect_request. pending_out/connected confirm
       // the request; a revert to none/declined means it could not be issued (the

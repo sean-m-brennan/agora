@@ -102,13 +102,17 @@ class HubDirectory {
     ]..sort((a, b) => b.seenAt.compareTo(a.seenAt));
   }
 
-  /// Every card found, in every area; one per person (the freshest).
-  List<HubCard> allCards({DateTime? now}) {
+  /// Every card found, in every area; one per person (the freshest). With
+  /// [personOf], devices of one person (Phase 4 multi-device) count once, and a
+  /// card whose person is '' (one of our own devices) is left out.
+  List<HubCard> allCards({DateTime? now, String Function(String uuidHex)? personOf}) {
     final best = <String, HubCard>{};
     for (final area in _cards.keys) {
       for (final c in cardsIn(area, now: now)) {
-        final held = best[c.uuidHex];
-        if (held == null || c.seenAt.isAfter(held.seenAt)) best[c.uuidHex] = c;
+        final key = personOf == null ? c.uuidHex : personOf(c.uuidHex);
+        if (key.isEmpty) continue;
+        final held = best[key];
+        if (held == null || c.seenAt.isAfter(held.seenAt)) best[key] = c;
       }
     }
     return best.values.toList()..sort((a, b) => b.seenAt.compareTo(a.seenAt));

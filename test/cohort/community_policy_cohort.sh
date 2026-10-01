@@ -320,11 +320,32 @@ class Ev(ctypes.Structure):
         ("area_issuer", ctypes.c_char * (64 + 1)),
         ("fc_seq", ctypes.c_int64),
         ("fc_count", ctypes.c_int32),
+        # Multi-device (41296): the address-book / device / backup tail.
+        ("fc_blob", ctypes.c_char * (7679 + 1)),
+        ("fc_expiry", ctypes.c_int64),
+        ("fc_role", ctypes.c_int32),
+        ("fc_petname", ctypes.c_char * (128 + 1)),
+        ("fc_verified", ctypes.c_uint8),
+        ("fc_provenance", ctypes.c_int32),
+        ("fc_added_at", ctypes.c_double),
+        ("fc_verified_at", ctypes.c_double),
+        ("fc_safety_number", ctypes.c_char * (71 + 1)),
+        ("fc_method", ctypes.c_int32),
+        ("fc_peer_dropped", ctypes.c_uint8),
+        ("fc_device_uuid", ctypes.c_uint8 * 16),
+        ("fc_origin", ctypes.c_int32),
+        ("backup_path", ctypes.c_char * (4095 + 1)),
+        ("backup_passphrase", ctypes.c_char * (31 + 1)),
+        ("backup_contacts", ctypes.c_int32),
+        ("backup_siblings", ctypes.c_int32),
+        ("backup_added", ctypes.c_int32),
+        ("backup_updated", ctypes.c_int32),
+        ("backup_removed", ctypes.c_int32),
     ]
 
 # ABI guard: MUST equal sizeof(agora_event_t) in at_agora_shim.h. A silent drift
 # here would decode every field past the drift point as garbage.
-assert ctypes.sizeof(Ev) == 29200, f"Ev size {ctypes.sizeof(Ev)} != 29200 (ABI drift)"
+assert ctypes.sizeof(Ev) == 41296, f"Ev size {ctypes.sizeof(Ev)} != 41296 (ABI drift)"
 
 EV_PEER, EV_POST, EV_POLICY, EV_LABEL = 1, 9, 16, 17
 

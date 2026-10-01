@@ -65,7 +65,7 @@ class _NearbyHubsPageState extends State<NearbyHubsPage> {
         listenable: s,
         builder: (context, _) {
           final listable = s.listableAreas;
-          final cards = s.hubs.allCards();
+          final cards = s.hubs.allCards(personOf: s.personKey);
           final incoming = s.hubs.incoming.values.toList();
           return ListView(
             children: [

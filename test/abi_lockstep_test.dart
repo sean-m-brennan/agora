@@ -74,10 +74,12 @@ void main() {
     // Grew 8024 -> 11288 with the P3.2 business tail, 11288 -> 17872 with the
     // P3.3 co-signing tail, 17872 -> 22152 with the P3.4 business-post tail,
     // 22152 -> 22168 with the P4.1 moderation tail, 22168 -> 28600 with the
-    // Phase 4 communities tail, and 28600 -> 29200 with the proximity-hub tail. When this fails, the C struct moved:
-    // update at_agora_shim.c's _Static_assert, ALL SEVEN cohort ctypes Ev
-    // asserts, and this one TOGETHER, and check that only the tail grew.
-    expect(sizeOf<AgoraEvent>(), 29200,
+    // Phase 4 communities tail, 28600 -> 29200 with the proximity-hub tail, and
+    // 29200 -> 41296 with the multi-device address-book / backup tail. When
+    // this fails, the C struct moved: update at_agora_shim.c's _Static_assert,
+    // ALL NINE cohort ctypes Ev asserts, and this one TOGETHER, and check that
+    // only the tail grew.
+    expect(sizeOf<AgoraEvent>(), 41296,
         reason: 'agora_event_t drift — poll() would misread every field '
             'past the drift point');
   });
@@ -192,5 +194,28 @@ void main() {
     expect(agoraEventCosignRequest, 13);
     expect(agoraEventCosignSignature, 14);
     expect(agoraEventBusinessPost, 15);
+    expect(agoraEventArea, 18);
+    expect(agoraEventContact, 19);
+    expect(agoraEventBackup, 20);
+  });
+
+  test('the address-book and backup bounds and kinds match the C header', () {
+    // at_first_contact.h: AT_FC_BLOB_LEN 7680, AT_FC_SAFETY_NUMBER_LEN 72,
+    // AT_FC_PATH_LEN 4096, AT_FC_PASSPHRASE_LEN 32 (each a NUL past these);
+    // the shim _Static_asserts its copies against them.
+    expect(agoraFcBlobMax, 7679);
+    expect(agoraFcSafetyNumberMax, 71);
+    expect(agoraBackupPathMax, 4095);
+    expect(agoraBackupPassphraseMax, 31);
+    expect([atFcInvitation, atFcContact, atFcContactsDone, atFcSafetyNumber,
+            atFcVerified, atFcRemoved],
+        [1000, 1004, 1005, 1006, 1007, 1008]);
+    expect([atFcDeviceLinked, atFcSiblingPaired, atFcSibling, atFcSiblingsDone,
+            atFcSiblingRemoved],
+        [1018, 1019, 1020, 1021, 1022]);
+    expect([atBackupWritten, atBackupRestored, atBackupRefused],
+        [1031, 1032, 1033]);
+    expect(atFcReasonNotSibling, 10);
+    expect([atFcOriginLocal, atFcOriginSibling, atFcOriginBackup], [0, 1, 2]);
   });
 }

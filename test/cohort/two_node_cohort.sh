@@ -312,16 +312,38 @@ class Ev(ctypes.Structure):
         ("area_issuer", ctypes.c_char * (64 + 1)),
         ("fc_seq", ctypes.c_int64),
         ("fc_count", ctypes.c_int32),
+        # Multi-device (41296): the address-book / device / backup tail.
+        ("fc_blob", ctypes.c_char * (7679 + 1)),
+        ("fc_expiry", ctypes.c_int64),
+        ("fc_role", ctypes.c_int32),
+        ("fc_petname", ctypes.c_char * (128 + 1)),
+        ("fc_verified", ctypes.c_uint8),
+        ("fc_provenance", ctypes.c_int32),
+        ("fc_added_at", ctypes.c_double),
+        ("fc_verified_at", ctypes.c_double),
+        ("fc_safety_number", ctypes.c_char * (71 + 1)),
+        ("fc_method", ctypes.c_int32),
+        ("fc_peer_dropped", ctypes.c_uint8),
+        ("fc_device_uuid", ctypes.c_uint8 * 16),
+        ("fc_origin", ctypes.c_int32),
+        ("backup_path", ctypes.c_char * (4095 + 1)),
+        ("backup_passphrase", ctypes.c_char * (31 + 1)),
+        ("backup_contacts", ctypes.c_int32),
+        ("backup_siblings", ctypes.c_int32),
+        ("backup_added", ctypes.c_int32),
+        ("backup_updated", ctypes.c_int32),
+        ("backup_removed", ctypes.c_int32),
     ]
-# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (29200 with
+# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (41296 with
 # the geohash + profile_json + connection_state + DM + POST + REACTION + in_group +
 # proximity_band + BUSINESS_AD tail; rtt@116, geohash@120, profile_json@133,
 # connection_state@2696, dm_seq@2704, post_id@3745, post_seq@3752, reaction tail after
 # post_body, in_group@8016 + proximity_band@8020 in the tail padding, business tail
 # from 8024, co-signing tail from 11288, business-post tail from 17864, moderation
-# tail from 22149, communities tail from 22168). If the C struct grows and this is not updated in lockstep, poll() would
+# tail from 22149, communities tail from 22168, hub tail from 28600, multi-device
+# tail from 29196). If the C struct grows and this is not updated in lockstep, poll() would
 # misread every field past the drift.
-assert ctypes.sizeof(Ev) == 29200, f"Ev size {ctypes.sizeof(Ev)} != 29200 (ABI drift)"
+assert ctypes.sizeof(Ev) == 41296, f"Ev size {ctypes.sizeof(Ev)} != 41296 (ABI drift)"
 
 lib = ctypes.CDLL(shim)
 lib.agora_set_root.argtypes = [ctypes.c_char_p]; lib.agora_set_root.restype = None

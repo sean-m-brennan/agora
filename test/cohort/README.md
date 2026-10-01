@@ -31,6 +31,25 @@ This file is the index.
 Exit status is 0 on PASS and non-zero on the first failed phase, except for
 `drive_ethne_half.sh`, which counts failures (see below).
 
+## Running them all
+
+```
+./test/cohort/run_all.sh                        # every cohort, in a fixed order
+./test/cohort/run_all.sh hub moderation         # only these
+./test/cohort/run_all.sh --skip partition,staff
+./test/cohort/run_all.sh --fail-fast            # stop at the first failure
+./test/cohort/run_all.sh --list                 # the run order
+```
+
+Run it as yourself. It re-runs itself under `sudo -E env "PATH=$PATH"` and adds
+`/usr/sbin` and `/sbin` to PATH. It runs every cohort even when one fails,
+prints a PASS/FAIL table, and exits with the number that failed. Each
+script's output is in `.coh/run-all-<pid>/<name>.log`. Env knobs such as `WAIT`
+or `KEEP` pass through to every script. A new `*_cohort.sh` is picked up
+automatically. `two_node_gui.sh` is left out because it needs a display and
+asserts nothing. Build first: the runner only checks that `native/build/agorad`
+exists.
+
 ## The tests
 
 | Script | Nodes | Needs | What it proves |
@@ -46,6 +65,7 @@ Exit status is 0 on PASS and non-zero on the first failed phase, except for
 | `partition_cohort.sh` | 7 | — | Phase 4 DDIL: a 3+2 split keeps both islands working, only the majority admits or finalizes, and the heal loses no post (store-and-forward) and no transaction (re-proposal) |
 | `community_policy_cohort.sh` | 4 | Ethne | Phase 4 communities: a policy the roll set is carried by members, verified on arrival, and applied only by a follower; a moderator's label reaches followers only; loosening needs more than a majority; an unseated moderator stops counting |
 | `hub_cohort.sh` | 5, two segments | Ethne | Phase 4 proximity hubs: two islands with no route between them meet at their community's area hub. The roll seats the hub, its roster rides inside the policy, only people listed in the area see who is, a listing outside the hub's area is refused, a request becomes a direct peer only on the other's yes, and withdrawing takes effect at once |
+| `device_cohort.sh` | 5, routed /30 links | libsodium | Phase 4 multi-device: a contact added and verified by safety number, a pairing refused across operators and accepted within one, the address book following to the new device, the contact filing it under the same person (live and in the list), a DM reaching the other device, and a lost-both restore from a 0600 backup that keeps the contact verified and links a third device |
 
 ### `two_node_cohort.sh`
 
@@ -252,6 +272,34 @@ netns only.
 sudo -E env "PATH=$PATH" ./test/cohort/community_policy_cohort.sh
 ```
 
+
+### `device_cohort.sh`
+
+One human's three devices (`annphone`, `annlaptop`, `anntablet`), a contact
+(`bob`) and a device of another operator (`eve`). Each node has its own /30
+link to a router namespace that forwards unicast, so broadcast discovery never
+joins them into one group: every crossing is the address book's doing. The
+driver plays the operator too. It signs device certs with libsodium the way
+`tools/device_cert.py` does, so the operator key never enters a node. PASS needs:
+
+1. bob's link redeemed by annphone, the same safety number on both screens,
+   and bob verified by typing annphone's;
+2. eve refused `not_sibling` on annphone's pairing link;
+3. annlaptop paired, with bob in its book (verified, provenance `sibling`);
+4. bob's node filing annlaptop under Ann (`DEVICE_LINKED`), and bob's list
+   naming it under the one record;
+5. with annphone stopped, a DM from bob reaching annlaptop;
+6. annphone's backup (0600, generated passphrase) restored on a fresh
+   anntablet with both old devices gone, bob still verified (provenance
+   `backup`);
+7. bob's node filing anntablet under Ann too: one record, three devices.
+
+```
+sudo -E env "PATH=$PATH" ./test/cohort/device_cohort.sh
+```
+
+Knobs: `WAIT` (120), `SUBNET` (10.9.10), `LOG_LEVEL`, `KEEP=1`.
+
 ## Options
 
 All options are environment variables.
@@ -268,7 +316,7 @@ All options are environment variables.
 | `AGORA_DIR` | the script's `../..` | all | The agora checkout to test |
 | `AGORA_ETHNE_PATH` | `native/build/libethne_agora.so` | business, business_post, staff, drive_ethne_half, community_policy, hub | The Ethne cdylib |
 | `DOCKER_IMAGE` | `ubuntu:26.04` | 3-node cohorts | Image for the docker backend. The host-built `agorad` is bind-mounted and its non-base libraries are staged beside it, so a stock image works. `Dockerfile.node` builds an alternative with those libraries installed. Either way, the base must match the host's Ubuntu release. |
-| `AGORA_COHORT_RUN` | see below | business_post, reputation, moderation, partition, staff, community_policy, hub | Run directory. Set a short path (e.g. `/tmp/ag-$$`) when a deep checkout makes the node socket paths exceed 108 bytes; the preflight refuses and says so. netns only: docker can bind-mount only paths it shares with the daemon. |
+| `AGORA_COHORT_RUN` | see below | business_post, reputation, moderation, partition, staff, community_policy, hub, device | Run directory. Set a short path (e.g. `/tmp/ag-$$`) when a deep checkout makes the node socket paths exceed 108 bytes; the preflight refuses and says so. netns only: docker can bind-mount only paths it shares with the daemon. |
 
 ### Per script
 
@@ -284,13 +332,14 @@ All options are environment variables.
 | `community_policy_cohort.sh` | 120 | `10.9.7` | `GATE_WINDOW` (how long `dee` must see no label, default 30); `POLICY_SEC` (the nodes' `AT_SOCIAL_POLICY_SEC`, how often a follower re-carries its policy, default 10); `LOG_LEVEL` (default 2) |
 | `hub_cohort.sh` | 120 | `10.9.8` + `10.9.9` (`SUBNET_A`, `SUBNET_B`) | `POLICY_SEC` (as community_policy, default 10); `LOG_LEVEL` (default 2). Bridges `agbr8` + `agbr9`; the hub has a leg on each with `ip_forward=0` |
 | `moderation_cohort.sh` | 90 | `10.9.5` | `GATE_WINDOW` (how long a negative waits, default 20); `NEUTRAL` (`AT_REP_NEUTRAL`, default 0.70); `RESCORE_SEC` (`AT_REP_RESCORE_SEC`, default 5); `CHECKPOINT_SEC` (default 20) |
+| `device_cohort.sh` | 120 | `10.9.10` (one /30 per node behind router netns `agdvrouter`) | `LOG_LEVEL` (default 2). Operator keys are random per run and never written to a node |
 
 ## Where the evidence goes
 
 Each run writes its node roots, `agorad.log` files and driver logs to a run
 directory:
 
-- `business_post`, `reputation`, `moderation`, `partition`, `staff`: `.coh/<tag>-<pid>/`
+- `business_post`, `reputation`, `moderation`, `partition`, `staff`, `hub`, `device`: `.coh/<tag>-<pid>/`
   under the agora directory (`staff` falls back to `/tmp/ag-<pid>` under netns
   when the checkout is too deep). **These are kept on failure** as well as with
   `KEEP=1`, so a failed host run can be read afterwards.

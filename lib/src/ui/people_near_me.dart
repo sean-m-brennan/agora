@@ -18,6 +18,7 @@ import 'blocked_list.dart';
 import 'businesses_near_me.dart';
 import 'circles_view.dart';
 import 'communities_view.dart';
+import 'contacts_page.dart';
 import 'dm_thread.dart';
 import 'feed_view.dart';
 import 'moderation_sheets.dart';
@@ -81,6 +82,16 @@ class _PeopleNearMePageState extends State<PeopleNearMePage> {
             onPressed: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
                 builder: (_) => FeedPage(service: service),
+              ),
+            ),
+          ),
+          IconButton(
+            key: const Key('open-contacts'),
+            icon: const Icon(Icons.contacts_outlined),
+            tooltip: 'Contacts and your devices',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => ContactsPage(service: service),
               ),
             ),
           ),
@@ -450,11 +461,15 @@ class _PeerTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
     final present = peer.operatorBound && peer.operatorAttestedAt > 0;
-    final strength =
-        tieStrength(peer, ownGeohash: ownGeohash, nowEpochSeconds: now);
+    // One person, several devices (Phase 4): the strongest device's tie, the
+    // name from the address book when they are in it, and how many devices.
+    final strength = service.strengthOf(peer);
     final audience = audienceLabel(audienceForTier(trustTier(peer)));
-    final nameText = peer.hasProfile
-        ? Text(peer.displayLabel)
+    final contact = service.contactOf(peer);
+    final devices = service.deviceCountOf(peer);
+    final name = contact?.label ?? (peer.hasProfile ? peer.displayLabel : null);
+    final nameText = name != null
+        ? Text(devices > 1 ? '$name · $devices devices' : name)
         : Text(peer.shortId, style: const TextStyle(fontFamily: 'monospace'));
     // Group co-membership indicator (distinct from a connection edge): shown
     // once the cohort converges and this peer's address is in our group. A quiet
