@@ -45,7 +45,7 @@ from autonomous_trust.core.identity import Identity
 from autonomous_trust.social import handlers
 from autonomous_trust.social.state import SocialState
 from autonomous_trust.social.protocol import SocialProtocol
-from autonomous_trust.core.identity.protocol import IdentityProtocol, UNENCRYPTED_VERBS
+from autonomous_trust.core.identity.protocol import IdentityProtocol, CORE_UNENCRYPTED_VERBS
 from autonomous_trust.core.system import CfgIds
 from autonomous_trust.core.config import to_json_string
 from autonomous_trust.core.freshness import Freshness
@@ -317,5 +317,5 @@ def test_send_profile_query_emits(alice, bob):
 
 # -- the profile verbs are NOT plaintext pre-admission verbs ------------------
 def test_profile_verbs_not_in_unencrypted_allowlist():
-    assert SocialProtocol.profile_query not in UNENCRYPTED_VERBS
-    assert SocialProtocol.profile_response not in UNENCRYPTED_VERBS
+    assert SocialProtocol.profile_query not in CORE_UNENCRYPTED_VERBS
+    assert SocialProtocol.profile_response not in CORE_UNENCRYPTED_VERBS

@@ -2703,7 +2703,7 @@ pub unsafe extern "C" fn ethne_guardian_state(
 // P3.3 S9 — The member-roll border artifact (D26)
 // ---------------------------------------------------------------------------
 //
-// Border artifact #6: the polity's roll, published under its ROOT key, so its
+// Border artifact #5: the polity's roll, published under its ROOT key, so its
 // members have a real anonymous channel in the compact tier. KC models
 // communities and speakers and has no member roster, so an insider holding no
 // delegation was in no ring at all; this is the feed that fixes that.

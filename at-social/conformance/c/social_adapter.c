@@ -58,8 +58,6 @@
 #include "utilities/msg_types_priv.h"
 #include "utilities/allocation.h"
 #include <math.h>
-#include "contacts/contacts.h"
-#include "identity/first_contact.h"
 
 #include "negative_runner.h"
 #include "scenario_engine.h"

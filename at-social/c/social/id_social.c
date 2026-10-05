@@ -427,6 +427,11 @@ static struct {
     double       last_policy_ad_at;
     map_t        want_sent_at;
     map_t        want_served_at;
+    /* Report targets whose report AT is still holding for a full network
+     * queue (ISSUES §2.40): the day's cap is spent only once it goes, so a
+     * second report to the same target waits until the first is settled. */
+    uuid_t       reports_in_flight[ID_SEND_RETRY_MAX];
+    size_t       num_reports_in_flight;
     pthread_mutex_t lock;
     bool initialized;
 } social_state = { .lock = PTHREAD_MUTEX_INITIALIZER };
@@ -1662,24 +1667,14 @@ static void _submit_interaction_score(const process_t *proc,
     if (channel != NULL)
         at_strlcpy(msg.info.tx_score.channel, channel,
                    sizeof(msg.info.tx_score.channel));
-    /* Bounded retry, as identity_send_to_network does for the wire. The moderation
-     * cohort (run 8, 2026-09-23) lost ada's half of a report here: her
-     * reputation queue was full of catch-up traffic, one EAGAIN dropped the
-     * score, and the report went out anyway, so bob staged a half that could
-     * never pair. */
-    int ret = -1;
-    for (int attempt = 0; attempt < 10; attempt++)
-    {
-        ret = messaging_send("reputation", TRANSACTION_SCORE, &msg, false);
-        if (ret == 0)
-            break;
-        usleep(20000); /* 20ms */
-    }
-    if (ret != 0)
-        log_warn(proc->logger,
-                 "Identity: could not submit social score %.3f after 10 tries"
-                 " (%s) — this half is lost and nothing retries it\n", score,
-                 ret == EAGAIN ? "reputation queue still full" : "send failed");
+    /* Retried, and kept past a long burst, as identity_send_to does for every
+     * one-shot (AT ISSUES §2.40). The moderation cohort (run 8, 2026-09-23)
+     * lost ada's half of a report here: her reputation queue was full of
+     * catch-up traffic, one EAGAIN dropped the score, and the report went out
+     * anyway, so bob staged a half that could never pair. */
+    char what[48];
+    snprintf(what, sizeof(what), "social score %.3f", score);
+    (void)identity_send_to(proc, "reputation", &msg, what, "reputation");
 
     /* Record the staged score as the conformance/observability surface — the
      * deterministic thing a scenario asserts, independent of the Paxos round. */
@@ -3005,10 +3000,30 @@ static int identity_emit_reaction(const uuid_t reactor_uuid, const char *post_id
     return messaging_send(AT_MAIN_QUEUE, PEER_REACTION_OBSERVED, &msg, false);
 }
 
+/* What a reaction's on-sent callback needs to accrue our half. */
+typedef struct {
+    uuid_t reactor;
+    uuid_t author;
+    char   post_id[AT_POST_ID_LEN + 1];
+} _reaction_sent_t;
+
+/* The reaction's fate: accrue our (reactor) half only if it went. */
+static void _on_reaction_sent(const process_t *proc, const void *ctx, bool sent)
+{
+    const _reaction_sent_t *r = ctx;
+    if (sent)
+        _social_accrue_reaction(proc, r->reactor, r->author, r->post_id);
+    else
+        log_warn(proc != NULL ? proc->logger : NULL,
+                 "Identity: a kept reaction was given up on; not scoring it\n");
+}
+
 /* Directed, encrypted reaction to the post's author: {post_id, seq, ts}.
- * crypto_box authenticates us, so no signature. Encrypt=true. */
+ * crypto_box authenticates us, so no signature. Encrypt=true. Our half of the
+ * score is accrued once the frame is really out (see handle_app_react_post). */
 static int _send_reaction(const process_t *proc, const public_identity_t *author,
-                          const char *post_id, int64_t seq, double ts)
+                          const uuid_t reactor, const char *post_id, int64_t seq,
+                          double ts)
 {
     generic_msg_t out = {0};
     out.type = NET_MESSAGE;
@@ -3024,7 +3039,13 @@ static int _send_reaction(const process_t *proc, const public_identity_t *author
     json_object_set_new(env, "ts", json_real(ts));
     net_msg_pack_json(&out.info.net_msg, env);
     json_decref(env);
-    return identity_send_to_network(proc, &out, "a post reaction", author->nickname);
+    _reaction_sent_t sent = {0};
+    uuid_copy(sent.reactor, reactor);
+    uuid_copy(sent.author, author->uuid);
+    snprintf(sent.post_id, sizeof(sent.post_id), "%s", post_id);
+    return identity_send_to_network_then(proc, &out, "a post reaction",
+                                         author->nickname, _on_reaction_sent,
+                                         &sent, sizeof(sent));
 }
 
 /* App -> AT verb (AT_APP_REACT_POST): the operator reacts to a peer's post.
@@ -3085,14 +3106,15 @@ static bool handle_app_react_post(const process_t *proc, directory_t *queues,
      * half-entry, and a score claimed for an interaction the other party
      * never had. Silently accruing anyway is what the 2026-09-21 cohort
      * caught: bob's half was submitted, alice never heard of the reaction,
-     * and nothing could reconcile them. */
-    if (_send_reaction(proc, &author, post_id, seq, ts) != 0) {
+     * and nothing could reconcile them.
+     *
+     * So the accrual is the send's on-sent callback, not this function's: a
+     * frame a full queue made AT keep (ISSUES §2.40) is scored when the tick
+     * gets it out, and never if it is given up on. */
+    if (_send_reaction(proc, &author, self->uuid, post_id, seq, ts) != 0)
         log_warn(proc->logger,
                  "Identity: react_post to %s was not sent; not scoring it\n",
                  author.nickname);
-        return true;
-    }
-    _social_accrue_reaction(proc, self->uuid, author_uuid, post_id);
     return true;
 }
 
@@ -3292,9 +3314,61 @@ static int _social_report_task(const uuid_t reporter, const uuid_t reported,
                                tail, sizeof(tail), task);
 }
 
-/* Directed, encrypted report to @p target: {seq, ts}. Encrypt=true. */
+/* What a report's on-sent callback needs to stage our half. */
+typedef struct {
+    uuid_t task;
+    uuid_t peer;
+    long   now;
+} _report_sent_t;
+
+/* Whether a report to @p peer is still held by AT; with @p set, mark it (true)
+ * or settle it (false) instead. Takes social_state.lock. */
+static bool _report_in_flight(const uuid_t peer, bool set, bool on)
+{
+    bool found = false;
+    pthread_mutex_lock(&social_state.lock);
+    size_t n = social_state.num_reports_in_flight;
+    for (size_t i = 0; i < n && !found; i++) {
+        if (uuid_compare(social_state.reports_in_flight[i], peer) != 0)
+            continue;
+        found = true;
+        if (set && !on)
+            uuid_copy(social_state.reports_in_flight[i],
+                      social_state.reports_in_flight[--social_state.num_reports_in_flight]);
+    }
+    if (set && on && !found && n < ID_SEND_RETRY_MAX)
+        uuid_copy(social_state.reports_in_flight[social_state.num_reports_in_flight++],
+                  peer);
+    pthread_mutex_unlock(&social_state.lock);
+    return found;
+}
+
+/* The report's fate. If it went: count it against the day's cap and stage our
+ * first-person half. If AT gave it up: nothing was spent, the operator may
+ * report again. */
+static void _on_report_sent(const process_t *proc, const void *ctx, bool sent)
+{
+    const _report_sent_t *r = ctx;
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(r->peer, peer_str);
+    _report_in_flight(r->peer, true, false);
+    if (!sent) {
+        log_warn(proc != NULL ? proc->logger : NULL,
+                 "Identity: a kept report of %s was given up on; not scoring"
+                 " it\n", peer_str);
+        return;
+    }
+    _social_report_outbound(peer_str, r->now, true);
+    _submit_interaction_score(proc, r->task, AT_SOCIAL_REPORT_SCORE, r->peer,
+                              TX_CHANNEL_FIRST_PERSON);
+    log_info(proc != NULL ? proc->logger : NULL,
+             "Identity: reported peer %s\n", peer_str);
+}
+
+/* Directed, encrypted report to @p target: {seq, ts}. Encrypt=true. Our half
+ * is staged once the frame is really out (see handle_app_report_peer). */
 static int _send_report(const process_t *proc, const public_identity_t *target,
-                        int64_t seq, double ts)
+                        const uuid_t task, long now, int64_t seq, double ts)
 {
     generic_msg_t out = {0};
     out.type = NET_MESSAGE;
@@ -3309,7 +3383,13 @@ static int _send_report(const process_t *proc, const public_identity_t *target,
     json_object_set_new(env, "ts", json_real(ts));
     net_msg_pack_json(&out.info.net_msg, env);
     json_decref(env);
-    return identity_send_to_network(proc, &out, "a report", target->nickname);
+    _report_sent_t sent = {0};
+    uuid_copy(sent.task, task);
+    uuid_copy(sent.peer, target->uuid);
+    sent.now = now;
+    return identity_send_to_network_then(proc, &out, "a report",
+                                         target->nickname, _on_report_sent,
+                                         &sent, sizeof(sent));
 }
 
 /* App -> AT verb (AT_APP_REPORT_PEER): the operator reports a peer. Payload
@@ -3350,6 +3430,12 @@ static bool handle_app_report_peer(const process_t *proc, directory_t *queues,
     char peer_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(peer_uuid, peer_str);
     long now = (long)time(NULL);
+    if (_report_in_flight(peer_uuid, false, false)) {
+        log_info(proc->logger,
+                 "Identity: report of %s refused: an earlier one is still"
+                 " waiting for the network queue\n", peer_str);
+        return true;
+    }
     if (!_social_report_outbound(peer_str, now, false)) {
         log_info(proc->logger,
                  "Identity: report of %s refused: daily report or accrual cap "
@@ -3365,17 +3451,18 @@ static bool handle_app_report_peer(const process_t *proc, directory_t *queues,
     if (_social_report_task(self->uuid, peer_uuid, (uint64_t)seq, task) != 0)
         return true;
     /* STAGE ONLY IF IT WENT — the reaction path's rule, for its reason: an
-     * unsent report would leave our half in the chain for good. */
-    if (_send_report(proc, &target, seq, (double)time(NULL)) != 0) {
+     * unsent report would leave our half in the chain for good. Staging (and
+     * the cap) is the send's on-sent callback, so a report AT kept for a full
+     * queue counts when it goes out and never if it is given up on. Until it
+     * is settled the target is marked in flight, so a second report cannot
+     * slip past the cap meanwhile. */
+    _report_in_flight(peer_uuid, true, true);
+    if (_send_report(proc, &target, task, now, seq, (double)time(NULL)) != 0) {
+        _report_in_flight(peer_uuid, true, false);   /* no callback follows */
         log_warn(proc->logger,
                  "Identity: report of %s was not sent; not scoring it\n",
                  target.nickname);
-        return true;
     }
-    _social_report_outbound(peer_str, now, true);
-    _submit_interaction_score(proc, task, AT_SOCIAL_REPORT_SCORE, peer_uuid,
-                              TX_CHANNEL_FIRST_PERSON);
-    log_info(proc->logger, "Identity: reported peer %s\n", peer_str);
     return true;
 }
 
@@ -6042,6 +6129,7 @@ static void _social_reset(void)
     pthread_mutex_lock(&social_state.lock);
     map_free(&social_state.peer_position_map);
     map_init(&social_state.peer_position_map);
+    social_state.num_reports_in_flight = 0;
     map_free(&social_state.peer_proximity_map);
     map_init(&social_state.peer_proximity_map);
     social_state.own_exact_set = false;

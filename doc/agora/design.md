@@ -209,7 +209,7 @@ inventing an audience system; we are labeling the one that exists.
 | **Presence ("active now")** | `operator_attested_at` nonce-fresh pull | AT operator-attended |
 | **Events / local happenings** | Business or person polity emits a signed event artifact; discovery is proximity-first | Ethne + position |
 | **Moderation / block / report** | Block = refuse traffic (tier floor). Report = negative reputation transaction. Ban from a business = polity **expulsion** (majority+1) | AT reputation + Ethne roll |
-| **Account recovery / device add** | Each device is its own node, certified by the person's operator key (out of band, `tools/device_cert.py`); devices with one operator **pair** and keep one address book; a verified contact files a new device under the same person; a passphrase-sealed **backup** restores the book onto a new device | AT first contact, Phase 4 (FIRST_CONTACT_PLAN) |
+| **Account recovery / device add** | Each device is its own node, certified by the person's operator key (out of band, `src/autonomous-trust-first-contact/tools/device_cert.py`); devices with one operator **pair** and keep one address book; a verified contact files a new device under the same person; a passphrase-sealed **backup** restores the book onto a new device | AT first contact, Phase 4 (FIRST_CONTACT_PLAN) |
 
 ### 4.1 Discovery, concretely
 

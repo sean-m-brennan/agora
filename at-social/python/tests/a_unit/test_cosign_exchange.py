@@ -218,9 +218,9 @@ def test_no_private_key_field_exists_on_either_envelope():
 # --- the wire ---------------------------------------------------------------- #
 
 def test_cosign_verbs_not_in_unencrypted_allowlist():
-    from autonomous_trust.core.identity.protocol import UNENCRYPTED_VERBS
-    assert SocialProtocol.cosign_request not in UNENCRYPTED_VERBS
-    assert SocialProtocol.cosign_sig not in UNENCRYPTED_VERBS
+    from autonomous_trust.core.identity.protocol import CORE_UNENCRYPTED_VERBS
+    assert SocialProtocol.cosign_request not in CORE_UNENCRYPTED_VERBS
+    assert SocialProtocol.cosign_sig not in CORE_UNENCRYPTED_VERBS
 
 
 # --- the exchange, end to end through the real handlers ---------------------- #

@@ -754,10 +754,15 @@ no_crosstalk() { # joiner "far nodes" -> 0 when nothing crossed
 
 # The app-driven task a node submitted most recently (`cap -` is the marker of
 # an app interaction, never one of AT's probes).
+# The newest APP task: one whose FIRST forward carried no capability. A
+# re-proposal of a dropped half is also logged "(cap -, ...)" whatever the task
+# was (rep_proc _repropose_dropped), so the newest "cap -" line can be an old
+# probe: part-655967 took an at.echo-challenge probe for island A's reaction and
+# phase 7 waited on it.
 app_task_of() {
   plain_log "$1" \
-    | sed -n 's/.*forwarding transaction for task \([0-9a-f-]*\),.*(cap -,.*/\1/p' \
-    | tail -1
+    | sed -n 's/.*forwarding transaction for task \([0-9a-f-]*\),.*(cap \([^,]*\),.*/\1 \2/p' \
+    | awk '!seen[$1]++ && $2 == "-" { t = $1 } END { if (t != "") print t }'
 }
 
 # Prove the group channel publisher -> observer is live before asserting what
@@ -959,9 +964,14 @@ island_commit() { # author reactor island-label -> sets ISLAND_TASK
   drive "$reactor" react "$saw_json" "$WAIT" >/dev/null || return 4
   local deadline=$(( SECONDS + WAIT )) t_a="" t_r=""
   ISLAND_TASK=""
+  # The REACTOR's newest app task is the reaction; the author must have
+  # forwarded that same task at some point. Not the author's newest: it can be
+  # a re-proposal of an older dropped half (rep_proc _repropose_dropped), which
+  # is how part-556681 failed with the reaction already bilateral on both.
   while [ "$SECONDS" -lt "$deadline" ]; do
-    t_a=$(app_task_of "$author"); t_r=$(app_task_of "$reactor")
-    if [ -n "$t_a" ] && [ "$t_a" = "$t_r" ]; then
+    t_r=$(app_task_of "$reactor"); t_a=""
+    if [ -n "$t_r" ] && plain_log "$author" | grep -q "forwarding transaction for task $t_r,"; then
+      t_a="$t_r"
       if saw "$author" "task $t_a is bilateral" || saw "$reactor" "task $t_a is bilateral"; then
         ISLAND_TASK="$t_a"; return 0
       fi

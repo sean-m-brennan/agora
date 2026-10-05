@@ -15,6 +15,11 @@
 #          page it carries is the one it LEARNED.
 #   bob  — a bystander who arrives LATE, after biz is dead. He never met the
 #          business at all.
+#   cal  — a silent witness, there only so the group can admit bob once biz is
+#          gone. Admission takes a majority of the WHOLE group (AT ISSUES §2.26,
+#          and a stopped member stays on the roster, §2.21): in {biz, ada} ada
+#          alone is 1 of 2 and could never let bob in; in {biz, ada, cal} ada and
+#          cal are 2 of 3. cal observes nothing and advertises nothing.
 #
 # What it proves, in order:
 #   1. An ad crosses the whole runtime and lands on the APP-EVENT QUEUE (kind 12
@@ -77,11 +82,12 @@ SUBNET="${SUBNET:-10.9.1}"
 GEO="${GEO:-u4pruy}"
 # .11/.12/.13, not .1/.2/.3: a docker bridge network claims .1 for its own
 # gateway, and a container asking for it is refused.
-IP_BIZ="$SUBNET.11"; IP_ADA="$SUBNET.12"; IP_BOB="$SUBNET.13"; PREFIX=24
+IP_BIZ="$SUBNET.11"; IP_ADA="$SUBNET.12"; IP_BOB="$SUBNET.13"; IP_CAL="$SUBNET.14"; PREFIX=24
 
-NS_BIZ=agbiz; NS_ADA=agada; NS_BOB=agbob
+NS_BIZ=agbiz; NS_ADA=agada; NS_BOB=agbob; NS_CAL=agcal
 BR=agbr1
 V_BIZ=agvb; V_BIZB=agvbb; V_ADA=agva; V_ADAB=agvab; V_BOB=agvo; V_BOBB=agvob
+V_CAL=agvc; V_CALB=agvcb
 
 BACKEND="${BACKEND:-auto}"
 NET=agora-biz-net                          # docker network name
@@ -90,10 +96,11 @@ NET=agora-biz-net                          # docker network name
 # bind-mounts paths shared with it, and in a sandbox that is the repo tree. The
 # socket path stays well inside sun_path's 108 bytes ($ROOT/var/at/<queue>).
 RUN="$AGORA_DIR/.cohort/biz-$$"
-ROOT_BIZ="$RUN/biz"; ROOT_ADA="$RUN/ada"; ROOT_BOB="$RUN/bob"; LIBSTAGE="$RUN/lib"
-mkdir -p "$ROOT_BIZ" "$ROOT_ADA" "$ROOT_BOB" "$LIBSTAGE"
+ROOT_BIZ="$RUN/biz"; ROOT_ADA="$RUN/ada"; ROOT_BOB="$RUN/bob"; ROOT_CAL="$RUN/cal"
+LIBSTAGE="$RUN/lib"
+mkdir -p "$ROOT_BIZ" "$ROOT_ADA" "$ROOT_BOB" "$ROOT_CAL" "$LIBSTAGE"
 
-PID_BIZ=""; PID_ADA=""; PID_BOB=""
+PID_BIZ=""; PID_ADA=""; PID_BOB=""; PID_CAL=""
 
 log()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  OK\033[0m %s\n' "$*"; }
@@ -207,7 +214,7 @@ stage_libs() {
 
 net_up() {
   if [ "$BACKEND" = netns ]; then
-    log "Creating bridge $BR + three namespaces on $SUBNET.0/$PREFIX"
+    log "Creating bridge $BR + four namespaces on $SUBNET.0/$PREFIX"
     ip link add "$BR" type bridge
     ip link set "$BR" up
     mk_ns() { # ns veth vethb ip
@@ -222,6 +229,7 @@ net_up() {
     mk_ns "$NS_BIZ" "$V_BIZ" "$V_BIZB" "$IP_BIZ"
     mk_ns "$NS_ADA" "$V_ADA" "$V_ADAB" "$IP_ADA"
     mk_ns "$NS_BOB" "$V_BOB" "$V_BOBB" "$IP_BOB"
+    mk_ns "$NS_CAL" "$V_CAL" "$V_CALB" "$IP_CAL"
     if [ -e /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
       echo 0 > /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || true
     fi
@@ -288,6 +296,7 @@ net_down() {
     ip netns del "$NS_BIZ" 2>/dev/null
     ip netns del "$NS_ADA" 2>/dev/null
     ip netns del "$NS_BOB" 2>/dev/null
+    ip netns del "$NS_CAL" 2>/dev/null
     ip link del "$BR" 2>/dev/null
   else
     docker network rm "$NET" >/dev/null 2>&1
@@ -296,7 +305,7 @@ net_down() {
 
 cleanup() {
   local keep="${KEEP:-0}"
-  node_stop "$PID_BIZ"; node_stop "$PID_ADA"; node_stop "$PID_BOB"
+  node_stop "$PID_BIZ"; node_stop "$PID_ADA"; node_stop "$PID_BOB"; node_stop "$PID_CAL"
   if [ "$keep" = "1" ]; then
     log "KEEP=1 — leaving the network and $RUN in place."
     return
@@ -659,13 +668,28 @@ drive() { # root verb args...
 # --------------------------------------------------------------------------- #
 # Phase 1 — the business advertises; the customer's app queue sees it
 # --------------------------------------------------------------------------- #
-log "Phase 1: starting biz ($IP_BIZ) and ada ($IP_ADA)"
+# One at a time, founder first, as partition_cohort.sh does: three nodes
+# started together can found two groups that a common joiner never introduces
+# (AT ISSUES §2.33).
+log "Phase 1: starting biz ($IP_BIZ), then ada ($IP_ADA), then the witness cal ($IP_CAL)"
+in_log() { grep -q "$2" "$1/agorad.log" 2>/dev/null; }
+await_log() { # root pattern what
+  local deadline=$(( SECONDS + WAIT ))
+  until in_log "$1" "$2"; do
+    [ "$SECONDS" -lt "$deadline" ] || { err "FAIL (phase 1) — $3 in ${WAIT}s"; tail -n 30 "$1/agorad.log" 2>/dev/null; exit 1; }
+    sleep 1
+  done
+}
 PID_BIZ="$(node_start "$NS_BIZ" "$ROOT_BIZ" agora-biz biz-seed-1 "$IP_BIZ")" || exit 1
+await_log "$ROOT_BIZ" "self-bootstrapping a fresh group" "biz never founded a group"
 PID_ADA="$(node_start "$NS_ADA" "$ROOT_ADA" agora-ada ada-seed-1 "$IP_ADA")" || exit 1
-sleep 6
-for h in "$PID_BIZ" "$PID_ADA"; do
+await_log "$ROOT_ADA" "Network: added peer agora-biz " "ada never joined biz"
+PID_CAL="$(node_start "$NS_CAL" "$ROOT_CAL" agora-cal cal-seed-1 "$IP_CAL")" || exit 1
+await_log "$ROOT_CAL" "Network: added peer agora-biz " "cal never joined biz"
+await_log "$ROOT_CAL" "Network: added peer agora-ada " "cal never joined ada"
+for h in "$PID_BIZ" "$PID_ADA" "$PID_CAL"; do
   if ! node_alive "$h"; then
-    err "a daemon exited early:"; tail -n 30 "$ROOT_BIZ/agorad.log" "$ROOT_ADA/agorad.log" 2>/dev/null; exit 1
+    err "a daemon exited early:"; tail -n 30 "$ROOT_BIZ/agorad.log" "$ROOT_ADA/agorad.log" "$ROOT_CAL/agorad.log" 2>/dev/null; exit 1
   fi
 done
 

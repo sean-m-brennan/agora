@@ -9,7 +9,7 @@ them.
 Every device is its own AutonomousTrust node, with its own uuid and keys. No
 key is shared between devices. What makes devices one person is the person's
 **operator key**. It signs a device cert for each device, saying "this node is
-mine". The key lives in the operator's keystore, and `tools/device_cert.py`
+mine". The key lives in the operator's keystore, and `src/autonomous-trust-first-contact/tools/device_cert.py`
 issues certs from there. Neither the node nor the Agora app ever holds it.
 A device without a cert is a person of its own.
 
@@ -47,8 +47,8 @@ Our own other devices are us. They never appear as peers.
 
 ## Recovering a lost device
 
-1. Restore the operator key into the keystore: `tools/backup.py restore-key`.
-2. Issue the new device its cert: `tools/device_cert.py issue`, then start
+1. Restore the operator key into the keystore: `src/autonomous-trust-first-contact/tools/backup.py restore-key`.
+2. Issue the new device its cert: `src/autonomous-trust-first-contact/tools/device_cert.py issue`, then start
    Agora.
 3. In Your devices → Restore a backup, give the file and its passphrase.
 

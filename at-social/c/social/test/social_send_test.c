@@ -47,6 +47,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
 
 #include <jansson.h>
 #include <uuid/uuid.h>
@@ -239,10 +240,11 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_a_reaction_the_network_queue_refused_is_not_scored)
 {
-    /* THE regression. The queue is full for the whole bounded retry, so the
-     * author never hears of the reaction. Our half must not be recorded:
-     * a bilateral task with only one side submitted can never complete, and
-     * it would credit an interaction that did not happen. */
+    /* THE regression. The queue stays full past the age bound, so AT gives
+     * the kept frame up (ISSUES §2.40) and the author never hears of the
+     * reaction. Our half must not be recorded: a bilateral task with only one
+     * side submitted can never complete, and it would credit an interaction
+     * that did not happen. */
     _begin(true);
     identity_t *me = _mk_identity("me", "10.0.0.1");
     identity_t *author = _mk_identity("author", "10.0.0.2");
@@ -250,9 +252,36 @@ DEFINE_TEST(test_a_reaction_the_network_queue_refused_is_not_scored)
     _add_peer(proc, author);
 
     _react(proc, author);
+    ck_assert(!_scored(author));                 /* kept, not yet out */
+    ck_assert_uint_eq(id_send_retry_pending("network"), 1);
+    id_send_retry_drain(proc, NULL, (double)time(NULL) + 3600.0);
 
+    ck_assert_uint_eq(id_send_retry_pending("network"), 0);
     ck_assert_uint_eq(g_reaction_sent, 0);
     ck_assert(!_scored(author));
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_kept_reaction_is_scored_when_it_goes_out)
+{
+    /* The same full queue, but it drains inside the age bound: the identity
+     * tick gets the kept reaction out, and only then is our half accrued. */
+    _begin(true);
+    identity_t *me = _mk_identity("me", "10.0.0.1");
+    identity_t *author = _mk_identity("author", "10.0.0.2");
+    process_t *proc = _mk_process(me);
+    _add_peer(proc, author);
+
+    _react(proc, author);
+    ck_assert_uint_eq(g_reaction_sent, 0);
+    ck_assert(!_scored(author));
+
+    g_network_full = false;                      /* the burst passes */
+    ck_assert_uint_eq(id_send_retry_drain(proc, NULL, (double)time(NULL)), 1);
+
+    ck_assert_uint_eq(g_reaction_sent, 1);
+    ck_assert(_scored(author));
     _end();
 }
 END_TEST_DEFINITION()
@@ -323,6 +352,7 @@ END_TEST_DEFINITION()
 RUN_TESTS(SocialSend,
           test_a_reaction_that_goes_out_is_scored,
           test_a_reaction_the_network_queue_refused_is_not_scored,
+          test_a_kept_reaction_is_scored_when_it_goes_out,
           test_a_transient_refusal_is_retried_rather_than_dropped,
           test_a_published_post_is_multicast,
           test_a_post_behind_a_burst_still_goes_out)

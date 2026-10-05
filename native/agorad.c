@@ -82,6 +82,11 @@
 #include "config/generate.h"       /* random_config */
 #include "utilities/util.h"        /* makedirs */
 #include "social/at_social.h"      /* at_social_link */
+#include "first_contact/first_contact.h"  /* at_first_contact_link */
+#include "processes/extension.h"       /* at_extensions_enabled */
+#include "processes/plaintext_verbs.h" /* PLAINTEXT_VERBS_FILENAME */
+#include <jansson.h>
+#include "rendezvous/at_rendezvous.h"        /* at_rendezvous_link */
 
 /* True if an identity config already exists in cfg_dir (either serialization). */
 static bool identity_present(const char *cfg_dir)
@@ -99,6 +104,8 @@ static bool identity_present(const char *cfg_dir)
 /* Ensure $AUTONOMOUS_TRUST_ROOT is set, the cfg/data dirs exist, and an identity
  * has been generated. Idempotent: an existing identity is preserved. Returns 0
  * on success, non-zero on failure. */
+static int grant_plaintext_verbs(const char *cfg_dir);
+
 static int ensure_config(void)
 {
     const char *root = getenv("AUTONOMOUS_TRUST_ROOT");
@@ -139,6 +146,11 @@ static int ensure_config(void)
      * trusts no release key, so a node that follows no hub community reaches
      * nobody new. */
     (void)setenv("AT_FIRST_CONTACT", "1", 0);
+    /* And the relays those rosters name: since AT's Phase 7 split, rosters and
+     * the seed list stand in for AT_USE_RELAY only under rendezvous's own
+     * switch, which first contact no longer implies (rendezvous.md). Without it
+     * an installed roster is filed and never registered with (hub-608011). */
+    (void)setenv("AT_RELAY_SEED_FALLBACK", "1", 0);
     if (makedirs(cfg_dir, 0755) != 0) {
         fprintf(stderr, "agorad: makedirs %s failed: %s\n", cfg_dir, strerror(errno));
         return 1;
@@ -147,6 +159,9 @@ static int ensure_config(void)
         fprintf(stderr, "agorad: makedirs %s failed: %s\n", data_dir, strerror(errno));
         return 1;
     }
+
+    if (grant_plaintext_verbs(cfg_dir) != 0)
+        return 1;
 
     if (identity_present(cfg_dir)) {
         fprintf(stderr, "agorad: using existing identity/config in %s\n", cfg_dir);
@@ -162,6 +177,50 @@ static int ensure_config(void)
                 rc, strerror(errno));
         return 1;
     }
+    return 0;
+}
+
+/* Grant the plaintext verbs of every enabled extension, unless the operator
+ * already wrote the grant. AT refuses to start a node whose enabled extension
+ * declares verbs that <cfg_dir>/unencrypted_verbs.cfg.json does not name
+ * (processes/plaintext_verbs.h): the extension DECLARES, the operator GRANTS.
+ * agorad is the operator that turned first contact on above, so it grants
+ * exactly what the enabled set declares -- read from the extensions, not
+ * copied, so a verb AT adds cannot go missing here. An existing file is left
+ * alone: it is the operator's, and AT checks it. Returns 0, or 1 on failure. */
+static int grant_plaintext_verbs(const char *cfg_dir)
+{
+    char path[CFG_PATH_LEN + 64];
+    char tmp[sizeof(path) + 8];
+    int n = snprintf(path, sizeof(path), "%s/%s", cfg_dir, PLAINTEXT_VERBS_FILENAME);
+    if (n < 0 || (size_t)n >= sizeof(path) ||
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) {
+        fprintf(stderr, "agorad: plaintext verbs path too long under %s\n", cfg_dir);
+        return 1;
+    }
+    if (access(path, F_OK) == 0)
+        return 0;
+
+    const at_extension_t *on[AT_EXTENSION_MAX];
+    size_t n_on = at_extensions_enabled(on, AT_EXTENSION_MAX);
+    json_t *verbs = json_array();
+    for (size_t i = 0; i < n_on && verbs != NULL; i++)
+        for (const char *const *v = on[i]->plaintext_verbs; v != NULL && *v != NULL; v++)
+            json_array_append_new(verbs, json_string(*v));
+    if (verbs == NULL || json_array_size(verbs) == 0) {
+        json_decref(verbs);   /* nothing to grant: no file is the core-only grant */
+        return 0;
+    }
+    json_t *doc = json_pack("{s:o}", "verbs", verbs);
+    int rc = (doc == NULL || json_dump_file(doc, tmp, JSON_INDENT(2)) != 0 ||
+              rename(tmp, path) != 0);
+    json_decref(doc);
+    if (rc) {
+        unlink(tmp);
+        fprintf(stderr, "agorad: could not write %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    fprintf(stderr, "agorad: granted the enabled extensions' plaintext verbs in %s\n", path);
     return 0;
 }
 
@@ -204,6 +263,12 @@ int main(int argc, char **argv)
     /* agorad IS a social node: keep libat_social in the link (present means
      * on; without it the daemon would run with no social verbs at all). */
     at_social_link();
+    /* First contact and rendezvous are AT extension libraries now (AT
+     * FEATURE_SPLIT_PLAN Phase 7), and the core references neither: keep both
+     * in the link, or the hub, contact and relay handlers below never register
+     * and AT_FIRST_CONTACT=1 turns on nothing. */
+    at_first_contact_link();
+    at_rendezvous_link();
     if (argc < 3) {
         fprintf(stderr,
                 "usage: %s <app_to_at_queue> <at_to_app_queue> "

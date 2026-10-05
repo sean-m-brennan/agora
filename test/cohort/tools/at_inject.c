@@ -58,6 +58,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>   /* EAGAIN */
+#include <unistd.h>  /* usleep */
 
 #include <jansson.h>
 
@@ -149,9 +151,21 @@ int main(int argc, char **argv)
     }
     json_decref(body);
 
-    if (messaging_send("network", NET_MESSAGE, &msg, false) != 0) {
-        fprintf(stderr, "at_inject: send to the network queue failed — is the "
-                        "daemon up, and is --root its AUTONOMOUS_TRUST_ROOT?\n");
+    /* A busy node's network queue refuses a non-blocking send with EAGAIN;
+     * retry for up to ~5 s, as AT's own one-shot senders do (ISSUES §2.30),
+     * rather than fail a phase on a moment of load (rep-550845: the second of
+     * two injections was refused while alice was mid-burst). */
+    int rc = 0;
+    for (int tries = 0; tries < 250; tries++) {
+        rc = messaging_send("network", NET_MESSAGE, &msg, false);
+        if (rc != EAGAIN)
+            break;
+        usleep(20000);
+    }
+    if (rc != 0) {
+        fprintf(stderr, "at_inject: send to the network queue failed (%s) — is "
+                        "the daemon up, and is --root its AUTONOMOUS_TRUST_ROOT?\n",
+                rc == EAGAIN ? "still full after 5 s" : "refused");
         messaging_qclose(&self);
         return 4;
     }

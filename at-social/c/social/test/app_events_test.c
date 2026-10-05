@@ -137,10 +137,10 @@ DEFINE_TEST(test_drain_sends_every_app_bound_message)
      * Distinct payloads so we can tell them apart on the far side — the
      * pre-fix code sent ONE message twice as often as it sent two. */
     generic_msg_t first = {0}, second = {0};
-    first.type = UPDATE_ACCEPTED;
-    first.info.update_accepted.accept_count = 11;
-    second.type = UPDATE_ACCEPTED;
-    second.info.update_accepted.accept_count = 22;
+    first.type = TRANSACTION_SCORE;
+    first.info.tx_score.score = 0.11;
+    second.type = TRANSACTION_SCORE;
+    second.info.tx_score.score = 0.22;
     ck_assert_int_eq(at_route_queue_msg(&unhandled, &first), 0);
     ck_assert_int_eq(at_route_queue_msg(&unhandled, &second), 0);
 
@@ -149,8 +149,8 @@ DEFINE_TEST(test_drain_sends_every_app_bound_message)
     ck_assert_int_eq(sent, 2);
     ck_assert_int_eq(count_to("app_q"), 2);
     /* FIFO, and both distinct payloads survived. */
-    ck_assert_int_eq(captured[0].msg.info.update_accepted.accept_count, 11);
-    ck_assert_int_eq(captured[1].msg.info.update_accepted.accept_count, 22);
+    ck_assert_double_eq_tol(captured[0].msg.info.tx_score.score, 0.11, 1e-12);
+    ck_assert_double_eq_tol(captured[1].msg.info.tx_score.score, 0.22, 1e-12);
 
     /* The drain empties the array whatever it sends. */
     ck_assert_int_eq((int)array_size(&unhandled), 0);
@@ -175,9 +175,9 @@ DEFINE_TEST(test_drain_routes_on_the_type_tag_not_the_payload)
      * read it back as a generic_msg_t*, so ->type landed on exactly these
      * bytes and this message was misrouted to the reputation process. */
     generic_msg_t msg = {0};
-    msg.type = UPDATE_ACCEPTED;
-    long decoy = TASK_RESULT;
-    memcpy(msg.info.update_accepted.proposal_uuid, &decoy, sizeof(decoy));
+    msg.type = TRANSACTION_SCORE;
+    long decoy = TASK_STATUS;   /* would go to negotiation, not the app */
+    memcpy(msg.info.tx_score.task_uuid, &decoy, sizeof(decoy));
     ck_assert_int_eq(at_route_queue_msg(&unhandled, &msg), 0);
 
     int sent = at_route_internal_msgs(&unhandled, "app_q", NULL);
@@ -185,8 +185,8 @@ DEFINE_TEST(test_drain_routes_on_the_type_tag_not_the_payload)
     /* Routed as what it IS, not as what its payload happens to spell. */
     ck_assert_int_eq(sent, 1);
     ck_assert_int_eq(count_to("app_q"), 1);
-    ck_assert_int_eq(count_to("reputation"), 0);
-    ck_assert_int_eq(captured[0].type, UPDATE_ACCEPTED);
+    ck_assert_int_eq(count_to("negotiation"), 0);
+    ck_assert_int_eq(captured[0].type, TRANSACTION_SCORE);
 
     capture_done();
 }
@@ -404,10 +404,14 @@ DEFINE_TEST(test_extern_msg_routes_inbound_types)
     ck_assert_int_eq(at_route_extern_msg(&task, NULL), 0);
     ck_assert_int_eq(count_to("negotiation"), 1);
 
-    generic_msg_t prop = {0};
-    prop.type = UPDATE_PROPOSAL;
-    ck_assert_int_eq(at_route_extern_msg(&prop, NULL), 0);
-    ck_assert_int_eq(count_to("fleet"), 1);
+    /* Fleet's update proposal used to be the second inbound type here. Fleet is
+     * an extension now (libat_fleet): an app proposes through its registered
+     * app_fleet_propose verb, pinned by fleet_ext_test.c, so the core's other
+     * inbound type stands in. */
+    generic_msg_t status = {0};
+    status.type = TASK_STATUS;
+    ck_assert_int_eq(at_route_extern_msg(&status, NULL), 0);
+    ck_assert_int_eq(count_to("negotiation"), 2);
 
     /* An app may not inject arbitrary internal traffic. */
     generic_msg_t bogus = {0};

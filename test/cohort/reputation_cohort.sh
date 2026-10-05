@@ -338,8 +338,16 @@ net_up || exit 1
 # --------------------------------------------------------------------------- #
 INJECT="$RUN/at_inject"
 ATC="$AGORA_DIR/../../lib/autonomous_trust/src/c"
-CC_BIN="$(command -v cc || command -v gcc)"
-if ! "$CC_BIN" -fms-extensions \
+# The system compiler, as build.sh builds the AT core: with a conda env active,
+# `cc` is conda's, whose linker does not search the system library dirs that
+# the system libprotobuf's own dependency (libz) lives in.
+CC_BIN=""
+for c in /usr/bin/cc /usr/bin/gcc "$(command -v cc)" "$(command -v gcc)"; do
+  [ -n "$c" ] && [ -x "$c" ] && { CC_BIN="$c"; break; }
+done
+[ -n "$CC_BIN" ] || { err "no C compiler found to build the injector"; exit 1; }
+# A system-only PATH as well: gcc runs the first `ld` on PATH, and conda's is.
+if ! env PATH=/usr/local/bin:/usr/bin:/bin "$CC_BIN" -fms-extensions \
      -I"$ATC" -I"$ATC/autonomous_trust" \
      -I"$NATIVE/at_core" -I"$NATIVE/at_core/autonomous_trust" \
      -I"$NATIVE/at_core/protobuf" \

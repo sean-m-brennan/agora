@@ -105,6 +105,6 @@ def test_bad_signature_and_reattribution_rejected():
 
 
 def test_connection_verbs_not_in_unencrypted_allowlist():
-    from autonomous_trust.core.identity.protocol import UNENCRYPTED_VERBS
-    assert SocialProtocol.connection_request not in UNENCRYPTED_VERBS
-    assert SocialProtocol.connection_response not in UNENCRYPTED_VERBS
+    from autonomous_trust.core.identity.protocol import CORE_UNENCRYPTED_VERBS
+    assert SocialProtocol.connection_request not in CORE_UNENCRYPTED_VERBS
+    assert SocialProtocol.connection_response not in CORE_UNENCRYPTED_VERBS

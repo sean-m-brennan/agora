@@ -114,7 +114,17 @@ if(NOT TARGET at_social)
                         "AT_EXTERNAL_EXTENSIONS names ${AGORA_SOCIAL_DIR} above, "
                         "so this AT tree does not support external extensions")
 endif()
-foreach(_layer physics calibration certificates prequential replication social)
+# First contact (area hubs, contacts, devices) and the rendezvous relays it
+# rides are AT extension libraries since AT's FEATURE_SPLIT_PLAN Phase 7, no
+# longer part of the core; Agora cannot run without them.
+foreach(_layer rendezvous first_contact)
+    if(NOT TARGET at_${_layer})
+        message(FATAL_ERROR "Agora needs AT's ${_layer} library (libat_${_layer}); "
+                            "configure AT with AT_FIRST_CONTACT_LIB and AT_RENDEZVOUS_LIB ON")
+    endif()
+endforeach()
+foreach(_layer physics calibration certificates prequential replication social
+               rendezvous first_contact)
     if(TARGET at_${_layer})
         list(APPEND AT_EXT_LIBS at_${_layer})
         list(APPEND AT_EXT_RPATH "${CMAKE_CURRENT_BINARY_DIR}/at_core/extensions/${_layer}")

@@ -55,5 +55,5 @@ def test_non_string_body_is_empty():
 
 
 def test_dm_verb_not_in_unencrypted_allowlist():
-    from autonomous_trust.core.identity.protocol import UNENCRYPTED_VERBS
-    assert SocialProtocol.dm not in UNENCRYPTED_VERBS
+    from autonomous_trust.core.identity.protocol import CORE_UNENCRYPTED_VERBS
+    assert SocialProtocol.dm not in CORE_UNENCRYPTED_VERBS

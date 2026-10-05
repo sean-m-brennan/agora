@@ -3,10 +3,11 @@
 // Your devices (SOCIAL_APP_PLAN Phase 4, multi-device per person). Each device
 // is its own node with its own keys. What makes them one person is a device
 // cert from your operator key, issued out of band with AutonomousTrust's
-// tools/device_cert.py. The key itself never reaches Agora. Two devices with
-// certs from the same key can pair; after that their address books stay in
-// step, and your contacts see the new device as you. A backup, sealed with a
-// passphrase, brings the address book to a new device when the old one is gone.
+// src/autonomous-trust-first-contact/tools/device_cert.py. The key itself
+// never reaches Agora. Two devices with certs from the same key can pair;
+// after that their address books stay in step, and your contacts see the new
+// device as you. A backup, sealed with a passphrase, brings the address book
+// to a new device when the old one is gone.
 
 import 'dart:io';
 
@@ -113,9 +114,10 @@ class MyDevicesPage extends StatelessWidget {
               padding: EdgeInsets.all(16),
               child: Text(
                 'Lost a device? On the new one: restore your operator key '
-                '(tools/backup.py restore-key), issue this device a cert '
-                '(tools/device_cert.py issue), restart Agora, then restore the '
-                'backup here.',
+                '(src/autonomous-trust-first-contact/tools/backup.py '
+                'restore-key), issue this device a cert '
+                '(src/autonomous-trust-first-contact/tools/device_cert.py '
+                'issue), restart Agora, then restore the backup here.',
               ),
             ),
           ]);

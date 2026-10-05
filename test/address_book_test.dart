@@ -227,7 +227,8 @@ void main() {
       expect(s.defaultBackupPath(DateTime(2026, 10, 1)),
           endsWith('/var/agora/backups/agora-2026-10-01.atbk'));
       expect(DeviceCertStatus.issueCommand('/r'),
-          'AUTONOMOUS_TRUST_ROOT="/r" python3 tools/device_cert.py issue');
+          'AUTONOMOUS_TRUST_ROOT="/r" python3 '
+          'src/autonomous-trust-first-contact/tools/device_cert.py issue');
     });
   });
 }

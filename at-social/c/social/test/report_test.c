@@ -44,6 +44,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <time.h>
 
 #include <jansson.h>
 #include <uuid/uuid.h>
@@ -362,6 +363,8 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_an_unsent_report_is_not_scored)
 {
+    /* The network queue stays full past the age bound: AT keeps the report
+     * and then gives it up (ISSUES §2.40), and our half is never staged. */
     _begin();
     identity_t *me = _mk_identity("self", "10.0.0.1");
     identity_t *bob = _mk_identity("bob", "10.0.0.2");
@@ -370,7 +373,10 @@ DEFINE_TEST(test_an_unsent_report_is_not_scored)
     g_network_full = true;
 
     _report(proc, bob, NULL);
+    ck_assert(!_staged_about(bob).have);         /* kept, not yet out */
+    id_send_retry_drain(proc, NULL, (double)time(NULL) + 3600.0);
 
+    ck_assert_int_eq(g_reports_sent, 0);
     ck_assert(!_staged_about(bob).have);
     /* And the failed attempt spent nothing: once the queue drains the
      * operator can report after all. */
@@ -378,6 +384,37 @@ DEFINE_TEST(test_an_unsent_report_is_not_scored)
     _report(proc, bob, NULL);
     ck_assert_int_eq(g_reports_sent, 1);
     ck_assert(_staged_about(bob).have);
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_kept_report_is_staged_when_it_goes_out)
+{
+    /* A full queue that drains inside the age bound: the tick gets the kept
+     * report out, and only then is our half staged and the day's cap spent. */
+    _begin();
+    identity_t *me = _mk_identity("self", "10.0.0.1");
+    identity_t *bob = _mk_identity("bob", "10.0.0.2");
+    process_t *proc = _mk_process(me);
+    _add_peer(proc, bob);
+    g_network_full = true;
+
+    _report(proc, bob, NULL);
+    ck_assert_int_eq(g_reports_sent, 0);
+    ck_assert(!_staged_about(bob).have);
+    /* The cap is not spent yet, but a second report to bob must not slip
+     * past it while the first is held: bob would pair only one of them. */
+    _report(proc, bob, NULL);
+    ck_assert_uint_eq(id_send_retry_pending("network"), 1);
+
+    g_network_full = false;
+    ck_assert_uint_eq(id_send_retry_drain(proc, NULL, (double)time(NULL)), 1);
+    ck_assert_int_eq(g_reports_sent, 1);
+    ck_assert_double_eq_tol(_staged_about(bob).score, AT_SOCIAL_REPORT_SCORE,
+                            1e-9);
+    /* Spent: a second report the same day is refused before the wire. */
+    _report(proc, bob, NULL);
+    ck_assert_int_eq(g_reports_sent, 1);
     _end();
 }
 END_TEST_DEFINITION()
@@ -511,6 +548,7 @@ RUN_TESTS(Report,
           test_a_peer_may_not_report_on_our_behalf,
           test_a_block_does_not_stop_a_report,
           test_an_unsent_report_is_not_scored,
+          test_a_kept_report_is_staged_when_it_goes_out,
           test_the_reported_node_stages_the_neutral_half,
           test_the_reported_side_pairs_one_report_per_reporter_per_day,
           test_a_replayed_report_is_refused_by_freshness,

@@ -3,10 +3,11 @@
 // This device's cert (SOCIAL_APP_PLAN Phase 4, multi-device): the operator's
 // signed word that this node is one of their devices. The operator key never
 // enters a node or this app; the cert is issued out of band with AT's
-// tools/device_cert.py, wherever the operator's keystore is, and lands in
-// <root>/etc/at/device_cert.cfg.json. The node checks the signature and that
-// the cert names it when it starts; this file only reads what is there, to say
-// whether pairing and device linking can work here at all.
+// src/autonomous-trust-first-contact/tools/device_cert.py, wherever the
+// operator's keystore is, and lands in <root>/etc/at/device_cert.cfg.json.
+// The node checks the signature and that the cert names it when it starts;
+// this file only reads what is there, to say whether pairing and device
+// linking can work here at all.
 
 import 'dart:convert';
 import 'dart:io';
@@ -86,5 +87,6 @@ class DeviceCertStatus {
   /// checkout on the machine holding the operator keystore while Agora is
   /// stopped. Restart Agora afterwards: the node reads its cert at startup.
   static String issueCommand(String root) =>
-      'AUTONOMOUS_TRUST_ROOT="$root" python3 tools/device_cert.py issue';
+      'AUTONOMOUS_TRUST_ROOT="$root" python3 '
+      'src/autonomous-trust-first-contact/tools/device_cert.py issue';
 }

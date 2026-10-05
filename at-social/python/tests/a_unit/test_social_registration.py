@@ -137,6 +137,16 @@ def test_social_sends_nothing_in_the_clear():
                                 and kw.value.value is False), f'{path.name}:{node.lineno}'
 
 
+
+def test_social_declares_no_plaintext_verbs():
+    """Since AT's plaintext-verbs split (FEATURE_SPLIT_PLAN D8) a feature's
+    DECLARED verbs are what an operator's unencrypted_verbs.cfg.json may grant
+    in the clear. Social declares none, so no file can downgrade a social verb;
+    the per-verb tests (test_*_exchange) check the core set."""
+    from autonomous_trust.social.extension import EXTENSION
+    assert tuple(EXTENSION.plaintext_verbs) == ()
+
+
 # -- blocks restored at start (Phase 5 step 6; twin of C _social_run_start) -- #
 
 def _saved_blocks(*uuids):

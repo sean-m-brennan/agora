@@ -22,9 +22,13 @@
 
 #include "social/at_agora.h"   /* + app_events.h */
 #include "social/at_social.h"  /* at_social_link */
-#include "at_first_contact.h"    /* proximity hubs, and the contact flow */
+/* First contact and rendezvous are AT extension libraries (libat_first_contact,
+ * libat_rendezvous; AT FEATURE_SPLIT_PLAN Phase 7), and their consumers own
+ * the link: the core references neither. */
+#include "first_contact/at_first_contact.h"  /* proximity hubs, and the contact flow */
+#include "rendezvous/at_rendezvous.h"        /* relay roster install/remove */
 /* first_contact_app.c's link anchor (declared in AT's internal
- * identity/first_contact.h): referencing it keeps the first-contact event
+ * first_contact/first_contact.h): referencing it keeps the first-contact event
  * decoders in a static link, as at_social_link does social's. */
 void at_first_contact_app_link(void);
 
@@ -147,6 +151,12 @@ _Static_assert(AGORA_FC_REF_MAX + 1 == AT_FC_REF_LEN
                && AGORA_AREA_NAME_MAX + 1 == AT_FC_AREA_NAME_LEN
                && AGORA_FC_ISSUER_MAX + 1 == AT_FC_ISSUER_LEN,
                "the first-contact bounds are out of sync with at_first_contact.h");
+/* Roster outcomes come from rendezvous (at_rendezvous.h) since AT's Phase 7
+ * split, into the same fc_ref / area_issuer / fc_reason fields. */
+_Static_assert(AGORA_FC_REF_MAX + 1 == AT_RDV_REF_LEN
+               && AGORA_FC_REASON_MAX + 1 == AT_RDV_REASON_LEN
+               && AGORA_FC_ISSUER_MAX + 1 == AT_RDV_ISSUER_LEN,
+               "the roster bounds are out of sync with at_rendezvous.h");
 /* 28600 -> 29200 at proximity hubs (the fc_* / area_* tail: fc_kind at 28600,
  * fc_count at 29192); every prior offset is unchanged. */
 _Static_assert(AGORA_FC_BLOB_MAX + 1 == AT_FC_BLOB_LEN
@@ -757,10 +767,28 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             w++;
             break;
         }
+        case AT_APP_EVENT_ROSTER_INSTALLED: case AT_APP_EVENT_ROSTER_REFUSED:
+        case AT_APP_EVENT_ROSTER_REMOVED: {
+            /* Rendezvous's own payload since AT's Phase 7 split: the area
+             * decoder answers NULL for these kinds, which dropped every
+             * roster outcome without a word (hub cohort hub-561981). Same
+             * AgoraEvent fields as before, so the app reads no difference. */
+            const at_app_roster_t *r = at_rendezvous_roster_event(&raw[i]);
+            if (r != NULL) {
+                e->kind = AGORA_EVENT_AREA;
+                e->fc_kind = raw[i].kind;
+                memcpy(e->fc_ref, r->ref, sizeof(e->fc_ref));
+                memcpy(e->fc_reason, r->reason, sizeof(e->fc_reason));
+                memcpy(e->area_issuer, r->issuer, sizeof(e->area_issuer));
+                e->fc_seq = r->seq;
+                e->fc_count = r->count;
+                w++;
+            }
+            break;
+        }
         case AT_APP_EVENT_AREA_PUBLISHED: case AT_APP_EVENT_AREA_REFUSED:
         case AT_APP_EVENT_AREA_WITHDRAWN: case AT_APP_EVENT_AREA_CARD:
-        case AT_APP_EVENT_AREA_DONE: case AT_APP_EVENT_ROSTER_INSTALLED:
-        case AT_APP_EVENT_ROSTER_REFUSED: case AT_APP_EVENT_ROSTER_REMOVED: {
+        case AT_APP_EVENT_AREA_DONE: {
             const at_app_area_t *a = at_first_contact_area_event(&raw[i]);
             if (a != NULL) {
                 e->kind = AGORA_EVENT_AREA;
