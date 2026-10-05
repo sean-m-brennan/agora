@@ -374,7 +374,7 @@ DEFINE_TEST(test_an_unsent_report_is_not_scored)
 
     _report(proc, bob, NULL);
     ck_assert(!_staged_about(bob).have);         /* kept, not yet out */
-    id_send_retry_drain(proc, NULL, (double)time(NULL) + 3600.0);
+    at_send_retry_drain(proc, NULL, (double)time(NULL) + 3600.0);
 
     ck_assert_int_eq(g_reports_sent, 0);
     ck_assert(!_staged_about(bob).have);
@@ -405,10 +405,10 @@ DEFINE_TEST(test_a_kept_report_is_staged_when_it_goes_out)
     /* The cap is not spent yet, but a second report to bob must not slip
      * past it while the first is held: bob would pair only one of them. */
     _report(proc, bob, NULL);
-    ck_assert_uint_eq(id_send_retry_pending("network"), 1);
+    ck_assert_uint_eq(at_send_retry_pending("network"), 1);
 
     g_network_full = false;
-    ck_assert_uint_eq(id_send_retry_drain(proc, NULL, (double)time(NULL)), 1);
+    ck_assert_uint_eq(at_send_retry_drain(proc, NULL, (double)time(NULL)), 1);
     ck_assert_int_eq(g_reports_sent, 1);
     ck_assert_double_eq_tol(_staged_about(bob).score, AT_SOCIAL_REPORT_SCORE,
                             1e-9);

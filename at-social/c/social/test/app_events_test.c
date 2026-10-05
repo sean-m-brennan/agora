@@ -40,9 +40,11 @@
 #include "test_setup.h"
 
 #include <string.h>
+#include <time.h>
 
 #include "autonomous_trust/at_route_priv.h"
 #include "utilities/message.h"
+#include "utilities/send_retry.h"
 #include "utilities/msg_types.h"
 #include "utilities/msg_types_priv.h"
 #include "structures/array.h"
@@ -98,6 +100,7 @@ static void capture_reset(void)
     memset(captured, 0, sizeof(captured));
     num_captured = 0;
     hook_fail_next = 0;
+    at_send_retry_reset();
     messaging_set_test_hook(_capture_hook);
 }
 
@@ -370,22 +373,33 @@ END_TEST_DEFINITION()
 DEFINE_TEST(test_drain_survives_send_failure)
 {
     capture_reset();
-    hook_fail_next = 1;   /* the outward send reports EAGAIN */
+    hook_fail_next = 2;   /* a's send, and b's drain of a, report EAGAIN */
 
     array_t unhandled = {0};
     array_init(&unhandled);
     generic_msg_t a = {0}, b = {0};
     a.type = PEER_OBSERVED;
+    a.info.peer_observed.rank = 1;
     b.type = PEER_OBSERVED;
+    b.info.peer_observed.rank = 2;
     at_route_queue_msg(&unhandled, &a);
     at_route_queue_msg(&unhandled, &b);
 
     int sent = at_route_internal_msgs(&unhandled, "app_q", NULL);
 
-    /* The failure is reported honestly rather than counted, and it does not
-     * abandon the rest of the batch. */
-    ck_assert_int_eq(sent, 1);
+    /* The refused event is KEPT for the main loop's tick, and the next one
+     * waits behind it so the app still sees them in order (ISSUES §2.14):
+     * both are handed over, and the batch is not abandoned. Until then the
+     * refused one was simply lost. */
+    ck_assert_int_eq(sent, 2);
     ck_assert_int_eq((int)array_size(&unhandled), 0);
+    ck_assert_int_eq(num_captured, 0);
+    ck_assert_uint_eq(at_send_retry_pending("app_q"), 2);
+    ck_assert_uint_eq(at_send_retry_drain(NULL, NULL, (double)time(NULL)), 2);
+    ck_assert_int_eq(count_to("app_q"), 2);
+    ck_assert_int_eq(captured[0].msg.info.peer_observed.rank, 1);
+    ck_assert_int_eq(captured[1].msg.info.peer_observed.rank, 2);
+    ck_assert_uint_eq(at_send_retry_pending(NULL), 0);
 
     capture_done();
 }

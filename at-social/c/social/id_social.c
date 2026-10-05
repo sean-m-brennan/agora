@@ -62,6 +62,18 @@
 #include "social_store.h"
 #include "community.h"
 #include "proximity.h"
+
+/* Emit one event to the app's queue (AT_MAIN_QUEUE). One try, then KEPT for
+ * this process's tick (utilities/send_retry.h, ISSUES §2.14): most of these
+ * are one-shots that a per-sender replay window or a dedup ring stops from
+ * ever arriving again, so a full queue used to lose them for good. One try,
+ * not ten, because a roster replay emits one per peer. 0 means the app's
+ * queue has it or will. */
+static int _social_emit(generic_msg_t *msg, const char *what)
+{
+    return at_send(NULL, AT_MAIN_QUEUE, msg, what, "the app", AT_SEND_NOW,
+                   NULL, NULL, 0);
+}
 static bool _peer_shares_our_group(const process_t *proc, const char *peer_uuid_str);
 static json_t *_business_map_load_json(map_t *map, const char *key);
 static void _record_peer_group_uuid(const process_t *proc,
@@ -430,7 +442,7 @@ static struct {
     /* Report targets whose report AT is still holding for a full network
      * queue (ISSUES §2.40): the day's cap is spent only once it goes, so a
      * second report to the same target waits until the first is settled. */
-    uuid_t       reports_in_flight[ID_SEND_RETRY_MAX];
+    uuid_t       reports_in_flight[AT_SEND_RETRY_MAX];
     size_t       num_reports_in_flight;
     pthread_mutex_t lock;
     bool initialized;
@@ -835,7 +847,7 @@ static int identity_emit_peer_position(const uuid_t peer_uuid, const char *geoha
     if (geohash != NULL)
         snprintf(ext->geohash,
                  sizeof(ext->geohash), "%s", geohash);
-    return messaging_send(AT_MAIN_QUEUE, PEER_POSITION_OBSERVED, &msg, false);
+    return _social_emit(&msg, "a peer position");
 }
 
 /* Handler: a peer asks for our coarse position. Opted out (empty own_geohash) =>
@@ -877,6 +889,8 @@ static bool handle_position_query(const process_t *proc, directory_t *queues, ge
     json_object_set_new(env, "seq", json_integer((json_int_t)seq));
     net_msg_pack_json(&response.info.net_msg, env);
     json_decref(env);
+    /* Bare on purpose (a position reply; the asker re-asks on its periodic
+     * resync): ISSUES §2.14. */
     messaging_send("network", NET_MESSAGE, &response, false);
     return true;
 }
@@ -977,6 +991,8 @@ static int _send_position_query(const process_t *proc, const public_identity_t *
     query.info.net_msg.encrypt = true;
     memcpy(&query.info.net_msg.to_whom, peer, sizeof(public_identity_t));
     strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    /* Bare on purpose (a position query; the periodic resync re-asks):
+     * ISSUES §2.14. */
     messaging_send("network", NET_MESSAGE, &query, false);
     log_debug(proc->logger, "Identity: sent position_query to %s\n", peer->nickname);
     return 0;
@@ -994,7 +1010,7 @@ static int identity_emit_peer_proximity(const uuid_t peer_uuid, int band)
     msg.size = sizeof(peer_proximity_msg_t);
     memcpy(ext->peer_uuid, peer_uuid, 16);
     ext->band = band;
-    return messaging_send(AT_MAIN_QUEUE, PEER_PROXIMITY_OBSERVED, &msg, false);
+    return _social_emit(&msg, "a proximity answer");
 }
 
 /* Record the coarse @p band learned toward peer @p uuid_str (lowercased uuid
@@ -1084,8 +1100,11 @@ static int _send_proximity_msg(const public_identity_t *peer, char *verb,
     strncpy(m.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     net_msg_pack_json(&m.info.net_msg, env);
     json_decref(env);
-    messaging_send("network", NET_MESSAGE, &m, false);
-    return 0;
+    /* A probe is the user's one-shot, and a reply answers one: neither is
+     * asked again, so both are kept on a full queue (ISSUES §2.14). */
+    int rc = identity_send_to_network(NULL, &m, verb, peer->nickname);
+    net_msg_free_obj(&m.info.net_msg);
+    return rc;
 }
 
 /* Parse {salt, tags} from a probe/reply payload. Returns true on a well-formed
@@ -1327,7 +1346,7 @@ static int identity_emit_peer_profile(const uuid_t peer_uuid, const char *profil
     if (profile_json != NULL)
         snprintf(ext->profile_json,
                  sizeof(ext->profile_json), "%s", profile_json);
-    return messaging_send(AT_MAIN_QUEUE, PEER_PROFILE_OBSERVED, &msg, false);
+    return _social_emit(&msg, "a peer profile");
 }
 
 /* Handler: a peer asks for our profile. Opted out (empty own_profile) => answer
@@ -1386,6 +1405,8 @@ static bool handle_profile_query(const process_t *proc, directory_t *queues, gen
     json_object_set_new(env, "seq", json_integer((json_int_t)seq));
     net_msg_pack_json(&response.info.net_msg, env);
     json_decref(env);
+    /* Bare on purpose (a profile reply; the asker re-asks on its periodic
+     * resync): ISSUES §2.14. */
     messaging_send("network", NET_MESSAGE, &response, false);
     return true;
 }
@@ -1492,6 +1513,8 @@ static int _send_profile_query(const process_t *proc, const public_identity_t *p
     query.info.net_msg.encrypt = true;
     memcpy(&query.info.net_msg.to_whom, peer, sizeof(public_identity_t));
     strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    /* Bare on purpose (a profile query; the periodic resync re-asks):
+     * ISSUES §2.14. */
     messaging_send("network", NET_MESSAGE, &query, false);
     log_debug(proc->logger, "Identity: sent profile_query to %s\n", peer->nickname);
     return 0;
@@ -1553,7 +1576,7 @@ static int identity_emit_connection(message_type_t type, const uuid_t peer_uuid,
     peer_connection_msg_t *ext = AT_MSG_EXT(&msg, peer_connection_msg_t);
     memcpy(ext->peer_uuid, peer_uuid, 16);
     ext->state = state;
-    return messaging_send(AT_MAIN_QUEUE, type, &msg, false);
+    return _social_emit(&msg, "a connection event");
 }
 
 /* Record that peer @p peer_uuid_str advertised group @p group_uuid_str, stored
@@ -2451,7 +2474,7 @@ static int identity_emit_dm(const uuid_t sender_uuid, int64_t seq, double ts,
     ext->seq = seq;
     ext->ts = ts;
     at_dm_bound_text(text, ext->text, sizeof(ext->text));
-    return messaging_send(AT_MAIN_QUEUE, PEER_DM_OBSERVED, &msg, false);
+    return _social_emit(&msg, "a direct message");
 }
 
 /* Record the most-recent DM from @p sender_str for the conformance/observability
@@ -2663,7 +2686,7 @@ static int identity_emit_cosign_request(const uuid_t requester_uuid,
     ext->ts = ts;
     at_cosign_bound(bytes, ext->bytes,
                     sizeof(ext->bytes), AT_COSIGN_BYTES_MAX);
-    return messaging_send(AT_MAIN_QUEUE, PEER_COSIGN_REQUEST_OBSERVED, &msg, false);
+    return _social_emit(&msg, "a co-sign request");
 }
 
 /* AT -> app: surface a returned signature to the node authoring the exchange. */
@@ -2684,7 +2707,7 @@ static int identity_emit_cosign_sig(const uuid_t signer_uuid, const char *cid,
                     sizeof(ext->sig), AT_COSIGN_SIG_MAX);
     ext->seq = seq;
     ext->ts = ts;
-    return messaging_send(AT_MAIN_QUEUE, PEER_COSIGN_SIG_OBSERVED, &msg, false);
+    return _social_emit(&msg, "a co-signature");
 }
 
 /* Directed, encrypted co-signing ask to one admitted peer. */
@@ -2693,7 +2716,6 @@ static int _send_cosign_request(const process_t *proc, const public_identity_t *
                                 const char *polity, const char *cid,
                                 const char *bytes, int64_t seq, double ts)
 {
-    (void)proc;
     generic_msg_t out = {0};
     out.type = NET_MESSAGE;
     strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
@@ -2705,8 +2727,11 @@ static int _send_cosign_request(const process_t *proc, const public_identity_t *
     if (env == NULL) return -1;
     net_msg_pack_json(&out.info.net_msg, env);
     json_decref(env);
-    messaging_send("network", NET_MESSAGE, &out, false);
-    return 0;
+    /* One-shot: nothing asks a co-signer twice (ISSUES §2.14). */
+    int rc = identity_send_to_network(proc, &out, "a co-sign request",
+                                      peer->nickname);
+    net_msg_free_obj(&out.info.net_msg);
+    return rc;
 }
 
 /* Directed, encrypted signature return to the peer authoring the exchange. */
@@ -2714,7 +2739,6 @@ static int _send_cosign_sig(const process_t *proc, const public_identity_t *peer
                             const char *cid, const char *signer, const char *sig,
                             int64_t seq, double ts)
 {
-    (void)proc;
     generic_msg_t out = {0};
     out.type = NET_MESSAGE;
     strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
@@ -2726,8 +2750,11 @@ static int _send_cosign_sig(const process_t *proc, const public_identity_t *peer
     if (env == NULL) return -1;
     net_msg_pack_json(&out.info.net_msg, env);
     json_decref(env);
-    messaging_send("network", NET_MESSAGE, &out, false);
-    return 0;
+    /* One-shot: the requester does not ask again (ISSUES §2.14). */
+    int rc = identity_send_to_network(proc, &out, "a co-signature",
+                                      peer->nickname);
+    net_msg_free_obj(&out.info.net_msg);
+    return rc;
 }
 
 /* App -> AT verb (AT_APP_REQUEST_COSIGN): ask each named peer to co-sign one
@@ -2997,7 +3024,7 @@ static int identity_emit_reaction(const uuid_t reactor_uuid, const char *post_id
              post_id != NULL ? post_id : "");
     ext->seq = seq;
     ext->ts = ts;
-    return messaging_send(AT_MAIN_QUEUE, PEER_REACTION_OBSERVED, &msg, false);
+    return _social_emit(&msg, "a reaction");
 }
 
 /* What a reaction's on-sent callback needs to accrue our half. */
@@ -3336,7 +3363,7 @@ static bool _report_in_flight(const uuid_t peer, bool set, bool on)
             uuid_copy(social_state.reports_in_flight[i],
                       social_state.reports_in_flight[--social_state.num_reports_in_flight]);
     }
-    if (set && on && !found && n < ID_SEND_RETRY_MAX)
+    if (set && on && !found && n < AT_SEND_RETRY_MAX)
         uuid_copy(social_state.reports_in_flight[social_state.num_reports_in_flight++],
                   peer);
     pthread_mutex_unlock(&social_state.lock);
@@ -3642,7 +3669,7 @@ static int identity_emit_post(const uuid_t author_uuid, const char *post_id,
         snprintf(ext->community, sizeof(ext->community), "%s", scope->community);
         at_post_scope_labels_joined(scope, ext->labels, sizeof(ext->labels));
     }
-    return messaging_send(AT_MAIN_QUEUE, PEER_POST_OBSERVED, &msg, false);
+    return _social_emit(&msg, "a post");
 }
 
 /* Whether @p id_hex is in the feed-post dedup ring, WITHOUT recording it: what
@@ -4327,7 +4354,7 @@ static int identity_emit_business_ad(const uuid_t advertiser_uuid,
     ext->ts = ts;
     at_business_bound_bundle(bundle, ext->bundle,
                              sizeof(ext->bundle));
-    return messaging_send(AT_MAIN_QUEUE, PEER_BUSINESS_AD_OBSERVED, &msg, false);
+    return _social_emit(&msg, "a business ad");
 }
 
 /* Encrypted group multicast of one signed business ad. Same shape as
@@ -4861,7 +4888,7 @@ static int identity_emit_business_post(const uuid_t sender_uuid, const char *did
     ext->hops = hops;
     at_business_post_bound_bundle(bundle, ext->bundle,
                                   sizeof(ext->bundle));
-    return messaging_send(AT_MAIN_QUEUE, PEER_BUSINESS_POST_OBSERVED, &msg, false);
+    return _social_emit(&msg, "a business post");
 }
 
 /* Encrypted group multicast of one signed business post. Same shape as
@@ -5281,7 +5308,7 @@ static int identity_emit_community_policy(const uuid_t carrier, const char *did,
     ext->seq = seq;
     ext->ts = ts;
     at_community_bound_policy(bundle, ext->bundle, sizeof(ext->bundle));
-    return messaging_send(AT_MAIN_QUEUE, PEER_COMMUNITY_POLICY_OBSERVED, &msg, false);
+    return _social_emit(&msg, "a community policy");
 }
 
 /* Identity -> app: one label accepted. */
@@ -5303,7 +5330,7 @@ static int identity_emit_post_label(const uuid_t author, const char *did,
     ext->ts = ts;
     ext->hops = hops;
     at_community_bound_label(bundle, ext->bundle, sizeof(ext->bundle));
-    return messaging_send(AT_MAIN_QUEUE, PEER_POST_LABEL_OBSERVED, &msg, false);
+    return _social_emit(&msg, "a post label");
 }
 
 /* Resolve the key to verify a carried artifact against: a known peer's stored

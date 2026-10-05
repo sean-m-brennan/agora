@@ -65,8 +65,12 @@
 #include "utilities/msg_types_priv.h"
 #include "utilities/allocation.h"
 #include "social/social_msg_types.h"
+#include "social/dm.h"
+#include "utilities/send_retry.h"
+#include <time.h>
 
 static char REACT_FN[] = AT_APP_REACT_POST;
+static char DM_FN[] = "peer_dm";
 static char PUBLISH_FN[] = AT_APP_PUBLISH_POST;
 
 /* A 64-hex content id; only the first 32 chars are read (the task binding). */
@@ -80,7 +84,9 @@ static const char POST_ID[] =
 
 static size_t g_reaction_sent;
 static size_t g_post_sent;
+static size_t g_dm_observed;
 static bool   g_network_full;
+static bool   g_app_full;
 
 static int _hook(const char *key, const message_type_t type,
                  generic_msg_t *msg, bool blocking)
@@ -88,6 +94,13 @@ static int _hook(const char *key, const message_type_t type,
     (void)blocking;
     if (g_network_full && key != NULL && strcmp(key, "network") == 0)
         return EAGAIN;           /* exactly what a saturated queue returns */
+    if (key != NULL && strcmp(key, AT_MAIN_QUEUE) == 0) {
+        if (g_app_full)
+            return EAGAIN;
+        if (type == PEER_DM_OBSERVED)
+            g_dm_observed++;
+        return 0;
+    }
     if (type == NET_MESSAGE && msg->info.net_msg.function != NULL
         && strcmp(msg->info.net_msg.function, "peer_reaction") == 0)
         g_reaction_sent++;
@@ -200,11 +213,19 @@ static void _begin(bool network_full)
     identity_reset_state();
     g_reaction_sent = 0;
     g_post_sent = 0;
+    g_dm_observed = 0;
     g_network_full = network_full;
+    g_app_full = false;
     messaging_set_test_hook(_hook);
 }
 
-static void _end(void) { messaging_set_test_hook(NULL); g_network_full = false; }
+static void _end(void)
+{
+    messaging_set_test_hook(NULL);
+    g_network_full = false;
+    g_app_full = false;
+    at_send_retry_reset();
+}
 
 /* Let the "queue" drain partway through the bounded retry. */
 static void *_relent(void *unused)
@@ -253,10 +274,10 @@ DEFINE_TEST(test_a_reaction_the_network_queue_refused_is_not_scored)
 
     _react(proc, author);
     ck_assert(!_scored(author));                 /* kept, not yet out */
-    ck_assert_uint_eq(id_send_retry_pending("network"), 1);
-    id_send_retry_drain(proc, NULL, (double)time(NULL) + 3600.0);
+    ck_assert_uint_eq(at_send_retry_pending("network"), 1);
+    at_send_retry_drain(proc, NULL, (double)time(NULL) + 3600.0);
 
-    ck_assert_uint_eq(id_send_retry_pending("network"), 0);
+    ck_assert_uint_eq(at_send_retry_pending("network"), 0);
     ck_assert_uint_eq(g_reaction_sent, 0);
     ck_assert(!_scored(author));
     _end();
@@ -278,7 +299,7 @@ DEFINE_TEST(test_a_kept_reaction_is_scored_when_it_goes_out)
     ck_assert(!_scored(author));
 
     g_network_full = false;                      /* the burst passes */
-    ck_assert_uint_eq(id_send_retry_drain(proc, NULL, (double)time(NULL)), 1);
+    ck_assert_uint_eq(at_send_retry_drain(proc, NULL, (double)time(NULL)), 1);
 
     ck_assert_uint_eq(g_reaction_sent, 1);
     ck_assert(_scored(author));
@@ -349,10 +370,48 @@ DEFINE_TEST(test_a_post_behind_a_burst_still_goes_out)
 }
 END_TEST_DEFINITION()
 
+/* An inbound DM is a one-shot for the app: the per-sender replay window
+ * refuses it if the peer sends it again. A full app queue used to lose it for
+ * good; it is kept for this process's tick now (ISSUES §2.14). */
+DEFINE_TEST(test_a_dm_the_app_queue_refused_is_kept)
+{
+    _begin(false);
+    identity_t *me = _mk_identity("me", "10.0.0.1");
+    identity_t *bob = _mk_identity("bob", "10.0.0.2");
+    process_t *proc = _mk_process(me);
+    _add_peer(proc, bob);
+    public_identity_t *bob_pub = NULL;
+    ck_assert_ret_ok(identity_publish(bob, &bob_pub));
+
+    json_t *dm = at_dm_to_json("hello", 1, (double)time(NULL));
+    generic_msg_t msg = {0};
+    msg.type = NET_MESSAGE;
+    strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    msg.info.net_msg.function = DM_FN;
+    msg.info.net_msg.verified = true;
+    memcpy(&msg.info.net_msg.from_whom, bob_pub, sizeof(public_identity_t));
+    ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, dm));
+    json_decref(dm);
+    smrt_deref(bob_pub);
+
+    g_app_full = true;
+    run_message_handlers(proc, NULL, NET_MESSAGE, &msg);
+    net_msg_free_obj(&msg.info.net_msg);
+    ck_assert_uint_eq(g_dm_observed, 0);
+    ck_assert_uint_eq(at_send_retry_pending(AT_MAIN_QUEUE), 1);
+
+    g_app_full = false;
+    ck_assert_uint_eq(at_send_retry_drain(proc, NULL, (double)time(NULL)), 1);
+    ck_assert_uint_eq(g_dm_observed, 1);
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(SocialSend,
           test_a_reaction_that_goes_out_is_scored,
           test_a_reaction_the_network_queue_refused_is_not_scored,
           test_a_kept_reaction_is_scored_when_it_goes_out,
           test_a_transient_refusal_is_retried_rather_than_dropped,
           test_a_published_post_is_multicast,
-          test_a_post_behind_a_burst_still_goes_out)
+          test_a_post_behind_a_burst_still_goes_out,
+          test_a_dm_the_app_queue_refused_is_kept)
