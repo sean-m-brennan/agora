@@ -172,6 +172,28 @@ DEFINE_TEST(test_out_of_range_coords_rejected)
     ck_assert(proximity_compute_tags(-90.0, 180.0, key, salt, t)); /* edges ok */
 }
 
+/* $AT_OWN_EXACT's form, parsed as Python's SocialState.from_env does (§2.37). */
+DEFINE_TEST(test_parse_exact_position)
+{
+    double lat = 0, lon = 0;
+    ck_assert(proximity_parse_exact("37.7749,-122.4194", &lat, &lon));
+    ck_assert(fabs(lat - 37.7749) < 1e-9 && fabs(lon + 122.4194) < 1e-9);
+    ck_assert(proximity_parse_exact(" -90 , 180 ", &lat, &lon)); /* edges, spaces */
+    ck_assert(fabs(lat + 90.0) < 1e-9 && fabs(lon - 180.0) < 1e-9);
+    lat = lon = 7.0;
+    ck_assert(!proximity_parse_exact(NULL, &lat, &lon));
+    ck_assert(!proximity_parse_exact("", &lat, &lon));
+    ck_assert(!proximity_parse_exact("37.7", &lat, &lon));
+    ck_assert(!proximity_parse_exact("37.7,", &lat, &lon));
+    ck_assert(!proximity_parse_exact("x,1", &lat, &lon));
+    ck_assert(!proximity_parse_exact("1,2,3", &lat, &lon));
+    ck_assert(!proximity_parse_exact("91,0", &lat, &lon));
+    ck_assert(!proximity_parse_exact("0,-181", &lat, &lon));
+    ck_assert(!proximity_parse_exact("nan,0", &lat, &lon));
+    ck_assert(!proximity_parse_exact("0,inf", &lat, &lon));
+    ck_assert(fabs(lat - 7.0) < 1e-9 && fabs(lon - 7.0) < 1e-9); /* untouched on refusal */
+}
+
 RUN_TESTS(Proximity,
           test_band_logic_synthetic,
           test_identical_position_is_near,
@@ -179,4 +201,5 @@ RUN_TESTS(Proximity,
           test_twenty_km_is_far,
           test_no_shared_key_no_match,
           test_tags_json_round_trip,
-          test_out_of_range_coords_rejected)
+          test_out_of_range_coords_rejected,
+          test_parse_exact_position)

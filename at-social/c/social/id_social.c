@@ -6093,6 +6093,20 @@ static void _social_init(void)
             snprintf(social_state.own_geohash, sizeof(social_state.own_geohash),
                      "%s", env_geo);
     }
+    /* Opt-in EXACT position (Phase 2, private proximity): seed from
+     * $AT_OWN_EXACT ("lat,lon") for headless/testing, as Python's
+     * SocialState.from_env does (the Flutter UI sets it at runtime via
+     * AT_APP_SET_EXACT_POSITION instead). LOCAL-ONLY: it feeds only the
+     * proximity probe. Unparsable/out-of-range/unset => opted out. */
+    {
+        const char *env_exact = getenv("AT_OWN_EXACT");
+        double lat = 0.0, lon = 0.0;
+        if (proximity_parse_exact(env_exact, &lat, &lon)) {
+            social_state.own_exact_set = true;
+            social_state.own_exact_lat = lat;
+            social_state.own_exact_lon = lon;
+        }
+    }
     map_init(&social_state.peer_profile_map);
     map_init(&social_state.connection_edges);
     map_init(&social_state.peer_group_uuids);

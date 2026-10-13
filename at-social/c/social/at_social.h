@@ -27,7 +27,8 @@
  * (identity/id_ext.h), its 34 identity verbs (processes/extension.h), its 12
  * message types and 18 app verbs, and the app-event decoders behind at_agora.h.
  * Present means on: a node that links it has social; one that does not carries
- * none of it, and refuses to start if $AT_OWN_GEOHASH or $AT_OWN_PROFILE is set.
+ * none of it, and refuses to start if $AT_OWN_GEOHASH, $AT_OWN_EXACT or
+ * $AT_OWN_PROFILE is set.
  *
  * A shared link registers it when the library loads, but only if the program
  * keeps it: nothing references a constructor-registered library, so under

@@ -95,4 +95,10 @@ json_t *proximity_tags_to_json(
 bool proximity_tags_from_json(const json_t *arr,
                               uint8_t tags_out[AT_PROX_NTAGS][AT_PROX_TAG_LEN]);
 
+/** Parse an exact position "lat,lon" (degrees), the form $AT_OWN_EXACT takes,
+ *  as Python's SocialState.from_env does: surrounding whitespace is allowed;
+ *  anything else, or a coordinate out of range, is refused.
+ *  @return true iff @p s parsed and both coordinates are in range. */
+bool proximity_parse_exact(const char *s, double *lat_out, double *lon_out);
+
 #endif /* AT_IDENTITY_PROXIMITY_H */

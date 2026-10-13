@@ -5,7 +5,9 @@
 #include "proximity.h"
 
 
+#include <ctype.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Earth radius (metres), spherical approximation — a coarse band does not need
@@ -153,3 +155,34 @@ bool proximity_tags_from_json(const json_t *arr,
     return true;
 }
 
+static bool _parse_coord(const char *s, const char *end, double *out)
+{
+    char *stop = NULL;
+    double v = strtod(s, &stop);
+    if (stop == s)
+        return false;
+    while (stop < end && isspace((unsigned char)*stop))
+        stop++;
+    if (stop != end)
+        return false;
+    *out = v;
+    return true;
+}
+
+bool proximity_parse_exact(const char *s, double *lat_out, double *lon_out)
+{
+    if (s == NULL || s[0] == '\0')
+        return false;
+    const char *comma = strchr(s, ',');
+    if (comma == NULL)
+        return false;
+    double lat, lon;
+    if (!_parse_coord(s, comma, &lat) || !_parse_coord(comma + 1, s + strlen(s), &lon))
+        return false;
+    /* NaN fails both comparisons, and an infinity is out of range. */
+    if (!(lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0))
+        return false;
+    *lat_out = lat;
+    *lon_out = lon;
+    return true;
+}
