@@ -3081,6 +3081,7 @@ fn parse_office(s: &str) -> Office {
         "CharterKeeper" => Office::CharterKeeper,
         "RendezvousOperator" => Office::RendezvousOperator,
         "Moderator" => Office::Moderator,
+        "ReleaseOfficer" => Office::ReleaseOfficer,
         other => Office::Other(other.to_string()),
     }
 }
@@ -3093,6 +3094,7 @@ fn office_name(o: &Office) -> String {
         Office::CharterKeeper => "CharterKeeper".into(),
         Office::RendezvousOperator => "RendezvousOperator".into(),
         Office::Moderator => "Moderator".into(),
+        Office::ReleaseOfficer => "ReleaseOfficer".into(),
         Office::Other(s) => s.clone(),
     }
 }
@@ -4123,6 +4125,24 @@ mod tests {
 
     fn signer_json(i: &Ident) -> serde_json::Value {
         serde_json::json!({ "did": i.did, "priv": serde_json::to_value(&i.priv_key).unwrap() })
+    }
+
+    // Every named office survives name -> parse; a variant added to one mapping
+    // and not the other reads back as Other and loses its authority.
+    #[test]
+    fn office_names_roundtrip() {
+        for o in [
+            Office::Convener,
+            Office::Inductor,
+            Office::EnvoyAuthorizer,
+            Office::CharterKeeper,
+            Office::RendezvousOperator,
+            Office::Moderator,
+            Office::ReleaseOfficer,
+            Office::Other("Archivist".into()),
+        ] {
+            assert_eq!(parse_office(&office_name(&o)), o);
+        }
     }
 
     #[test]

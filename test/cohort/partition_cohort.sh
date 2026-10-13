@@ -31,7 +31,9 @@
 #   4. BOTH ISLANDS KEEP WORKING, AND ONLY THE MAJORITY GROWS:
 #      - cal starts in A and A admits it (three of five votes; a key rotation
 #        in A). eve starts in B, B proposes it and must refuse it (two of five);
-#      - a reaction commits bilaterally in EACH island;
+#      - a reaction commits bilaterally in A; in B (two of five, no Paxos
+#        majority since AT §2.13) it must NOT commit, and both halves are
+#        PARKED (AT §2.60) to wait for the heal;
 #      - A (four of six, with cal) finalizes a checkpoint; B must NOT, since two
 #        of five is no majority. Finalizing in both islands would leave two
 #        finalized windows that no heal could reconcile.
@@ -41,22 +43,22 @@
 #      exactly once, with its original content id. Nobody re-sends them by
 #      hand: each node's periodic digest offers them and the other island asks
 #      (peer_post_digest / peer_post_want / peer_post_backfill);
-#   7. REPUTATION CARRIED FORWARD: the island whose chain is shorter adopts
-#      the other's (which island that is depends on how much AT's own probes
-#      committed on each side, so the script reads it off the log). That drops
-#      the loser's split-time transaction; its nodes re-propose their own
-#      halves ("re-proposing N dropped transaction(s)"), and the task then
-#      commits on the adopted chain, as seen from a node of the OTHER island.
-#      The winner's task needs no such check: it reached the losers inside
-#      the adopted chain itself.
+#   7. REPUTATION CARRIED FORWARD: only A committed while split, so B
+#      catches up from A's chain at the heal. That wakes B's parked halves
+#      ("chain grew from …; re-proposing N parked half(s)", AT §2.60), and
+#      B's reaction then commits on the healed chain. A's task reached B
+#      inside A's chain. Both must be two-sided in every member's persisted
+#      chain. (An adoption that drops committed entries still re-proposes
+#      them: "re-proposing N dropped transaction(s)".)
 #
 # NETNS ONLY. Under docker, `docker network disconnect` removes the interface a
 # node's discovery socket is bound to, which is a different fault from a
 # partition. The script refuses a docker backend rather than test that.
 #
-# BOUNDED BY OPEN AT ISSUES (ISSUES.md): §2.13, Paxos commits on one grant, so
-# each island commits alone (which is what makes the chains fork, and is fine
-# here); §2.18, a group_key_update that arrives early is dropped and never
+# BOUNDED BY AT ISSUES (ISSUES.md): §2.13 (closed 2026-10-05), a Paxos round
+# needs a majority of the whole group, so only A commits while split, and
+# B's halves are parked (§2.60) and re-proposed when B catches up from A at
+# the heal; the OPEN §2.18, a group_key_update that arrives early is dropped and never
 # re-sent, which phase 5 may surface as a node that cannot decrypt after the
 # heal. Phase 7 reads every through-split member's persisted chain.
 #
@@ -982,12 +984,52 @@ island_commit() { # author reactor island-label -> sets ISLAND_TASK
   return 6
 }
 
-log "Phase 4b: a reaction commits bilaterally inside EACH island"
+island_park() { # author reactor island-label -> sets ISLAND_TASK
+  # The minority side (AT §2.13): the reaction must NOT commit, and both
+  # halves must be PARKED (§2.60) rather than given up, so the heal can land
+  # them. Parking follows five unanswered re-proposals, 15 s apart.
+  local author="$1" reactor="$2" label="$3" saw_json="$RUN/saw-$3.json"
+  drive "$reactor" observe-saw "rep-$label-$$" "$WAIT" "$saw_json" >/dev/null &
+  local o=$!
+  sleep 3
+  drive "$author" publish "rep-$label-$$" 0 "$WAIT" >/dev/null || return 4
+  wait "$o" || return 5
+  drive "$reactor" react "$saw_json" "$WAIT" >/dev/null || return 4
+  local wait_park=$(( WAIT > 150 ? WAIT : 150 ))
+  local deadline=$(( SECONDS + WAIT )) t=""
+  ISLAND_TASK=""
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    t=$(app_task_of "$reactor")
+    [ -n "$t" ] && plain_log "$author" | grep -q "forwarding transaction for task $t," && break
+    t=""; sleep 2
+  done
+  [ -n "$t" ] || { err "  $label: the author never forwarded the reactor's task"; return 6; }
+  deadline=$(( SECONDS + wait_park ))
+  local parked=""
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if saw "$author" "task $t is bilateral" || saw "$reactor" "task $t is bilateral"; then
+      err "  $label: task $t committed in a two-of-five island: a minority must"
+      err "  not commit (AT §2.13; check _round_quorum_locked in rep_proc.c)"
+      return 7
+    fi
+    parked=""
+    for n in "$author" "$reactor"; do
+      saw "$n" "our half of task $t has no quorum.*parking it" && parked="$parked $n"
+    done
+    [ "$parked" = " $author $reactor" ] && { ISLAND_TASK="$t"; return 0; }
+    sleep 3
+  done
+  err "  $label: task $t parked on:${parked:- nobody} after ${wait_park}s (want $author and $reactor)."
+  err "  A half given up instead ('giving up on it') is AT §2.60 regressing."
+  return 8
+}
+
+log "Phase 4b: a reaction commits bilaterally in A; B (2 of 5) cannot, and parks it"
 island_commit ada amy A || { err "FAIL (phase 4b): island A cannot commit"; dump_logs; exit 1; }
 TASK_A="$ISLAND_TASK"
-island_commit bob ben B || { err "FAIL (phase 4b): island B cannot commit"; dump_logs; exit 1; }
+island_park bob ben B || { err "FAIL (phase 4b): island B did not hold its reaction for the heal"; dump_logs; exit 1; }
 TASK_B="$ISLAND_TASK"
-ok "phase 4b: A committed $TASK_A, B committed $TASK_B, apart"
+ok "phase 4b: A committed $TASK_A; B could not commit $TASK_B and parked both halves"
 
 log "Phase 4c: A (4 of 6) must finalize a checkpoint; B (2 of 5 in its view) must not"
 sleep $(( CHECKPOINT_SEC * 2 + 5 ))
@@ -1121,7 +1163,9 @@ done
 # Informational: how the tasks got there.
 healed_saw() { plain_log "$1" | tail -n +$(( HEAL_LINE[$1] + 1 )) | grep -q "$2"; }
 reproposed=""
-for n in "${MEMBERS[@]}"; do healed_saw "$n" "re-proposing [0-9]* dropped transaction" && reproposed="$reproposed $n"; done
+for n in "${MEMBERS[@]}"; do
+  healed_saw "$n" "re-proposing [0-9]* dropped transaction\|re-proposing [0-9]* parked half" && reproposed="$reproposed $n"
+done
 if [ -n "$missing" ]; then
   err "FAIL (phase 7): after ${WAIT}s the persisted chain on:$missing lacks a"
   err "  two-sided entry for A's $TASK_A or B's $TASK_B."
@@ -1129,7 +1173,11 @@ if [ -n "$missing" ]; then
   for n in $missing; do
     f="${ROOT[$n]}/etc/at/reputation-history.cfg.json"
     for t in "$TASK_A" "$TASK_B"; do
-      grep -q "$t" "$f" 2>/dev/null && echo "  $n: $t present, one-sided" >&2 || echo "  $n: $t absent" >&2
+      # Each task on its own: chain_has_both is all-or-nothing, so a
+      # two-sided task used to be reported "one-sided" beside an absent one.
+      if chain_has_both "$n" "$t"; then echo "  $n: $t two-sided" >&2
+      elif grep -q "$t" "$f" 2>/dev/null; then echo "  $n: $t present, one-sided" >&2
+      else echo "  $n: $t absent" >&2; fi
     done
   done
   dump_logs; exit 1
