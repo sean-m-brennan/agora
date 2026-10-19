@@ -12,7 +12,10 @@
 # poison each other on the shared filesystem). Install the deps with ./setup.sh.
 #
 # Usage:
-#   ./build.sh [linux|macos|windows]  # default: linux
+#   ./build.sh [linux|macos|windows]        # default: linux
+#   ./build.sh [linux|macos|windows] --run  # build the native layer, then
+#                                           # `flutter run` the app against it
+#                                           # (what ./run-dev.sh does)
 #
 # Env:
 #   AGORA_STRICT=1   keep AT's hardcoded -Werror (default: strip it via
@@ -36,7 +39,14 @@
 # into agora.app (macos/embed_native.sh, a Runner build phase).
 set -euo pipefail
 
-PLATFORM="${1:-linux}"
+PLATFORM="linux"
+RUN=0
+for arg in "$@"; do
+  case "$arg" in
+    --run) RUN=1 ;;
+    *)     PLATFORM="$arg" ;;
+  esac
+done
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 FLUTTER_MODE="${FLUTTER_MODE:---debug}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -114,11 +124,17 @@ if [ "$PLATFORM" = "windows" ]; then
 fi
 
 # --- locate flutter ----------------------------------------------------------
+# On PATH, else where ./setup.sh puts it ($FLUTTER_HOME; /opt/flutter on Linux,
+# ~/flutter on macOS and Windows).
 if ! command -v flutter >/dev/null 2>&1; then
-  if [ -x /opt/flutter/bin/flutter ]; then
-    export PATH="$PATH:/opt/flutter/bin"
-  else
-    echo "error: 'flutter' not found on PATH (and not at /opt/flutter/bin)." >&2
+  for fh in "${FLUTTER_HOME:-}" /opt/flutter "$HOME/flutter"; do
+    if [ -n "$fh" ] && [ -x "$fh/bin/flutter" ]; then
+      export PATH="$PATH:$fh/bin"
+      break
+    fi
+  done
+  if ! command -v flutter >/dev/null 2>&1; then
+    echo "error: 'flutter' not found on PATH (nor in \$FLUTTER_HOME, /opt/flutter, ~/flutter); run ./setup.sh" >&2
     exit 1
   fi
 fi
@@ -199,7 +215,45 @@ flutter pub get
 # "includes non-existent path". Create any such missing dir (empty; the app
 # includes nothing from them) right before the build, reading .pc files directly
 # so an active conda env can't shadow them.
-echo "==> Building Flutter app: flutter build $PLATFORM $FLUTTER_MODE"
+if [ "$RUN" = "1" ]; then
+  # `flutter run` from the source tree: point the app at native/build, which it
+  # would otherwise look for beside its executable (lib/src/ffi/native_paths.dart).
+  FLUTTER_ARGS=(run -d "$PLATFORM" "$FLUTTER_MODE")
+  NATIVE="$ROOT/native/build"
+  case "$PLATFORM" in
+    linux)
+      export AGORA_DAEMON_PATH="$NATIVE/agorad"
+      export AGORA_SHIM_PATH="$NATIVE/libagora_shim.so"
+      export LD_LIBRARY_PATH="$NATIVE/at_core${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      ETHNE="$NATIVE/libethne_agora.so"
+      ;;
+    macos)
+      # The build-tree rpath finds the AT libraries (and the Runner's embed
+      # phase copies them into the .app as well).
+      export AGORA_DAEMON_PATH="$NATIVE/agorad"
+      export AGORA_SHIM_PATH="$NATIVE/libagora_shim.dylib"
+      ETHNE="$NATIVE/libethne_agora.dylib"
+      ;;
+    windows)
+      # The app is a native program: Windows paths, and a DLL's DLLs on PATH.
+      for d in "$NATIVE" "$NATIVE/at_core" "$NATIVE"/at_core/extensions/*; do PATH="$d:$PATH"; done
+      export PATH
+      AGORA_DAEMON_PATH="$(cygpath -m "$NATIVE/agorad.exe")"
+      AGORA_SHIM_PATH="$(cygpath -m "$NATIVE/libagora_shim.dll")"
+      export AGORA_DAEMON_PATH AGORA_SHIM_PATH
+      ETHNE="$NATIVE/ethne_agora.dll"
+      ;;
+  esac
+  if [ -f "$ETHNE" ]; then
+    AGORA_ETHNE_PATH="$ETHNE"
+    [ "$PLATFORM" = "windows" ] && AGORA_ETHNE_PATH="$(cygpath -m "$ETHNE")"
+    export AGORA_ETHNE_PATH
+  fi
+  echo "==> Running Agora: flutter run -d $PLATFORM $FLUTTER_MODE"
+else
+  FLUTTER_ARGS=(build "$PLATFORM" "$FLUTTER_MODE")
+  echo "==> Building Flutter app: flutter build $PLATFORM $FLUTTER_MODE"
+fi
 if [ "$PLATFORM" = "linux" ]; then
   bash "$ROOT/native/stub-pkgconfig-includes.sh" || true
 
@@ -233,13 +287,15 @@ if [ "$PLATFORM" = "linux" ]; then
   if [ -x /usr/bin/clang ] && [ -x /usr/bin/clang++ ]; then
     flutter_env=(env CC=/usr/bin/clang CXX=/usr/bin/clang++)
   fi
-  "${flutter_env[@]}" flutter build "$PLATFORM" "$FLUTTER_MODE"
+  "${flutter_env[@]}" flutter "${FLUTTER_ARGS[@]}"
 elif [ "$PLATFORM" = "windows" ]; then
   # The runner is Visual Studio's (MSVC); keep MSYS2's GCC out of its CMake.
-  env -u CC -u CXX flutter build windows "$FLUTTER_MODE"
+  env -u CC -u CXX flutter "${FLUTTER_ARGS[@]}"
 else
-  flutter build "$PLATFORM" "$FLUTTER_MODE"
+  flutter "${FLUTTER_ARGS[@]}"
 fi
+# `flutter run` has returned: the app was quit; nothing was built to report.
+[ "$RUN" = "1" ] && exit 0
 
 echo
 echo "==> Build complete."

@@ -67,11 +67,17 @@ else
 fi
 
 # --- locate flutter ----------------------------------------------------------
+# On PATH, else where ./setup.sh puts it ($FLUTTER_HOME; /opt/flutter on Linux,
+# ~/flutter on macOS and Windows).
 if ! command -v flutter >/dev/null 2>&1; then
-  if [ -x /opt/flutter/bin/flutter ]; then
-    export PATH="$PATH:/opt/flutter/bin"
-  else
-    echo "error: 'flutter' not found on PATH (and not at /opt/flutter/bin)." >&2
+  for fh in "${FLUTTER_HOME:-}" /opt/flutter "$HOME/flutter"; do
+    if [ -n "$fh" ] && [ -x "$fh/bin/flutter" ]; then
+      export PATH="$PATH:$fh/bin"
+      break
+    fi
+  done
+  if ! command -v flutter >/dev/null 2>&1; then
+    echo "error: 'flutter' not found on PATH (nor in \$FLUTTER_HOME, /opt/flutter, ~/flutter); run ./setup.sh" >&2
     exit 1
   fi
 fi

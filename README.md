@@ -74,17 +74,20 @@ submodule — run `git submodule update --init --recursive` first.
 ### Quick start
 
 ```bash
-./setup.sh            # install Flutter + Linux desktop toolchain (one-time)
+./setup.sh            # this OS's toolchain, deps, Rust, Flutter (one-time)
 ./build.sh            # native layer + Flutter app (default: linux/x86_64)
 ./build.sh macos      # on a Mac
 ./test.sh             # flutter analyze + pure-Dart unit tests
+./run-dev.sh          # build for this OS (Linux, macOS, Windows) and flutter run
 ```
 
 Agora builds entirely with the **system toolchain** — **conda is not used for the
 build** (mixing a conda env with the system GTK stack breaks the Flutter build).
-`setup.sh` installs everything from apt: the C/C++ toolchain, CMake/Ninja/pkg-config,
+`setup.sh` detects the OS (as `run-dev.sh` does) and installs what it can,
+listing anything it cannot (Xcode, Visual Studio without winget) as manual steps
+and exiting 1. On Linux it installs from apt (or dnf, pacman): the C/C++ toolchain, CMake/Ninja/pkg-config,
 the AT C-core deps (libsodium, jansson, uuid, protobuf, protobuf-c, openssl), the
-Flutter Linux desktop toolchain (GTK), and the Flutter SDK. No conda activation is
+Flutter Linux desktop toolchain (GTK), Rust (rustup), and the Flutter SDK. No conda activation is
 needed; if a conda env happens to be active, `build.sh` strips it for a clean
 system build (override with `AGORA_KEEP_CONDA=1`). conda remains fine for the
 AutonomousTrust *Python* inspector/services — it is simply off the Agora build path.
@@ -142,10 +145,10 @@ linked for arm64 macOS from Linux, but not yet built, run or signed on a Mac.
 Flutter cannot cross-compile desktop apps, so the build runs on the Mac itself.
 
 ```bash
-./setup.sh            # Xcode check, Homebrew deps, Flutter SDK (one-time)
+./setup.sh            # Homebrew + deps, Rosetta, Rust, Flutter; Xcode is manual
 ./build.sh macos      # native layer + agora.app, for this Mac's architecture
 ./test.sh             # analyze + unit tests (+ integration once native is built)
-./run-dev.sh          # flutter run against native/build
+./run-dev.sh          # build the native layer for this OS, then flutter run
 ./package-dmg.sh      # a .dmg for other Macs (SIGN_IDENTITY / NOTARY_PROFILE to distribute)
 ```
 
@@ -174,10 +177,10 @@ built or run on Windows.
 
 ```bash
 # in an "MSYS2 UCRT64" shell
-./setup.sh            # pacman packages, Visual Studio check, Flutter SDK (one-time)
+./setup.sh            # pacman packages + Rust, VS Build Tools (winget), Flutter
 ./build.sh windows    # native layer + agora.exe
 ./test.sh             # analyze + unit tests (+ integration once native is built)
-./run-dev.sh          # flutter run against native/build
+./run-dev.sh          # build the native layer for this OS, then flutter run
 ./package-windows.sh  # a .zip for other PCs (SIGN_CMD to sign)
 ```
 
