@@ -83,15 +83,25 @@ set(AT_INCLUDE_DIRS
     "${CMAKE_CURRENT_BINARY_DIR}/at_core/autonomous_trust"
     # generated protobuf-c headers (AT's PROTO_BINARY_DIR, its CMake line ~879)
     "${CMAKE_CURRENT_BINARY_DIR}/at_core/protobuf"
-    "${CMAKE_CURRENT_BINARY_DIR}/at_core/protobuf/autonomous_trust/core/protobuf")
+    "${CMAKE_CURRENT_BINARY_DIR}/at_core/protobuf/autonomous_trust/core/protobuf"
+    # AT's dependency headers, where AT found them (its find_path results are
+    # cache variables). On Linux they sit in /usr/include anyway; Homebrew's
+    # /opt/homebrew/include is not a default search path.
+    ${LIBSODIUM_INCLUDE_DIR} ${LIBJANSSON_INCLUDE_DIR} ${LIBPROTOBUF_C_INCLUDE_DIR})
 
-# libautonomous_trust.so is deliberately underlinked (AT links its deps only
-# into final executables, not the shared lib — a .so may carry unresolved
-# symbols). So each consumer must resolve AT's own dependencies. It is CXX-
-# linked, hence stdc++.
+# The shim and agorad call sodium, jansson, uuid and protobuf-c themselves, so
+# they link them too (AT's libraries link their own since AT made its dylibs
+# self-contained for macOS). libautonomous_trust is CXX-linked, hence the C++
+# runtime: stdc++ on Linux, libc++ on macOS (recent Xcode has no libstdc++).
 find_library(AT_SODIUM_LIB    sodium     REQUIRED)
 find_library(AT_JANSSON_LIB   jansson    REQUIRED)
-find_library(AT_UUID_LIB      uuid       REQUIRED)
+if(APPLE OR WIN32)
+    # libuuid is part of libSystem on macOS (Homebrew's ossp-uuid is a
+    # different API), and AT's compat/win32 on Windows (see AT's CMakeLists.txt).
+    set(AT_UUID_LIB "")
+else()
+    find_library(AT_UUID_LIB  uuid       REQUIRED)
+endif()
 find_library(AT_PROTOBUFC_LIB protobuf-c REQUIRED)
 find_library(AT_PROTOBUF_LIB  protobuf   REQUIRED)  # C++ runtime (ShutdownProtobufLibrary)
 # AT's extension libraries this build links: the five verification layers
@@ -130,7 +140,7 @@ foreach(_layer physics calibration certificates prequential replication social
         list(APPEND AT_EXT_RPATH "${CMAKE_CURRENT_BINARY_DIR}/at_core/extensions/${_layer}")
     endif()
 endforeach()
-if(AT_EXT_LIBS AND NOT APPLE)
+if(AT_EXT_LIBS AND NOT APPLE AND NOT WIN32)
     set(AT_EXT_LIBS -Wl,--no-as-needed ${AT_EXT_LIBS})
 endif()
 set(AT_LINK_LIBS
@@ -138,7 +148,7 @@ set(AT_LINK_LIBS
     autonomous_trust
     ${AT_SODIUM_LIB} ${AT_JANSSON_LIB} ${AT_UUID_LIB}
     ${AT_PROTOBUFC_LIB} ${AT_PROTOBUF_LIB}
-    pthread m stdc++)
+    pthread m $<IF:$<PLATFORM_ID:Darwin>,c++,stdc++>)
 
 # AT's public headers embed a typedef'd struct as an UNNAMED member (e.g.
 # structures/array.h: `smrt_ptr_t;`), a Microsoft/plan9 anonymous-member
@@ -148,6 +158,16 @@ set(AT_LINK_LIBS
 # above, so it covers our own targets (agora_shim, agorad) without touching the
 # already-configured AT core, which sets the flag itself.
 add_compile_options(-fms-extensions)
+# Windows: the shim and agorad include AT's headers, so they compile against
+# the same POSIX layer AT does (AT's compat/win32; set by its CMakeLists.txt).
+if(WIN32)
+    include_directories(BEFORE ${AT_WIN32_INCLUDE_DIR})
+    add_compile_options(${AT_WIN32_COMPILE_OPTIONS})
+endif()
+# Clang (Apple's included) also warns on every such member; AT's build quiets it.
+if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    add_compile_options(-Wno-microsoft-anon-tag)
+endif()
 
 # --- Flat FFI shim -----------------------------------------------------------
 add_library(agora_shim SHARED at_agora_shim.c)
@@ -175,9 +195,20 @@ set_target_properties(agorad PROPERTIES
 # BUILD_WITH_INSTALL_RPATH bakes this into the build-tree binaries themselves,
 # which is required because the Flutter bundle install copies the files verbatim
 # (install(FILES ...) does no rpath rewriting).
+#
+# macOS has no $ORIGIN. In Agora.app the shim and the AT dylibs sit in
+# Contents/Frameworks and agorad in Contents/MacOS (macos/embed_native.sh), so
+# the shim finds its siblings at @loader_path and agorad at
+# @executable_path/../Frameworks. The AT dylibs' install names are
+# @rpath/<lib>.dylib (CMake's default on Apple), which these entries resolve.
+if(APPLE)
+    set(AGORA_BUNDLE_RPATH "@loader_path;@executable_path/../Frameworks")
+else()
+    set(AGORA_BUNDLE_RPATH "$ORIGIN")
+endif()
 set_target_properties(agora_shim agorad PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
-    INSTALL_RPATH "$ORIGIN;${CMAKE_CURRENT_BINARY_DIR}/at_core;${AT_EXT_RPATH}")
+    INSTALL_RPATH "${AGORA_BUNDLE_RPATH};${CMAKE_CURRENT_BINARY_DIR}/at_core;${AT_EXT_RPATH}")
 
 # --- Ethne C-FFI cdylib (Phase 3: businesses = Ethne polities) ---------------
 # ethne_ffi/ is a Rust cdylib exposing a C ABI over Ethne's Rust charter engine
@@ -194,9 +225,22 @@ if(NOT CARGO_EXECUTABLE)
     message(WARNING "cargo not found; the ethne_ffi (business/polity) library "
                     "will NOT be built. Install Rust (rustup) and reconfigure.")
 else()
-    set(ETHNE_FFI_TARGET_DIR "/tmp/agora-ethne-ffi-target"
+    if(WIN32)
+        set(_ethne_tmp "$ENV{TEMP}")
+    else()
+        set(_ethne_tmp "/tmp")
+    endif()
+    set(ETHNE_FFI_TARGET_DIR "${_ethne_tmp}/agora-ethne-ffi-target"
         CACHE PATH "cargo target dir for ethne_ffi (keep off virtiofs)")
-    set(ETHNE_FFI_SO "${CMAKE_CURRENT_BINARY_DIR}/libethne_agora.so")
+    # Cargo's name for a cdylib: libethne_agora.so on Linux,
+    # libethne_agora.dylib on macOS, ethne_agora.dll (no lib prefix) on Windows.
+    if(WIN32)
+        set(ETHNE_FFI_NAME "ethne_agora.dll")
+    else()
+        set(ETHNE_FFI_NAME
+            "${CMAKE_SHARED_LIBRARY_PREFIX}ethne_agora${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    endif()
+    set(ETHNE_FFI_SO "${CMAKE_CURRENT_BINARY_DIR}/${ETHNE_FFI_NAME}")
     add_custom_command(
         OUTPUT "${ETHNE_FFI_SO}"
         COMMAND ${CMAKE_COMMAND} -E env
@@ -204,7 +248,7 @@ else()
                 ${CARGO_EXECUTABLE} build --release
                 --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/ethne_ffi/Cargo.toml"
         COMMAND ${CMAKE_COMMAND} -E copy
-                "${ETHNE_FFI_TARGET_DIR}/release/libethne_agora.so" "${ETHNE_FFI_SO}"
+                "${ETHNE_FFI_TARGET_DIR}/release/${ETHNE_FFI_NAME}" "${ETHNE_FFI_SO}"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/ethne_ffi/src/lib.rs"
                 "${CMAKE_CURRENT_SOURCE_DIR}/ethne_ffi/Cargo.toml"
         COMMENT "Building ethne_ffi cdylib (cargo, target on ${ETHNE_FFI_TARGET_DIR})"

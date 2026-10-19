@@ -16,6 +16,9 @@ This file is the index.
   (`native/build/agorad`, `libagora_shim.so`, `at_core/libautonomous_trust.so`,
   the extension libraries, and, for the Ethne scripts, `libethne_agora.so`).
   Nothing is rebuilt inside a namespace or a container.
+- **Linux only.** The backends are Linux network namespaces and docker's Linux
+  networking; there is no macOS equivalent, so on a Mac use the unit tests,
+  the integration test (`./test.sh`) and a real second machine instead.
 - **Run on a host, not in a sandbox.** Each node needs its own network stack,
   because AT's open discovery is UDP broadcast on one fixed port (27787). That
   needs either root with a kernel that permits `CLONE_NEWNET` (`netns`

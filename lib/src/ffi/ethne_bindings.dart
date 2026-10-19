@@ -13,6 +13,8 @@ import 'dart:io';
 
 import 'package:ffi/ffi.dart';
 
+import 'native_paths.dart';
+
 part 'kc_bindings.dart';
 
 // --- Raw C signatures --------------------------------------------------------
@@ -73,7 +75,8 @@ class EthneKeypair {
 }
 
 /// Loads and binds the ethne_agora cdylib. Path resolution mirrors the AT shim:
-/// `$AGORA_ETHNE_PATH`, else a conventional `native/build/libethne_agora.so`.
+/// `$AGORA_ETHNE_PATH`, else the bundled copy, else a conventional
+/// `native/build/libethne_agora.so` (`.dylib` on macOS).
 class EthneFfi {
   EthneFfi._(DynamicLibrary lib)
       : _lib = lib,
@@ -259,7 +262,10 @@ class EthneFfi {
   static String? resolveLibraryPath() {
     final env = Platform.environment['AGORA_ETHNE_PATH'];
     if (env != null && env.isNotEmpty && File(env).existsSync()) return env;
-    const conventional = 'native/build/libethne_agora.so';
+    final name = cargoLibName('ethne_agora');
+    final bundled = '${bundledLibDir()}/$name';
+    if (File(bundled).existsSync()) return bundled;
+    final conventional = 'native/build/$name';
     if (File(conventional).existsSync()) return conventional;
     return null;
   }
@@ -269,7 +275,8 @@ class EthneFfi {
     final p = path ?? resolveLibraryPath();
     if (p == null) {
       throw EthneException('ethne_agora library not found '
-          '(set AGORA_ETHNE_PATH or build native/build/libethne_agora.so)');
+          '(set AGORA_ETHNE_PATH or build native/build/'
+          '${cargoLibName('ethne_agora')})');
     }
     return EthneFfi._(DynamicLibrary.open(p));
   }

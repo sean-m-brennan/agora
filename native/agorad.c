@@ -48,7 +48,8 @@
  *                names against the same root, so both meet: conventionally
  *                app->AT = "extern_to_at", AT->app = "at_to_extern" (the AT
  *                defaults the app_events.h example uses). Keep the root SHORT —
- *                the full socket path must fit a 108-byte AF_UNIX sun_path.
+ *                the full socket path must fit an AF_UNIX sun_path (108 bytes
+ *                on Linux, 104 on macOS).
  *     log_level: 1=DEBUG 2=INFO 3=WARNING 4=ERROR 5=CRITICAL (default 3)
  *     log_file : path, or omitted/"" for stderr
  *
@@ -64,10 +65,13 @@
  *
  * Per-instance root: honor $AUTONOMOUS_TRUST_ROOT if set (a 2-node same-host
  * test gives each node a distinct root this way); otherwise default to
- * $AGORA_ROOT, then $XDG_STATE_HOME/agora, then $HOME/.local/state/agora.
+ * $AGORA_ROOT, then $XDG_STATE_HOME/agora, then $HOME/.local/state/agora
+ * ($HOME/Library/Application Support/Agora on macOS, where XDG is not used).
+ * The Dart supervisor (agora_daemon.dart) picks the same root and passes it.
  */
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -87,6 +91,8 @@
 #include "processes/plaintext_verbs.h" /* PLAINTEXT_VERBS_FILENAME */
 #include <jansson.h>
 #include "rendezvous/at_rendezvous.h"        /* at_rendezvous_link */
+#include "utilities/message.h"     /* messaging_in_process */
+#include "utilities/sighandler.h"  /* stop_process */
 
 /* True if an identity config already exists in cfg_dir (either serialization). */
 static bool identity_present(const char *cfg_dir)
@@ -116,12 +122,24 @@ static int ensure_config(void)
         const char *home = getenv("HOME");
         if (agora && agora[0])
             snprintf(def, sizeof(def), "%s", agora);
+#ifdef __APPLE__
+        else if (home && home[0])
+            snprintf(def, sizeof(def), "%s/Library/Application Support/Agora", home);
+#endif
+#ifdef _WIN32
+        else if (getenv("LOCALAPPDATA") && getenv("LOCALAPPDATA")[0])
+            snprintf(def, sizeof(def), "%s/Agora", getenv("LOCALAPPDATA"));
+        else if (getenv("TEMP") && getenv("TEMP")[0])
+            snprintf(def, sizeof(def), "%s/agora", getenv("TEMP"));
+#endif
         else if (xdg && xdg[0])
             snprintf(def, sizeof(def), "%s/agora", xdg);
         else if (home && home[0])
             snprintf(def, sizeof(def), "%s/.local/state/agora", home);
+#ifndef _WIN32
         else
             snprintf(def, sizeof(def), "/tmp/agora-%d", (int)getuid());
+#endif
         if (setenv("AUTONOMOUS_TRUST_ROOT", def, 1) != 0) {
             fprintf(stderr, "agorad: setenv AUTONOMOUS_TRUST_ROOT failed: %s\n",
                     strerror(errno));
@@ -224,6 +242,43 @@ static int grant_plaintext_verbs(const char *cfg_dir)
     return 0;
 }
 
+/* --- stop on stdin EOF ------------------------------------------------------ */
+/* The supervisor (agora_daemon.dart) holds our stdin open and closes it to ask
+ * for a stop; if the GUI dies, the pipe closes and the stop comes anyway. That
+ * is the only stop Windows can send (Dart's Process.kill there is
+ * TerminateProcess, with no handler to run), so it is always on there, and on
+ * Linux/macOS when $AGORA_QUIT_ON_STDIN_EOF=1. In-process the node watches
+ * stop_process itself; a forked node is sent SIGTERM by supervise(). */
+static volatile sig_atomic_t g_stdin_eof = 0;
+
+static void *watch_stdin(void *arg)
+{
+    (void)arg;
+    char buf[256];
+    for (;;) {
+        ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+        if (n > 0)
+            continue;          /* anything written is ignored; only EOF matters */
+        if (n < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    fprintf(stderr, "agorad: stdin closed; stopping\n");
+    g_stdin_eof = 1;
+    stop_process = true;
+    return NULL;
+}
+
+static bool quit_on_stdin_eof(void)
+{
+#ifdef _WIN32
+    return true;
+#else
+    const char *v = getenv("AGORA_QUIT_ON_STDIN_EOF");
+    return v != NULL && strcmp(v, "1") == 0;
+#endif
+}
+
 /* --- daemon supervision ---------------------------------------------------- */
 /* The AT node detaches (setsid) into its own session, so it is NOT our child —
  * we cannot waitpid() on it, only kill()/signal it. These globals let the signal
@@ -231,6 +286,7 @@ static int grant_plaintext_verbs(const char *cfg_dir)
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_daemon_pid = 0;
 
+#ifndef _WIN32
 static void forward_stop(int sig)
 {
     g_stop = sig;
@@ -251,12 +307,13 @@ static int supervise(pid_t daemon_pid)
     while (kill(daemon_pid, 0) == 0) {
         struct timespec ts = {.tv_sec = 0, .tv_nsec = 200 * 1000 * 1000};
         nanosleep(&ts, NULL);
-        if (g_stop)
+        if (g_stop || g_stdin_eof)
             kill(daemon_pid, SIGTERM);
     }
     fprintf(stderr, "agorad: AT node (pid %d) exited\n", (int)daemon_pid);
     return 0;
 }
+#endif
 
 int main(int argc, char **argv)
 {
@@ -300,12 +357,24 @@ int main(int argc, char **argv)
     if (ensure_config() != 0)
         return 1;
 
-    /* Forward the Dart supervisor's stop to the detached node (see supervise()). */
+#ifndef _WIN32
+    /* Forward the Dart supervisor's stop to the detached node (see supervise()).
+     * In-process, run_autonomous_trust installs AT's own handlers, which set
+     * stop_process for the node loop running right here. */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = forward_stop;
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
+#endif
+
+    if (quit_on_stdin_eof()) {
+        pthread_t watcher;
+        if (pthread_create(&watcher, NULL, watch_stdin, NULL) == 0)
+            pthread_detach(watcher);
+        else
+            fprintf(stderr, "agorad: could not watch stdin; only a signal stops this node\n");
+    }
 
     /* NULL capabilities -> use the on-disk config. Advertising agora.profile via
      * a serialized capabilities buffer is a follow-on (needs the AT capability
@@ -314,8 +383,10 @@ int main(int argc, char **argv)
      * Returns: >0 = the detached node's PID (default forking build; supervise it);
      * 0 = it ran in-process and has now shut down (future FORK=0 build); <0 = error. */
     int rc = run_autonomous_trust(q_in, q_out, NULL, 0, level, log_file);
+#ifndef _WIN32
     if (rc > 0)
         return supervise((pid_t)rc);
+#endif
     if (rc < 0) {
         fprintf(stderr, "agorad: run_autonomous_trust failed (rc=%d)\n", rc);
         return 1;

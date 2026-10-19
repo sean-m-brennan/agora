@@ -13,16 +13,159 @@
 # (conda is still fine for the AutonomousTrust *Python* inspector/services — it
 # is simply not on the Agora build path, and build.sh strips it if active.)
 #
+# macOS: the same pieces from Homebrew instead of apt, plus Xcode (which
+# `flutter build macos` needs; the command line tools alone are not enough).
+# See setup_macos below.
+#
+# Windows: run from an MSYS2 UCRT64 shell (https://www.msys2.org; the
+# "MSYS2 UCRT64" start-menu entry). The native layer is built with MSYS2's
+# UCRT64 toolchain and packages (pacman), the Flutter runner with Visual Studio
+# 2022's C++ tools, which `flutter build windows` requires. See setup_windows.
+#
 # Usage:   ./setup.sh
-# Env:     FLUTTER_HOME   (default /opt/flutter)
+# Env:     FLUTTER_HOME   (default /opt/flutter; $HOME/flutter on macOS)
 #          FLUTTER_CHANNEL(default stable)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FLUTTER_HOME="${FLUTTER_HOME:-/opt/flutter}"
 FLUTTER_CHANNEL="${FLUTTER_CHANNEL:-stable}"
 
 log() { printf '\n==> %s\n' "$*"; }
+
+# --- macOS -----------------------------------------------------------------
+setup_macos() {
+  FLUTTER_HOME="${FLUTTER_HOME:-$HOME/flutter}"
+  if ! xcode-select -p >/dev/null 2>&1; then
+    echo "error: Xcode is not installed. Install Xcode from the App Store, then run:" >&2
+    echo "         sudo xcode-select -s /Applications/Xcode.app && sudo xcodebuild -runFirstLaunch" >&2
+    exit 1
+  fi
+  if ! xcodebuild -version >/dev/null 2>&1; then
+    echo "error: only the command line tools are selected; flutter build macos needs Xcode:" >&2
+    echo "         sudo xcode-select -s /Applications/Xcode.app" >&2
+    exit 1
+  fi
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "error: Homebrew not found; install it from https://brew.sh, then re-run." >&2
+    exit 1
+  fi
+
+  log "Installing build tools and AT C-core deps (Homebrew)"
+  # libuuid is part of macOS itself. Do NOT install ossp-uuid: its uuid.h is a
+  # different API and would shadow the system one.
+  brew install cmake ninja pkg-config libsodium jansson protobuf protobuf-c
+
+  # Rust builds ethne_ffi (businesses); optional, the app runs without it.
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "note: Rust not found; businesses (ethne_ffi) will not be built."
+    echo "      To add them: brew install rustup && rustup-init -y"
+  fi
+
+  if [ -x "$FLUTTER_HOME/bin/flutter" ]; then
+    log "Flutter already present at $FLUTTER_HOME"
+  else
+    log "Installing Flutter ($FLUTTER_CHANNEL) to $FLUTTER_HOME"
+    git clone --branch "$FLUTTER_CHANNEL" --depth 1 \
+      https://github.com/flutter/flutter.git "$FLUTTER_HOME"
+  fi
+  export PATH="$PATH:$FLUTTER_HOME/bin"
+  # zsh is the macOS login shell.
+  if ! grep -qF "$FLUTTER_HOME/bin" "$HOME/.zprofile" 2>/dev/null; then
+    echo 'export PATH="$PATH:'"$FLUTTER_HOME"'/bin"' >> "$HOME/.zprofile"
+    log "PATH persisted to ~/.zprofile (open a new terminal, or: source ~/.zprofile)"
+  fi
+
+  log "Enabling Flutter macOS desktop + precaching the macOS engine"
+  flutter config --enable-macos-desktop
+  flutter precache --macos
+  flutter --version
+
+  cat <<EOF
+
+==> Setup complete.
+
+Next:
+  1. Build:   ./build.sh macos      # native layer + agora.app ($(uname -m) only)
+  2. Test:    ./test.sh
+  3. Package: ./package-dmg.sh      # a .dmg for other Macs
+
+If 'flutter' is not found in a new shell, add: export PATH="\$PATH:$FLUTTER_HOME/bin"
+EOF
+}
+
+# --- Windows (MSYS2 UCRT64) ------------------------------------------------
+setup_windows() {
+  if [ "${MSYSTEM:-}" != "UCRT64" ]; then
+    echo "error: run this from an MSYS2 UCRT64 shell (MSYSTEM=UCRT64, not '${MSYSTEM:-unset}')." >&2
+    exit 1
+  fi
+  FLUTTER_HOME="${FLUTTER_HOME:-$HOME/flutter}"
+
+  log "Installing the UCRT64 toolchain and AT C-core deps (pacman)"
+  pacman -S --needed --noconfirm git unzip zip \
+    mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake \
+    mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-pkgconf \
+    mingw-w64-ucrt-x86_64-python \
+    mingw-w64-ucrt-x86_64-libsodium mingw-w64-ucrt-x86_64-jansson \
+    mingw-w64-ucrt-x86_64-protobuf mingw-w64-ucrt-x86_64-protobuf-c \
+    mingw-w64-ucrt-x86_64-check
+  # Rust builds ethne_ffi (businesses); optional, the app runs without it.
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "note: Rust not found; businesses (ethne_ffi) will not be built."
+    echo "      To add them: pacman -S mingw-w64-ucrt-x86_64-rust"
+  fi
+
+  # flutter build windows needs Visual Studio's C++ workload.
+  local vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+  if [ ! -x "$vswhere" ] || [ -z "$("$vswhere" -latest -requires Microsoft.VisualStudio.Workload.VCTools Microsoft.VisualStudio.Workload.NativeDesktop -property installationPath 2>/dev/null)" ]; then
+    echo "warning: Visual Studio 2022 with 'Desktop development with C++' was not found;"
+    echo "         flutter build windows needs it (the Build Tools edition is enough):"
+    echo "         https://visualstudio.microsoft.com/downloads/"
+  fi
+
+  if [ -x "$FLUTTER_HOME/bin/flutter" ]; then
+    log "Flutter already present at $FLUTTER_HOME"
+  else
+    log "Installing Flutter ($FLUTTER_CHANNEL) to $FLUTTER_HOME"
+    git clone --branch "$FLUTTER_CHANNEL" --depth 1 \
+      https://github.com/flutter/flutter.git "$FLUTTER_HOME"
+  fi
+  export PATH="$PATH:$FLUTTER_HOME/bin"
+  if ! grep -qF "$FLUTTER_HOME/bin" "$HOME/.bashrc" 2>/dev/null; then
+    echo 'export PATH="$PATH:'"$FLUTTER_HOME"'/bin"' >> "$HOME/.bashrc"
+    log "PATH persisted to ~/.bashrc (open a new UCRT64 shell, or: source ~/.bashrc)"
+  fi
+
+  log "Enabling Flutter Windows desktop + precaching the Windows engine"
+  flutter config --enable-windows-desktop
+  flutter precache --windows
+  flutter --version
+
+  cat <<EOF
+
+==> Setup complete.
+
+Next (from this UCRT64 shell):
+  1. Build:   ./build.sh windows    # native layer + agora.exe
+  2. Test:    ./test.sh
+  3. Package: ./package-windows.sh  # a zip for other PCs
+
+If 'flutter' is not found in a new shell, add: export PATH="\$PATH:$FLUTTER_HOME/bin"
+EOF
+}
+
+if [ "$(uname -s)" = "Darwin" ]; then
+  setup_macos
+  exit 0
+fi
+case "$(uname -s)" in
+  MINGW*|MSYS*)
+    setup_windows
+    exit 0
+    ;;
+esac
+
+FLUTTER_HOME="${FLUTTER_HOME:-/opt/flutter}"
 
 SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo"

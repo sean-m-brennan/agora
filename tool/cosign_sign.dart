@@ -27,7 +27,7 @@
 // {"record","op","polity","cid","bytes",...}. Prints {"signer_did","sig",
 // "description","op"} on stdout, or exits non-zero with the reason.
 //
-// Needs the cdylib: AGORA_ETHNE_PATH, or native/build/libethne_agora.so.
+// Needs the cdylib: AGORA_ETHNE_PATH, or native/build/libethne_agora.{so,dylib}.
 
 import 'dart:convert';
 import 'dart:io';
@@ -56,7 +56,7 @@ Future<void> main(List<String> args) async {
   if (libPath == null) {
     _die(
         'ethne_agora not found (set AGORA_ETHNE_PATH or build '
-        'native/build/libethne_agora.so)',
+        'native/build/libethne_agora.{so,dylib})',
         2);
   }
   final ffi = EthneFfi.open(libPath);

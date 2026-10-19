@@ -59,6 +59,7 @@
 
 #include <pthread.h>
 #include <stdlib.h>
+#include <unistd.h>  /* mkdtemp: Darwin declares it here, not in stdlib.h */
 #include <sys/stat.h>
 
 /****************************

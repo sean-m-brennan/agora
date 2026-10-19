@@ -122,6 +122,25 @@ trap cleanup EXIT INT TERM
 # --------------------------------------------------------------------------- #
 # Build the virtual L2 segment: two netns bridged on one /24
 # --------------------------------------------------------------------------- #
+# What an earlier KEEP=1 run left up, these names only: its namespaces, with
+# its daemons still running in them and holding the ports, made this run's
+# network processes fail to start (ENOENT on every send to `network`; run-all
+# 3927785 and 4015220).
+for ns in "$NS1" "$NS2"; do
+  if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$ns"; then
+    log "Removing $ns left by an earlier run"
+    ip netns pids "$ns" 2>/dev/null | while read -r p; do kill -9 "$p" 2>/dev/null; done
+    ip netns del "$ns" 2>/dev/null
+  fi
+done
+# A deleted netns is torn down only once its killed daemons have exited, so
+# its veths' bridge-side ends can outlive the `netns del`; delete them by name
+# (each takes its peer with it) or the `ip link add` below fails with "File
+# exists" (run-all-4046791).
+ip link del "$V1B" 2>/dev/null || true
+ip link del "$V2B" 2>/dev/null || true
+ip link del "$BR" 2>/dev/null || true
+
 log "Creating bridge $BR + two namespaces ($NS1, $NS2) on $SUBNET.0/$PREFIX"
 ip link add "$BR" type bridge
 ip link set "$BR" up

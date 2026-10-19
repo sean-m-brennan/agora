@@ -9,9 +9,10 @@
 // Runs on the Dart VM under `flutter test` (no display needed). It SELF-SKIPS
 // unless the native artifacts are wired via env, so the ordinary pure-Dart
 // suite is unaffected. `test.sh` sets these when native/build exists:
-//   AGORA_SHIM_PATH   -> native/build/libagora_shim.so   (dlopen'd by the shim loader)
+//   AGORA_SHIM_PATH   -> native/build/libagora_shim.so   (.dylib on macOS; dlopen'd by the shim loader)
 //   AGORA_DAEMON_PATH -> native/build/agorad             (spawned by AgoraDaemon)
-//   LD_LIBRARY_PATH   includes native/build/at_core      (libautonomous_trust)
+//   LD_LIBRARY_PATH   includes native/build/at_core      (Linux only; on macOS the
+//                     build-tree rpath finds libautonomous_trust)
 // Build first with ./build.sh (or cmake -S native -B native/build).
 
 import 'dart:io';
@@ -44,7 +45,7 @@ void main() {
 
     setUp(() {
       // A SHORT root: AT roots each AF_UNIX socket at $root/var/at/<name>, and
-      // sun_path is capped at 108 bytes.
+      // sun_path is capped at 108 bytes (104 on macOS).
       root = Directory.systemTemp.createTempSync('agora_it_');
       svc = PeerService(
         daemon: AgoraDaemon(

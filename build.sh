@@ -12,7 +12,7 @@
 # poison each other on the shared filesystem). Install the deps with ./setup.sh.
 #
 # Usage:
-#   ./build.sh [linux|macos]          # default: linux
+#   ./build.sh [linux|macos|windows]  # default: linux
 #
 # Env:
 #   AGORA_STRICT=1   keep AT's hardcoded -Werror (default: strip it via
@@ -22,6 +22,18 @@
 #   FLUTTER_MODE=... --debug | --profile | --release for the app (default: --debug).
 #   AGORA_KEEP_CONDA=1  do NOT strip conda from the build environment (escape
 #                    hatch; the default is to remove it).
+#   MACOSX_DEPLOYMENT_TARGET=...  oldest macOS the native layer targets (default
+#                    12.0, the Runner's; Homebrew's own floor wins if newer).
+#
+# Windows: run from an MSYS2 UCRT64 shell. The native layer is built with its
+# MinGW GCC, CMake and Ninja (./setup.sh installs them with pacman); the
+# Flutter runner is built by Flutter with Visual Studio, and copies the native
+# layer and its MinGW DLLs in beside agora.exe (windows/CMakeLists.txt).
+#
+# macOS: the AT C deps come from Homebrew (./setup.sh installs them), found via
+# $(brew --prefix); the native layer is built for this Mac's architecture only,
+# since Homebrew bottles are single-arch. `flutter build macos` then embeds it
+# into agora.app (macos/embed_native.sh, a Runner build phase).
 set -euo pipefail
 
 PLATFORM="${1:-linux}"
@@ -31,8 +43,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 case "$PLATFORM" in
-  linux|macos) ;;
-  *) echo "error: unsupported platform '$PLATFORM' (want: linux | macos)" >&2; exit 2 ;;
+  linux|macos|windows) ;;
+  *) echo "error: unsupported platform '$PLATFORM' (want: linux | macos | windows)" >&2; exit 2 ;;
 esac
 
 # --- neutralize conda: build entirely with the system toolchain --------------
@@ -73,6 +85,32 @@ if [ "${AGORA_KEEP_CONDA:-0}" != "1" ]; then
     done
     IFS="$_oldifs"; export PKG_CONFIG_PATH="${SYS_PC}${_cleanpc:+:$_cleanpc}"
   fi
+fi
+
+# --- macOS / Windows: platform toolchain ------------------------------------
+# Set after the conda strip above, which clears CMAKE_PREFIX_PATH.
+JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)"
+PLATFORM_CMAKE_ARGS=()
+if [ "$PLATFORM" = "macos" ]; then
+  [ "$(uname -s)" = "Darwin" ] || { echo "error: a macOS build runs on macOS (Flutter cannot cross-compile desktop apps)" >&2; exit 2; }
+  command -v brew >/dev/null 2>&1 || { echo "error: Homebrew not found; run ./setup.sh first" >&2; exit 1; }
+  BREW_PREFIX="$(brew --prefix)"
+  PLATFORM_CMAKE_ARGS=(
+    "-DCMAKE_PREFIX_PATH=$BREW_PREFIX"
+    "-DCMAKE_OSX_ARCHITECTURES=$(uname -m)"
+    "-DCMAKE_OSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+  )
+fi
+if [ "$PLATFORM" = "windows" ]; then
+  case "${MSYSTEM:-}" in
+    UCRT64) ;;
+    *) echo "error: a Windows build runs in an MSYS2 UCRT64 shell (MSYSTEM=UCRT64, not '${MSYSTEM:-unset}'); see ./setup.sh" >&2; exit 2 ;;
+  esac
+  # Where windows/CMakeLists.txt finds the MinGW DLLs to bundle (a Windows
+  # path: the runner's CMake is a native Windows program).
+  AGORA_MINGW_BIN="$(cygpath -m "$MSYSTEM_PREFIX/bin")"
+  export AGORA_MINGW_BIN
+  PLATFORM_CMAKE_ARGS=(-G Ninja)
 fi
 
 # --- locate flutter ----------------------------------------------------------
@@ -129,6 +167,10 @@ if [ "${AGORA_STRICT:-0}" != "1" ]; then
   # would override ours.
   LAUNCH="$ROOT/native/cc-no-werror.sh"
   chmod +x "$LAUNCH"
+  # Ninja on Windows cannot run a .sh itself: launch it through bash.
+  if [ "$PLATFORM" = "windows" ]; then
+    LAUNCH="$(cygpath -m "$(command -v bash)");$(cygpath -m "$LAUNCH")"
+  fi
   NATIVE_CMAKE_ARGS+=(
     "-DAT_CC_VALIDATE_OUTPUT=OFF"
     "-DCMAKE_C_COMPILER_LAUNCHER=$LAUNCH"
@@ -136,13 +178,16 @@ if [ "${AGORA_STRICT:-0}" != "1" ]; then
   )
 fi
 
-cmake -S native -B native/build "${NATIVE_CMAKE_ARGS[@]}"
+cmake -S native -B native/build "${NATIVE_CMAKE_ARGS[@]}" ${PLATFORM_CMAKE_ARGS[@]+"${PLATFORM_CMAKE_ARGS[@]}"}
 # ethne_ffi (businesses = Ethne polities) is built too when cargo is available;
-# its CMake target is a no-op if Rust is not installed (a warning at configure).
-cmake --build native/build --target agorad agora_shim ethne_ffi \
-    -j"$(nproc 2>/dev/null || echo 4)" || \
-  cmake --build native/build --target agorad agora_shim \
-    -j"$(nproc 2>/dev/null || echo 4)"
+# its CMake target does not exist if Rust is not installed (a warning at
+# configure). The core targets build either way; an ethne failure is reported,
+# not fatal, since businesses are the only feature it carries.
+cmake --build native/build --target agorad agora_shim -j"$JOBS"
+if grep -q '^CARGO_EXECUTABLE:FILEPATH=/' native/build/CMakeCache.txt 2>/dev/null; then
+  cmake --build native/build --target ethne_ffi -j"$JOBS" \
+    || echo "==> WARNING: ethne_ffi (businesses) failed to build; the app runs without it" >&2
+fi
 
 # --- 2. Flutter app ----------------------------------------------------------
 echo "==> Fetching Dart packages"
@@ -189,20 +234,43 @@ if [ "$PLATFORM" = "linux" ]; then
     flutter_env=(env CC=/usr/bin/clang CXX=/usr/bin/clang++)
   fi
   "${flutter_env[@]}" flutter build "$PLATFORM" "$FLUTTER_MODE"
+elif [ "$PLATFORM" = "windows" ]; then
+  # The runner is Visual Studio's (MSVC); keep MSYS2's GCC out of its CMake.
+  env -u CC -u CXX flutter build windows "$FLUTTER_MODE"
 else
   flutter build "$PLATFORM" "$FLUTTER_MODE"
 fi
 
 echo
 echo "==> Build complete."
-echo "    native : native/build/{agorad,libagora_shim.so,at_core/libautonomous_trust.so}"
-echo "             + at_core/extensions/<layer>/libat_<layer>.so (the five verification layers)"
-echo "    app    : build/$PLATFORM/  (see 'flutter build $PLATFORM' output above)"
-echo
-echo "    To run (needs a display), point the app at the native artifacts:"
-echo "      export AGORA_DAEMON_PATH=\"$ROOT/native/build/agorad\""
-echo "      export AGORA_SHIM_PATH=\"$ROOT/native/build/libagora_shim.so\""
-echo "      export LD_LIBRARY_PATH=\"$ROOT/native/build/at_core:\$LD_LIBRARY_PATH\""
-echo "      flutter run -d $PLATFORM"
-echo "    agorad self-bootstraps its identity/config under a short"
-echo "    \$AUTONOMOUS_TRUST_ROOT (default ~/.local/state/agora) on first run."
+if [ "$PLATFORM" = "windows" ]; then
+  echo "    native : native/build/{agorad.exe,libagora_shim.dll,at_core/libautonomous_trust.dll}"
+  echo "             + at_core/extensions/<layer>/libat_<layer>.dll"
+  echo "    app    : build/windows/x64/runner/*/agora.exe (native layer and MinGW DLLs beside it)"
+  echo
+  echo "    To run from the source tree: ./run-dev.sh   (or start agora.exe above)."
+  echo "    To package for other PCs:    ./package-windows.sh"
+  echo "    agorad keeps its identity/config under %LOCALAPPDATA%\\Agora."
+elif [ "$PLATFORM" = "macos" ]; then
+  echo "    native : native/build/{agorad,libagora_shim.dylib,at_core/libautonomous_trust.dylib}"
+  echo "             + at_core/extensions/<layer>/libat_<layer>.dylib"
+  echo "    app    : build/macos/Build/Products/*/agora.app (native layer embedded)"
+  echo
+  echo "    To run from the source tree: ./run-dev.sh   (or open the .app above)."
+  echo "    To package for other Macs:   ./package-dmg.sh"
+  echo "    agorad self-bootstraps its identity/config under"
+  echo "    ~/Library/Application Support/Agora on first run."
+else
+  echo "    native : native/build/{agorad,libagora_shim.so,at_core/libautonomous_trust.so}"
+  echo "             + at_core/extensions/<layer>/libat_<layer>.so (the verification layers,"
+  echo "               social, rendezvous and first contact)"
+  echo "    app    : build/$PLATFORM/  (see 'flutter build $PLATFORM' output above)"
+  echo
+  echo "    To run (needs a display): ./run-dev.sh, or point the app at the native artifacts:"
+  echo "      export AGORA_DAEMON_PATH=\"$ROOT/native/build/agorad\""
+  echo "      export AGORA_SHIM_PATH=\"$ROOT/native/build/libagora_shim.so\""
+  echo "      export LD_LIBRARY_PATH=\"$ROOT/native/build/at_core:\$LD_LIBRARY_PATH\""
+  echo "      flutter run -d $PLATFORM"
+  echo "    agorad self-bootstraps its identity/config under a short"
+  echo "    \$AUTONOMOUS_TRUST_ROOT (default ~/.local/state/agora) on first run."
+fi

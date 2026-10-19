@@ -78,7 +78,7 @@ void main() {
   group('Ethne polity round-trip (P3.0)', () {
     if (libPath == null) {
       test('skipped — ethne_agora not built', () {}, skip: 'set AGORA_ETHNE_PATH '
-          '(build native/build/libethne_agora.so via ./build.sh)');
+          '(build native/build/libethne_agora.{so,dylib} via ./build.sh)');
       return;
     }
 

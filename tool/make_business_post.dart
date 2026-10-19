@@ -18,7 +18,7 @@
 //   {"polity","page_bundle","page_seq","name","locality",
 //    "posts":[{"seq","body","bundle"}, ...]}
 //
-// Needs the cdylib: AGORA_ETHNE_PATH, or native/build/libethne_agora.so.
+// Needs the cdylib: AGORA_ETHNE_PATH, or native/build/libethne_agora.{so,dylib}.
 
 import 'dart:convert';
 import 'dart:io';
@@ -50,7 +50,7 @@ void main(List<String> args) {
   final libPath = EthneFfi.resolveLibraryPath();
   if (libPath == null) {
     stderr.writeln('ethne_agora not found (set AGORA_ETHNE_PATH or build '
-        'native/build/libethne_agora.so)');
+        'native/build/libethne_agora.{so,dylib})');
     exit(2);
   }
   final ffi = EthneFfi.open(libPath);

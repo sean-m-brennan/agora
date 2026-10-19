@@ -398,7 +398,7 @@ net_up || exit 1
 #   advertise <root> <polity> <mint.json>        — publish the business page
 #   customer  <root> <polity> <sat>              — declare a customer edge
 #   post      <root> <polity> <bundle> <seq>     — publish a business post
-#   observe-post <root> <polity> <t> <out> [hops]— wait for one on the app queue
+#   observe-post <root> <polity> <t> <out> [hops] [seq] — wait for one on the app queue
 #   observe-none <root> <polity> <seconds>       — assert none arrives
 #
 # The ctypes Ev mirror and connect()/wait_in_group() below are SPLICED VERBATIM
@@ -684,8 +684,10 @@ def cmd_post(shim, root, polity, bundle_path, seq, timeout):
     return 0 if rc == 0 else 4
 
 
-def _collect_posts(lib, h, polity, deadline, buf, cap):
-    """Every business post for `polity` seen before the deadline."""
+def _collect_posts(lib, h, polity, deadline, buf, cap, want_seq=None):
+    """The first business post for `polity` (of seq `want_seq`, if given) seen
+    before the deadline. A post this node missed can arrive by backfill at any
+    moment, so a phase waiting for one particular post names its seq."""
     seen = []
     while time.time() < deadline:
         lib.agora_events_request_roster(h, b"extern_to_at")
@@ -693,6 +695,8 @@ def _collect_posts(lib, h, polity, deadline, buf, cap):
             if e.kind != EV_BUSINESS_POST:
                 continue
             if e.business_post_polity.decode(errors="replace") != polity:
+                continue
+            if want_seq is not None and int(e.business_post_seq) != int(want_seq):
                 continue
             seen.append({
                 "polity": e.business_post_polity.decode(errors="replace"),
@@ -708,8 +712,10 @@ def _collect_posts(lib, h, polity, deadline, buf, cap):
     return seen
 
 
-def cmd_observe_post(shim, root, polity, timeout, out_path, want_hops=None):
-    """Wait for ONE business post for `polity` on the app-event queue."""
+def cmd_observe_post(shim, root, polity, timeout, out_path, want_hops=None,
+                     want_seq=None):
+    """Wait for ONE business post for `polity` (of seq `want_seq`, if given) on
+    the app-event queue."""
     lib = open_lib(shim, root)
     h = connect(lib, timeout)
     if not h:
@@ -717,7 +723,8 @@ def cmd_observe_post(shim, root, polity, timeout, out_path, want_hops=None):
         return 2
     cap = 64
     buf = (Ev * cap)()
-    seen = _collect_posts(lib, h, polity, time.time() + timeout, buf, cap)
+    seen = _collect_posts(lib, h, polity, time.time() + timeout, buf, cap,
+                          want_seq)
     lib.agora_events_close(h)
     if not seen:
         print(f"observe-post: no business post for {polity[:16]}… in {timeout}s",
@@ -859,13 +866,17 @@ def main(argv):
         return cmd_post(shim, root, argv[4], argv[5], int(argv[6]), float(argv[7]))
     if verb == "observe-post":
         # argv: 0 script, 1 verb, 2 shim, 3 root, 4 polity, 5 timeout, 6 out,
-        # 7 want_hops. Spelled out because reading it one slot along made the
-        # hop assertion silently optional — the check ran, on nothing.
+        # 7 want_hops, 8 want_seq. Spelled out because reading it one slot
+        # along made the hop assertion silently optional — the check ran, on
+        # nothing.
         want = None
         if len(argv) > 7 and argv[7] != "":
             want = int(argv[7])
+        want_seq = None
+        if len(argv) > 8 and argv[8] != "":
+            want_seq = int(argv[8])
         return cmd_observe_post(shim, root, argv[4], float(argv[5]), argv[6] or None,
-                                want)
+                                want, want_seq)
     if verb == "publish-plain":
         return cmd_publish_plain(shim, root, argv[4], float(argv[5]))
     if verb == "observe-plain":
@@ -1105,7 +1116,9 @@ fi
 
 BOB_TAMPER="$RUN/bob_tampered.json"
 log "ada: publishing a TAMPERED bundle (body edited after signing)"
-drive "$ROOT_BOB" observe-post "$POLITY" "$WAIT" "$BOB_TAMPER" "" &
+# Its seq (9), not just the first post: bob's backfill of the posts he missed
+# before he held the page can land at the same moment (post-4019472).
+drive "$ROOT_BOB" observe-post "$POLITY" "$WAIT" "$BOB_TAMPER" "" 9 &
 OBS_TAMPER=$!
 sleep 4
 drive "$ROOT_ADA" post "$POLITY" "$RUN/post3-tampered.bundle" 9 "$WAIT"

@@ -22,7 +22,7 @@ void main() {
   group('Ethne business page (P3.1)', () {
     if (libPath == null) {
       test('skipped — ethne_agora not built', () {}, skip: 'set AGORA_ETHNE_PATH '
-          '(build native/build/libethne_agora.so via ./build.sh)');
+          '(build native/build/libethne_agora.{so,dylib} via ./build.sh)');
       return;
     }
 

@@ -73,7 +73,8 @@
 #   GATE_WINDOW (how long a negative waits, default 20), NEUTRAL
 #   (AT_REP_NEUTRAL for the nodes, default 0.70), RESCORE_SEC
 #   (AT_REP_RESCORE_SEC, default 5), CHECKPOINT_SEC (AT_REP_CHECKPOINT_SEC,
-#   default 20), SUBNET (default 10.9.5), KEEP=1.
+#   default 20), TIER_HEADROOM (score phase 6 wants above P's floor, default
+#   0.02), SUBNET (default 10.9.5), KEEP=1.
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -87,6 +88,8 @@ ATCORE="$NATIVE/at_core"
 
 WAIT="${WAIT:-90}"
 GATE_WINDOW="${GATE_WINDOW:-20}"
+# Phase 6 picks P only with this much score above P's floor.
+TIER_HEADROOM="${TIER_HEADROOM:-0.02}"
 NEUTRAL="${NEUTRAL:-0.70}"
 RESCORE_SEC="${RESCORE_SEC:-5}"
 CHECKPOINT_SEC="${CHECKPOINT_SEC:-20}"
@@ -1105,23 +1108,39 @@ drive "$ROOT_ADA" unblock "$BOB_UUID" "$WAIT" >/dev/null \
 drive "$ROOT_ADA" await-blocked "$BOB_UUID" 0 "$WAIT" >/dev/null \
   || { err "FAIL (phase 6) — the unblock never became visible"; dump_logs; exit 1; }
 
-# P = the tier BOTH receivers give bob right now. The cap goes one tier below.
-tier_of() { # root out-file -> echoes the tier, or nothing
+# P = the tier BOTH receivers give bob right now, with headroom above its
+# floor. The cap goes one tier below.
+tier_of() { # root out-file -> echoes "tier score", or nothing
   drive "$1" await-rep "$BOB_UUID" 1 - none - "$WAIT" "$2" >/dev/null || return 1
-  python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['tier'])" "$2"
+  python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d['tier'],d['score'])" "$2"
 }
-T_C="$(tier_of "$ROOT_CAROL" "$RUN/carol_bob.json")" \
+read -r T_C SC_C <<<"$(tier_of "$ROOT_CAROL" "$RUN/carol_bob.json")"
+[ -n "$T_C" ] \
   || { err "FAIL (phase 6 precondition) — carol no longer rates bob at tier >= 1 unbounded"; dump_logs; exit 1; }
-T_A="$(tier_of "$ROOT_ADA" "$RUN/ada_bob.json")" \
+read -r T_A SC_A <<<"$(tier_of "$ROOT_ADA" "$RUN/ada_bob.json")"
+[ -n "$T_A" ] \
   || { err "FAIL (phase 6 precondition) — ada no longer rates bob at tier >= 1 unbounded"; dump_logs; exit 1; }
 P=$(( T_C < T_A ? T_C : T_A ))
+# A score on P's floor can cross under it between the reading and the post, so
+# carol's miss would prove nothing (mod-2555501: carol at 0.804 on 0.80). Step
+# P down until both scores clear its floor by TIER_HEADROOM; tier 1 is the
+# least the phase can use, so it stays even when thin.
+P="$(python3 - "$P" "$SC_C" "$SC_A" "$TIER_HEADROOM" <<'PY'
+import sys
+p, sc, sa, room = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+floors = {1: 0.50, 2: 0.65, 3: 0.80, 4: 0.90}
+while p > 1 and min(sc, sa) - floors[p] < room:
+    p -= 1
+print(p)
+PY
+)"
 # The top score of tier P-1, comfortably inside it (rep_proc.c TIER_FLOORS:
 # 0.50, 0.65, 0.80, 0.90); tier 0's stays above COMM_CUTOFF (0.1).
 case "$P" in
   1) CAP_AT=0.30 ;; 2) CAP_AT=0.55 ;; 3) CAP_AT=0.70 ;; *) CAP_AT=0.85 ;;
 esac
 LOWER=$(( P - 1 ))
-log "Phase 6: bob is tier $T_C to carol, $T_A to ada; P=$P, capping ada at $CAP_AT (tier $LOWER)"
+log "Phase 6: bob is tier $T_C ($SC_C) to carol, $T_A ($SC_A) to ada; P=$P, capping ada at $CAP_AT (tier $LOWER)"
 
 # NOT VACUOUS: before the cap, ada DOES receive a tier-P post from bob.
 both_deliver "mod-uncapped-$$" "$P"; S6=$?
@@ -1153,6 +1172,14 @@ if [ "$S6" -ne 0 ]; then
     err "  SENT it: a cap must republish the tier (_publish_tier_change)."
   else
     err "FAIL (phase 6) — carol did not get bob's tier-$P post (rc=$S6)."
+    # Classify the miss: carol's gate logs a drop at INFO, and her tier for bob
+    # now says whether he had fallen under P or the frame never came.
+    if saw "$ROOT_CAROL" "peer_post from ${BOB_UUID:0:8}.* tier-gated (need $P"; then
+      err "  carol's gate dropped it: her tier for bob fell under $P after P was chosen."
+    else
+      err "  carol's gate logged no drop: the frame never reached her gate (lost on the wire?)."
+    fi
+    drive "$ROOT_CAROL" await-rep "$BOB_UUID" - - any - 10 "$RUN/carol_bob_miss.json" >&2 || true
   fi
   dump_logs; exit 1
 fi

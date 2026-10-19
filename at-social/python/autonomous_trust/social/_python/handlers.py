@@ -1204,7 +1204,7 @@ def _ingest_post(proc, queues, body, via_group):
         # 0 here exactly as C's post handler reads identity_get_peer_tier.
         author_tier = proc.get_peer_tier(author) if peer is not None else 0
         if author_tier < int(tier):
-            proc.logger.debug(
+            proc.logger.info(
                 'peer_post from %s tier-gated (need %d, have %d)',
                 str(author)[:8], int(tier), author_tier)
             return True

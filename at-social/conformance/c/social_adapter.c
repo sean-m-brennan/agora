@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>  /* mkdtemp: Darwin declares it here, not in stdlib.h */
 #include <string.h>
 #include <time.h>
 

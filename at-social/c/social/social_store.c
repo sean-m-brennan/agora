@@ -21,6 +21,7 @@
 
 #include <jansson.h>
 
+#include "utilities/portable.h"  /* at_tmp_path */
 #include "social_store.h"
 #include "structures/data.h"
 #include "utilities/util.h"
@@ -210,7 +211,10 @@ int social_store_save_all(const map_t *blocks, const map_t *communities,
      * target so they are always on the same one. Copied from contacts_save,
      * which is the house pattern for this. */
     char tmp[4096 + 16];
-    snprintf(tmp, sizeof(tmp), "%s.tmp%d", path, (int)getpid());
+    if (at_tmp_path(tmp, sizeof(tmp), path) != 0) {
+        json_decref(doc);
+        return -1;
+    }
     /* SORT_KEYS is not cosmetic: the Python twin writes the same document with
      * sort_keys=True, and test/social_store_test.c pins the exact bytes
      * against the identical golden string in tests/a_unit/test_social_store.py.

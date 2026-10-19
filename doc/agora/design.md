@@ -396,14 +396,15 @@ can now be built on real peer data rather than waiting on an AT-core extension.
 
 - **Model:** fork + **AF_UNIX `SOCK_DGRAM`** IPC bound to a `sun_path`
   (`utilities/message.c`). Fine on **Linux/macOS**.
-- **Windows (deferred).** MinGW helps the **compiler only** — it emits native PE
-  and supplies winpthreads, and it is in fact the *right* Windows compiler here
-  because `third_party/ryu` uses `__uint128_t` (**no MSVC**). But MinGW provides
-  **neither `fork()` nor AF_UNIX `SOCK_DGRAM`** (Windows AF_UNIX is stream-only).
-  The real enabler is building the core with **`FORK=0`** (run in-process on a
-  thread) plus a **portable IPC transport** (UDP loopback). That same change is
-  what iOS/Android need, so it is one piece of AT-core work that unlocks three
-  platforms — but `FORK=0` is documented as "future use" and is **unproven**.
+- **Windows (ported 2026-10-19; not yet built on Windows).** MinGW (MSYS2
+  UCRT64) is the compiler, and the right one: `third_party/ryu` uses
+  `__uint128_t` (**no MSVC** for the native layer; the Flutter runner is still
+  MSVC). MinGW provides **neither `fork()` nor AF_UNIX `SOCK_DGRAM`**, so AT
+  gained an in-process runtime (AT ISSUES §2.74): the subsystems run as threads
+  of agorad, their queues are in-process FIFOs, and the app link is an AF_UNIX
+  **stream** socket. Linux and macOS run the same runtime with
+  `AT_IN_PROCESS=1`, which is how it is tested; fork stays their default. The
+  same runtime is what iOS/Android need.
 - **iOS/Android (deferred).** No forked daemon (store/sandbox limits) → `FORK=0`
   in-process. Some `autonomous-trust-services` (video: opencv/mediapipe) will not
   build for mobile, but Phase 0 needs only core + the position service.
@@ -414,10 +415,17 @@ CMake ≥ 3.23, C11/C++17, `-Werror`. `autonomous_trust` builds **SHARED**
 (`libautonomous_trust.{so,dylib}`) plus a static variant. **`AT_NET_DTN` and
 `AT_ZTA` are OFF by default**, so the heavy `third_party/` DTN stack (ION-DTN,
 uD3TN) is **not** compiled — do not enable them. Per-platform C deps to provide:
-**libsodium, libjansson, libuuid, protobuf + protobuf-c, OpenSSL**. There is **no
-macOS/Darwin awareness in the CMake yet** — Linux is the only proven target, so
-budget for `-Werror`/POSIX build fixes on macOS (syslog `/dev/log`,
-epoll↔kqueue, abstract-socket differences).
+**libsodium, libjansson, libuuid, protobuf + protobuf-c, OpenSSL**.
+
+macOS support is in the CMake and the core since 2026-10-19, not yet built or
+run on a Mac. The AT core and every extension link their own dependencies
+(Apple's linker refuses an underlinked dylib), and
+the core's Linux-isms are handled (the IPC receive no longer relies on Linux's
+`MSG_PEEK|MSG_TRUNC` length, socket buffers are raised to Darwin's needs, v5
+UUIDs no longer need util-linux, `pthread_setname_np`, the MAC lookup,
+`st_mtim`, `SO_NOSIGPIPE`, `SO_REUSEPORT`). The core, the extensions, agorad
+and the shim compile and link for arm64 macOS under `-Werror` (cross-checked
+from Linux); Linux remains the only target run end to end.
 
 ---
 

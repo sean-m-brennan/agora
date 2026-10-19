@@ -481,7 +481,11 @@ def cmd_mint(shim, root, pair, out, timeout):
     lib, h = _session(shim, root, timeout)
     if not h:
         return 2
-    ref = b"pair" if pair else b"invite"
+    # A ref of this request's own: an event an earlier link of ours caused (a
+    # refusal of someone who redeemed it) carries that link's ref, and with a
+    # fixed one it read as this mint's answer (dev-4032840: phase 2's
+    # not_sibling refusal, held for the app, answered phase 3's mint).
+    ref = (b"pair-" if pair else b"invite-") + os.urandom(4).hex().encode()
     fn = lib.agora_fc_pair_invite if pair else lib.agora_fc_invite
     if fn(h, Q, ref, -1) != 0:
         return 4
@@ -503,16 +507,17 @@ def cmd_redeem(shim, root, link_path, in_person, expect, timeout):
     if not h:
         return 2
     link = open(link_path).read().strip().encode()
-    if lib.agora_fc_initiate(h, Q, b"redeem", link, int(in_person), None) != 0:
+    ref = b"redeem-" + os.urandom(4).hex().encode()   # this request's own; see cmd_mint
+    if lib.agora_fc_initiate(h, Q, ref, link, int(in_person), None) != 0:
         return 4
     def outcome(ev):
         if ev.kind != EV_CONTACT:
             return None
         if ev.fc_kind == FC_SIBLING_PAIRED:
             return "paired"
-        if ev.fc_kind == FC_ESTABLISHED and ev.fc_ref == b"redeem":
+        if ev.fc_kind == FC_ESTABLISHED and ev.fc_ref == ref:
             return "established"
-        if ev.fc_kind == FC_REFUSED and ev.fc_ref == b"redeem":
+        if ev.fc_kind == FC_REFUSED and ev.fc_ref == ref:
             return "not_sibling" if ev.fc_count == REASON_NOT_SIBLING else f"refused:{ev.fc_count}"
         return None
     got = _take_events(lib, h, timeout, outcome)
@@ -551,9 +556,10 @@ def cmd_verify(shim, root, peer_hex, digits_path, timeout):
     if not h:
         return 2
     digits = open(digits_path).read().strip().encode()
-    lib.agora_fc_verify(h, Q, b"verify", _u(peer_hex), digits, 0)
+    ref = b"verify-" + os.urandom(4).hex().encode()   # this request's own; see cmd_mint
+    lib.agora_fc_verify(h, Q, ref, _u(peer_hex), digits, 0)
     got = _take_events(lib, h, timeout, lambda ev: ev.fc_kind
-                       if ev.kind == EV_CONTACT and ev.fc_ref == b"verify"
+                       if ev.kind == EV_CONTACT and ev.fc_ref == ref
                        and ev.fc_kind in (FC_VERIFIED, FC_REFUSED) else None)
     lib.agora_events_close(h)
     return 0 if got == FC_VERIFIED else 5

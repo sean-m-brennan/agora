@@ -13,6 +13,8 @@ import 'dart:io';
 
 import 'package:ffi/ffi.dart';
 
+import 'native_paths.dart';
+
 const int agoraUuidLen = 16;
 const int agoraKeyLen = 32;
 const int agoraGeohashLen = 12; // must match AGORA_GEOHASH_LEN (at_agora_shim.h)
@@ -1076,14 +1078,13 @@ DynamicLibrary _loadShim() {
   if (override != null && override.isNotEmpty) {
     return DynamicLibrary.open(override);
   }
-  if (Platform.isLinux || Platform.isMacOS) {
-    final base = Platform.isMacOS ? 'libagora_shim.dylib' : 'libagora_shim.so';
-    // Bundled build: the shim ships in the app's lib/ dir, next to the
-    // executable (linux/CMakeLists.txt install rules). Load it by explicit path
-    // so it resolves without LD_LIBRARY_PATH; its $ORIGIN rpath then finds
-    // libautonomous_trust in the same dir.
-    final exeDir = File(Platform.resolvedExecutable).parent.path;
-    final bundled = '$exeDir/lib/$base';
+  if (Platform.isLinux || Platform.isMacOS || Platform.isWindows) {
+    final base = nativeLibName('agora_shim');
+    // Bundled build: the shim ships beside the AT libraries (lib/ on Linux,
+    // Contents/Frameworks on macOS; see native_paths.dart). Load it by explicit
+    // path so it resolves with no LD_LIBRARY_PATH / DYLD_* (which the hardened
+    // runtime strips anyway); its rpath then finds libautonomous_trust there.
+    final bundled = '${bundledLibDir()}/$base';
     if (File(bundled).existsSync()) return DynamicLibrary.open(bundled);
     // Dev fallback: rely on the loader search path (RUNPATH / LD_LIBRARY_PATH).
     return DynamicLibrary.open(base);

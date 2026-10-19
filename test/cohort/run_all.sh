@@ -24,6 +24,13 @@
 
 set -u
 
+# Linux only: every cohort needs network namespaces (ip netns) or docker's
+# Linux networking, which macOS does not have. See README.md.
+if [ "$(uname -s)" != "Linux" ]; then
+    echo "run_all.sh: the live cohorts run on Linux only (they need network namespaces)" >&2
+    exit 2
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGORA_DIR="${AGORA_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 

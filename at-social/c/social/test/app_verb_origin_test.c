@@ -48,6 +48,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include <jansson.h>
 #include <uuid/uuid.h>
@@ -211,7 +212,68 @@ DEFINE_TEST(test_a_verb_looped_back_through_our_own_queue_is_local)
 }
 END_TEST_DEFINITION()
 
+/* ISSUES §2.17: every social app verb refuses a frame that carries a peer's
+ * identity. The guard is the same two lines in each handler, so the
+ * observable is the refusal itself: one "refusing <verb> from the wire" line
+ * per verb, which a handler missing its guard never logs. (route_to_process
+ * refuses app_* from the wire before any handler; this is the second line.)
+ * The local half is the shared helper, driven above for app_block. */
+DEFINE_TEST(test_every_social_app_verb_refuses_a_peers_frame)
+{
+    static const char *verbs[] = {
+        "app_set_position", "app_set_profile", "app_connect_request",
+        "app_connect_respond", "app_send_dm", "app_publish_post",
+        "app_react_post", "app_block", "app_unblock", "app_request_attend",
+        "app_set_exact_position", "app_request_proximity",
+        "app_advertise_business", "app_set_customer", "app_request_cosign",
+        "app_return_cosign", "app_publish_business_post", "app_report_peer",
+        "app_follow_community", "app_unfollow_community",
+        "app_publish_post_label",
+    };
+    identity_t *self = _mk_identity("10.0.0.1", "self");
+    identity_t *meddler = _mk_identity("10.0.0.3", "meddler");
+    process_t *proc = _mk_process(self);
+    char path[] = "/tmp/at-app-verb-origin-XXXXXX";
+    int fd = mkstemp(path);
+    ck_assert(fd >= 0);
+    close(fd);
+    logger_t lg;
+    ck_assert_int_eq(logger_init(&lg, INFO, path), 0);
+    proc->logger = &lg;
+    size_t n = sizeof(verbs) / sizeof(verbs[0]);
+    for (size_t i = 0; i < n; i++) {
+        json_t *payload = json_object();
+        char *fn = strdup(verbs[i]);
+        _drive(proc, fn, payload, meddler);
+        free(fn);
+        json_decref(payload);
+    }
+    proc->logger = NULL;
+    if (lg.file != NULL)
+        fclose(lg.file);
+    FILE *f = fopen(path, "r");
+    ck_assert_ptr_nonnull(f);
+    char line[1024];
+    size_t refused[sizeof(verbs) / sizeof(verbs[0])] = {0};
+    while (fgets(line, sizeof(line), f) != NULL)
+        for (size_t i = 0; i < n; i++) {
+            char want[96];
+            snprintf(want, sizeof(want), "refusing %s from the wire", verbs[i]);
+            if (strstr(line, want) != NULL)
+                refused[i]++;
+        }
+    fclose(f);
+    unlink(path);
+    for (size_t i = 0; i < n; i++) {
+        if (refused[i] != 1)
+            fprintf(stderr, "%s refused %zu time(s)\n", verbs[i], refused[i]);
+        ck_assert_int_eq((int)refused[i], 1);
+    }
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(AppVerbOrigin,
           test_the_local_app_may_block,
           test_a_peer_may_not_block_a_third_party_on_our_node,
-          test_a_verb_looped_back_through_our_own_queue_is_local)
+          test_a_verb_looped_back_through_our_own_queue_is_local,
+          test_every_social_app_verb_refuses_a_peers_frame)

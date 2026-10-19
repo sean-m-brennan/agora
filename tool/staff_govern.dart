@@ -27,7 +27,7 @@
 //   dart run tool/staff_govern.dart publish-roll <keeper-dir> --out <file>
 //   dart run tool/staff_govern.dart verify-roll  --roll <file>
 //
-// Needs the cdylib: AGORA_ETHNE_PATH, or native/build/libethne_agora.so.
+// Needs the cdylib: AGORA_ETHNE_PATH, or native/build/libethne_agora.{so,dylib}.
 
 import 'dart:convert';
 import 'dart:io';
@@ -74,7 +74,7 @@ Future<void> main(List<String> args) async {
   if (libPath == null) {
     _die(
         'ethne_agora not found (set AGORA_ETHNE_PATH or build '
-        'native/build/libethne_agora.so)',
+        'native/build/libethne_agora.{so,dylib})',
         2);
   }
   final ffi = EthneFfi.open(libPath);

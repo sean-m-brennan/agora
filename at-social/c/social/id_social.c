@@ -958,6 +958,9 @@ static bool handle_set_position(const process_t *proc, directory_t *queues, gene
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_SET_POSITION);
     json_t *payload = NULL;
     char geo[AT_GEOHASH_MAX_LEN + 1] = {0};
     if (net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL) {
@@ -1134,6 +1137,9 @@ static bool handle_set_exact_position(const process_t *proc,
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_SET_EXACT_POSITION);
     json_t *payload = NULL;
     bool set = false;
     double lat = 0, lon = 0;
@@ -1171,6 +1177,9 @@ static bool handle_request_proximity(const process_t *proc, directory_t *queues,
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_REQUEST_PROXIMITY);
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true;
@@ -1488,6 +1497,9 @@ static bool handle_set_profile(const process_t *proc, directory_t *queues, gener
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_SET_PROFILE);
     at_profile_t p;
     memset(&p, 0, sizeof(p));
     json_t *payload = NULL;
@@ -2290,6 +2302,9 @@ static bool handle_app_connect_request(const process_t *proc, directory_t *queue
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_CONNECT_REQUEST);
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true;
@@ -2334,6 +2349,9 @@ static bool handle_request_attend(process_t *proc, directory_t *queues,
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_REQUEST_ATTEND);
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true;
@@ -2368,6 +2386,9 @@ static bool handle_app_connect_respond(const process_t *proc, directory_t *queue
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_CONNECT_RESPOND);
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true;
@@ -2529,6 +2550,9 @@ static bool handle_app_send_dm(const process_t *proc, directory_t *queues,
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_SEND_DM);
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true;
@@ -2765,6 +2789,9 @@ static bool handle_app_request_cosign(const process_t *proc, directory_t *queues
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_REQUEST_COSIGN);
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true;
@@ -2834,6 +2861,9 @@ static bool handle_app_return_cosign(const process_t *proc, directory_t *queues,
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_RETURN_COSIGN);
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true;
@@ -3083,6 +3113,9 @@ static bool handle_app_react_post(const process_t *proc, directory_t *queues,
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_REACT_POST);
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true;
@@ -3806,6 +3839,9 @@ static bool handle_app_publish_post(const process_t *proc, directory_t *queues,
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_PUBLISH_POST);
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true;
@@ -3999,9 +4035,9 @@ static bool _ingest_post(const process_t *proc, json_t *payload, bool via_group)
      * their public posts pass. */
     int author_tier = identity_get_peer_tier(author);
     if (author_tier < (int)tier) {
-        log_debug(proc->logger,
-                  "Identity: peer_post from %s tier-gated (need %d, have %d)\n",
-                  author_str, (int)tier, author_tier);
+        log_info(proc->logger,
+                 "Identity: peer_post from %s tier-gated (need %d, have %d)\n",
+                 author_str, (int)tier, author_tier);
         return true;
     }
 
@@ -4458,6 +4494,9 @@ static bool handle_app_advertise_business(const process_t *proc,
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_ADVERTISE_BUSINESS);
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true;
@@ -4496,6 +4535,9 @@ static bool handle_app_set_customer(const process_t *proc, directory_t *queues,
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_SET_CUSTOMER);
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true;
@@ -4976,6 +5018,9 @@ static bool handle_app_publish_business_post(const process_t *proc,
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, nmsg))
+        return identity_refuse_remote_app_verb(proc, nmsg, AT_APP_PUBLISH_BUSINESS_POST);
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true;
@@ -5639,6 +5684,10 @@ static bool handle_app_publish_post_label(const process_t *proc, directory_t *qu
                                           generic_msg_t *msg)
 {
     (void)queues;
+    /* The local app's verb only, never a peer's (ISSUES §2.17). */
+    if (!identity_is_local_app_verb(proc, &msg->info.net_msg))
+        return identity_refuse_remote_app_verb(proc, &msg->info.net_msg,
+                                               AT_APP_PUBLISH_POST_LABEL);
     json_t *payload = NULL;
     if (net_msg_unpack_json(&msg->info.net_msg, &payload) != 0 || payload == NULL)
         return true;

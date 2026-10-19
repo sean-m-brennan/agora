@@ -143,12 +143,19 @@ set(_agora_native_artifacts
   "${AGORA_NATIVE_BUILD_DIR}/libagora_shim.so"
   "${AGORA_NATIVE_BUILD_DIR}/at_core/libautonomous_trust.so")
 # The extension libraries agorad and the shim link (the five libat_<layer>
-# verification layers, AT_ORACLE_*, and libat_social; see
-# native/CMakeLists.txt), bundled beside the core.
-foreach(_layer physics calibration certificates prequential replication social)
+# verification layers, AT_ORACLE_*, libat_social, and the rendezvous and
+# first-contact libraries; see native/CMakeLists.txt), bundled beside the core.
+foreach(_layer physics calibration certificates prequential replication social
+               rendezvous first_contact)
   list(APPEND _agora_native_artifacts
     "${AGORA_NATIVE_BUILD_DIR}/at_core/extensions/${_layer}/libat_${_layer}.so")
 endforeach()
+# Ethne's cdylib (businesses) is optional: built only when cargo is present.
+set(_agora_ethne "${AGORA_NATIVE_BUILD_DIR}/libethne_agora.so")
+if(EXISTS "${_agora_ethne}")
+  install(FILES "${_agora_ethne}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+    COMPONENT Runtime)
+endif()
 foreach(_agora_art ${_agora_native_artifacts})
   if(EXISTS "${_agora_art}")
     install(FILES "${_agora_art}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"

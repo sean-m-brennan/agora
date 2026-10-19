@@ -6,6 +6,8 @@
 
 import 'dart:io';
 
+import '../ffi/native_paths.dart';
+
 class AgoraQueues {
   AgoraQueues(this.appToAt, this.atToApp);
 
@@ -48,7 +50,8 @@ class AgoraDaemon {
 
   /// $AUTONOMOUS_TRUST_ROOT for both the daemon and the in-process app-events
   /// client (they must agree to meet on the same sockets). Kept short so the
-  /// full `$root/var/at/<socket>` path fits an AF_UNIX sun_path (108 bytes).
+  /// full `$root/var/at/<socket>` path fits an AF_UNIX sun_path (108 bytes on
+  /// Linux, 104 on macOS).
   final String root;
 
   /// 1=DEBUG 2=INFO 3=WARNING 4=ERROR 5=CRITICAL.
@@ -59,29 +62,51 @@ class AgoraDaemon {
   bool get isRunning => _proc != null;
 
   /// A short, per-user config root. Honors an existing AUTONOMOUS_TRUST_ROOT,
-  /// else $XDG_STATE_HOME/agora, else $HOME/.local/state/agora, else a temp dir.
+  /// else $XDG_STATE_HOME/agora, else $HOME/.local/state/agora (on macOS,
+  /// $HOME/Library/Application Support/Agora, the platform's place for it),
+  /// else a temp dir. agorad.c defaults the same way when run on its own. A
+  /// default whose socket paths would not fit falls back to the temp dir.
   static String defaultRoot() {
     final env = Platform.environment;
     final explicit = env['AUTONOMOUS_TRUST_ROOT'];
     if (explicit != null && explicit.isNotEmpty) return explicit;
-    final xdg = env['XDG_STATE_HOME'];
-    if (xdg != null && xdg.isNotEmpty) return '$xdg/agora';
     final home = env['HOME'];
-    if (home != null && home.isNotEmpty) return '$home/.local/state/agora';
+    final xdg = env['XDG_STATE_HOME'];
+    final localAppData = env['LOCALAPPDATA'];
+    final String? preferred;
+    if (Platform.isWindows) {
+      preferred = (localAppData != null && localAppData.isNotEmpty)
+          ? '$localAppData\\Agora'
+          : null;
+    } else if (Platform.isMacOS && home != null && home.isNotEmpty) {
+      preferred = '$home/Library/Application Support/Agora';
+    } else if (xdg != null && xdg.isNotEmpty) {
+      preferred = '$xdg/agora';
+    } else if (home != null && home.isNotEmpty) {
+      preferred = '$home/.local/state/agora';
+    } else {
+      preferred = null;
+    }
+    final queues = AgoraQueues.forThisInstance();
+    if (preferred != null &&
+        socketPathFits(preferred, queues.appToAt) &&
+        socketPathFits(preferred, queues.atToApp)) {
+      return preferred;
+    }
     return '${Directory.systemTemp.path}/agora';
   }
 
   static String _daemonPath() {
     final override = Platform.environment['AGORA_DAEMON_PATH'];
     if (override != null && override.isNotEmpty) return override;
-    // Bundled build: agorad ships in the app's lib/ dir, next to the executable
-    // (linux/CMakeLists.txt install rules). Its $ORIGIN rpath finds the AT core
-    // in that same dir, so no LD_LIBRARY_PATH is needed.
-    final exeDir = File(Platform.resolvedExecutable).parent.path;
-    final bundled = '$exeDir/lib/agorad';
+    // Bundled build: agorad ships in the app's lib/ dir on Linux, beside the
+    // app executable on macOS (native_paths.dart). Its rpath finds the AT
+    // libraries, so no LD_LIBRARY_PATH is needed. A Finder-launched macOS app
+    // has a minimal PATH, so the bare-name fallback below is for dev only.
+    final bundled = '${bundledDaemonDir()}/$daemonExeName';
     if (File(bundled).existsSync()) return bundled;
     // Dev default: rely on PATH / AGORA_DAEMON_PATH.
-    return 'agorad';
+    return daemonExeName;
   }
 
   Future<void> start() async {
@@ -110,12 +135,24 @@ class AgoraDaemon {
     final p = _proc;
     if (p == null) return;
     _proc = null;
-    p.kill(ProcessSignal.sigterm);
-    await p.exitCode
-        .timeout(const Duration(seconds: 5), onTimeout: () {
-      p.kill(ProcessSignal.sigkill);
-      return -1;
-    });
+    if (Platform.isWindows) {
+      // Windows has no SIGTERM to send: Process.kill is TerminateProcess,
+      // which gives the node no chance to stop its subsystems or save its
+      // stores. agorad stops when its stdin closes (agorad.c watch_stdin), so
+      // close it, wait out AT's own 5 s shutdown, and only then terminate.
+      await p.stdin.close();
+      await p.exitCode.timeout(const Duration(seconds: 7), onTimeout: () {
+        p.kill();
+        return -1;
+      });
+    } else {
+      p.kill(ProcessSignal.sigterm);
+      await p.exitCode
+          .timeout(const Duration(seconds: 5), onTimeout: () {
+        p.kill(ProcessSignal.sigkill);
+        return -1;
+      });
+    }
     _cleanupSockets();
   }
 
@@ -123,12 +160,15 @@ class AgoraDaemon {
     // The sockets live under $root/var/at/<name> (AT's data dir), not at the
     // bare name. Best-effort removal of the two app-facing ones; AT unlinks its
     // own on the next bind, so this is just tidiness.
+    // `<name>.s` is the stream link's socket (Windows; AT_IPC_STREAM=1).
     for (final name in [queues.appToAt, queues.atToApp]) {
-      try {
-        final f = File('$root/var/at/$name');
-        if (f.existsSync()) f.deleteSync();
-      } catch (_) {
-        // best-effort
+      for (final path in ['$root/var/at/$name', '$root/var/at/$name.s']) {
+        try {
+          final f = File(path);
+          if (f.existsSync()) f.deleteSync();
+        } catch (_) {
+          // best-effort
+        }
       }
     }
   }

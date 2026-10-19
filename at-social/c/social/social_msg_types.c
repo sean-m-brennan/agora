@@ -19,16 +19,21 @@
 
 /* Each payload is a fixed-size struct that crosses IPC as a raw copy (no
  * to_proto/from_proto), exactly as the union arms it replaces did. */
-#define SOCIAL_TYPE(tag, id, T)                                                \
+#define SOCIAL_TYPE_(tag, id, T, replayed)                                     \
     AT_MSG_ASSERT_FITS(T);                                                     \
     static const at_msg_vtable_t tag##_vt = {                                  \
-        .name = #id, .size = sizeof(T), .app_bound = true };                   \
+        .name = #id, .size = sizeof(T), .app_bound = true,                     \
+        .app_replayed = replayed };                                            \
     AT_MSG_TYPE_REGISTER(tag, id, &tag##_vt)
+#define SOCIAL_TYPE(tag, id, T) SOCIAL_TYPE_(tag, id, T, false)
+/* State the roster pull re-emits (_social_roster_replay): not held for an app
+ * that is not attached, since its next pull brings it back. */
+#define SOCIAL_STATE_TYPE(tag, id, T) SOCIAL_TYPE_(tag, id, T, true)
 
-SOCIAL_TYPE(position,           PEER_POSITION_OBSERVED,           peer_position_msg_t)
-SOCIAL_TYPE(profile,            PEER_PROFILE_OBSERVED,            peer_profile_msg_t)
+SOCIAL_STATE_TYPE(position,         PEER_POSITION_OBSERVED,           peer_position_msg_t)
+SOCIAL_STATE_TYPE(profile,          PEER_PROFILE_OBSERVED,            peer_profile_msg_t)
 SOCIAL_TYPE(connection_request, PEER_CONNECTION_REQUEST_OBSERVED, peer_connection_msg_t)
-SOCIAL_TYPE(connection_state,   PEER_CONNECTION_STATE_OBSERVED,   peer_connection_msg_t)
+SOCIAL_STATE_TYPE(connection_state, PEER_CONNECTION_STATE_OBSERVED,   peer_connection_msg_t)
 SOCIAL_TYPE(dm,                 PEER_DM_OBSERVED,                 peer_dm_msg_t)
 SOCIAL_TYPE(post,               PEER_POST_OBSERVED,               peer_post_msg_t)
 SOCIAL_TYPE(reaction,           PEER_REACTION_OBSERVED,           peer_reaction_msg_t)
