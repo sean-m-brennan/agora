@@ -67,10 +67,11 @@ SOCIAL_VERBS = (
     'cosign_request', 'cosign_sig', 'proximity_trigger', 'proximity_probe',
     'proximity_reply', 'profile_query', 'profile_response',
     'connection_request', 'connection_response', 'dm', 'post', 'reaction',
-    'report', 'post_digest', 'post_want', 'post_backfill')
+    'report', 'post_digest', 'post_want', 'post_backfill',
+    'file_offer', 'file_ctl', 'file_req', 'file_chunk')
 
 
-def test_social_registers_its_20_verbs_on_identity_only():
+def test_social_registers_its_24_verbs_on_identity_only():
     proc = _identity_process()
     assert 'social' in proc._extensions
     for verb in SOCIAL_VERBS:

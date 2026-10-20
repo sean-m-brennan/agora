@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: file-offer-from-blocked-peer
+byte_pinning: false
+description: |
+    A blocked peer cannot offer a file, exactly as they cannot send a DM: the
+    offer is dropped, nothing is stored, nothing reaches the app.
+
+participants:
+  - id: node
+    role: border_guard
+  - id: alice
+    role: group_member
+  - id: bob
+    role: group_member
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: trigger_block
+    payload:
+      peer: alice
+  - id: 2
+    from: alice
+    to: node
+    function: peer_file_offer
+    payload: {id: a1b2c3d4e5f60718293a4b5c6d7e8f90, name: hello.txt, content: hi}
+  - id: 3
+    from: bob
+    to: node
+    function: peer_file_offer
+    payload: {id: a1b2c3d4e5f60718293a4b5c6d7e8f90, name: hello.txt, content: hi}
+    description: The control. bob is not blocked, and the same id from him is his own transfer.
+
+expected_state:
+  node:
+    file_xfer:
+      alice: {absent: true}
+      bob: {dir: in, state: 0, name: hello.txt}

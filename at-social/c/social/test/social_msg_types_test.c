@@ -47,6 +47,7 @@ DEFINE_TEST(test_social_types_are_registered)
         { PEER_BUSINESS_POST_OBSERVED, "PEER_BUSINESS_POST_OBSERVED" },
         { PEER_COMMUNITY_POLICY_OBSERVED, "PEER_COMMUNITY_POLICY_OBSERVED" },
         { PEER_POST_LABEL_OBSERVED, "PEER_POST_LABEL_OBSERVED" },
+        { PEER_FILE_OBSERVED, "PEER_FILE_OBSERVED" },
     };
     for (size_t i = 0; i < sizeof(social) / sizeof(*social); i++)
     {
@@ -59,6 +60,8 @@ DEFINE_TEST(test_social_types_are_registered)
     }
     ck_assert_str_eq(at_app_verb_target(AT_APP_PUBLISH_POST), "identity");
     ck_assert_str_eq(at_app_verb_target(AT_APP_REQUEST_COSIGN), "identity");
+    ck_assert_str_eq(at_app_verb_target(AT_APP_FILE_OFFER), "identity");
+    ck_assert_str_eq(at_app_verb_target(AT_APP_FILE_CANCEL), "identity");
 }
 END_TEST_DEFINITION()
 

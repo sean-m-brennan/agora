@@ -203,6 +203,7 @@ inventing an audience system; we are labeling the one that exists.
 | **News feed** | Content items are signed, content-addressed; distributed by gossip over the group channel; each reader **merges + ranks locally** by `S × recency` | AT group channel; `services.data` pattern |
 | **Post audience** | Required tier on the content capability (public/acq/friend/close) | AT `required_tier` gating |
 | **Messaging (DM)** | Encrypted peer-to-peer channel | AT P2P channel |
+| **Files in a DM** | Offer, accept, then the receiver pulls encrypted chunks; resumable, hash-checked at the end (§4.3) | AT P2P channel, `send_retry` |
 | **Group chat / groups** | An AT group, or a lightweight ephemeral polity for durable groups | AT groups / Ethne |
 | **People You May Know** | Friend-of-friend over the trust graph, **ranked by proximity** and filtered to operator-bound nodes | reputation graph + position |
 | **Find businesses** | Separate query over the business namespace, ranked by proximity | Ethne artifacts + position |
@@ -241,6 +242,62 @@ Location is the most sensitive datum here, so:
   live-verified in the two-node GUI cohort before any pilot.
 - Sharing exact position is opt-in, per-audience, and tier-gated like any other
   data.
+
+### 4.3 File sharing in a DM thread
+
+A person drops files from the desktop onto a DM thread (or picks them with the
+paperclip), confirms, and each file is **offered** to the other person. Nothing
+moves until they tap **Accept**. Then the file goes to the one device that
+accepted. An offer goes to every device of the person under one transfer id,
+and when one device accepts, the sender's app withdraws the offer from the
+others.
+
+**The core moves the bytes; the app never sees them.** The sender's app hands
+the core a path. The core hashes the file (BLAKE2b-256) and offers
+`{id, name, size, chunk, total, hash}`. The receiver's core writes chunks
+straight into `<root>/var/agora/files/.partial/<peer>-<id>.part`. A bitmap
+sidecar (`.part.map`) records which chunks it holds. When every chunk is in,
+the core checks the whole file against the offered hash and renames it to a
+name under `var/agora/files` that does not clobber an existing file. The app
+sees only `AT_APP_EVENT_FILE` events (offered, accepted with progress, done
+with the path, declined, cancelled, failed with a reason, too large). It then
+offers Open, Show in folder and Save as. This keeps 100 MB from crossing the
+8 KB app-event path as thousands of events.
+
+**The receiver pulls.** It keeps a window of chunk requests outstanding (8 by
+default, `AT_FILE_WINDOW`; more would overflow the ~10-frame IPC queue in
+one burst) and tops it up as chunks arrive. A request that goes
+unanswered for 3 s is asked again. A stalled transfer, after a partition or a
+restart, resumes on identity's ~20 s sweep from the bitmap and asks only for
+what is missing. Both sides keep their records in `etc/at/file_xfer.cfg.json`.
+So the sender can still serve a resume after a restart, and the roster pull
+re-emits every transfer to a freshly started app. The sender refuses to serve
+a file whose size or mtime changed since the offer.
+
+**Four peer verbs, all directed and encrypted:** `peer_file_offer`,
+`peer_file_ctl` (accept / decline / cancel / done / fail), `peer_file_req` and
+`peer_file_chunk`. They carry **no freshness seq**: the freshness mark keeps
+one highest seq per sender and verb, which would refuse every chunk behind a
+later one and every retried request. Each message is instead keyed by
+`(peer, id)` and idempotent. A finished transfer stays a tombstone for 7 days
+so a replayed offer changes nothing. A chunk is taken only for a transfer this
+node accepted, and only from the peer that offered it. A blocked peer cannot
+offer at all, as with a DM. A peer-supplied name is reduced to a bare file
+name: no separators, no `..`, no control characters, no Windows device names,
+and at most 255 bytes cut on a UTF-8 boundary. An offer over the receiver's
+cap (2 GiB, `AT_FILE_MAX_BYTES`) is shown as too large and declined.
+
+The four app verbs (`app_file_offer`, `_accept`, `_decline`, `_cancel`) are
+local-only like every app verb (§2.17 in AT's ISSUES). The chunk size is
+16 KiB by default (`AT_FILE_CHUNK`), which keeps each frame inside one UDP
+datagram. A TCP bulk path (AT ISSUES §7) would raise throughput; the UDP path
+is what ships.
+
+Evidence: `at-social/c/social/test/file_xfer_test.c` and
+`file_xfer_flow_test.c` (sender, receiver, resume from the bitmap, wrong-peer
+chunks, corrupt file, blocked sender, size cap, §2.17); the `file-*` social
+conformance scenarios on both runtimes; `test/file_transfer_test.dart` and
+`test/file_thread_view_test.dart`.
 
 ---
 

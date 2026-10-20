@@ -144,6 +144,9 @@ Everything a Mac build needs is in the tree; it has been cross-compiled and
 linked for arm64 macOS from Linux, but not yet built, run or signed on a Mac.
 Flutter cannot cross-compile desktop apps, so the build runs on the Mac itself.
 
+Download/install 
+
+
 ```bash
 ./setup.sh            # Homebrew + deps, Rosetta, Rust, Flutter; Xcode is manual
 ./build.sh macos      # native layer + agora.app, for this Mac's architecture
@@ -175,8 +178,13 @@ AT libraries are ordinary Windows programs and DLLs, and the Flutter runner is
 Visual Studio's. Cross-compiled and tested from Linux (zig, Wine), not yet
 built or run on Windows.
 
+Download/install MSYS2: https://www.msys2.org
+
+
 ```bash
 # in an "MSYS2 UCRT64" shell
+pacmac -S git
+git clone --recurse-submodules <repo> && cd <repo>
 ./setup.sh            # pacman packages + Rust, VS Build Tools (winget), Flutter
 ./build.sh windows    # native layer + agora.exe
 ./test.sh             # analyze + unit tests (+ integration once native is built)

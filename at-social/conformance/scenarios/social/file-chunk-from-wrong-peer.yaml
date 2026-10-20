@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: file-chunk-from-wrong-peer
+byte_pinning: false
+description: |
+    A chunk is accepted only for a transfer this node accepted, and only from the
+    peer that offered it.
+
+participants:
+  - id: node
+    role: border_guard
+  - id: alice
+    role: group_member
+  - id: mallory
+    role: group_member
+
+steps:
+  - id: 1
+    from: alice
+    to: node
+    function: peer_file_offer
+    payload: {id: a1b2c3d4e5f60718293a4b5c6d7e8f90, name: contract.pdf, content: the real terms}
+  - id: 2
+    from: alice
+    to: node
+    function: peer_file_chunk
+    payload: {id: a1b2c3d4e5f60718293a4b5c6d7e8f90, i: 0, content: the real terms}
+    description: Before Accept, not even the offerer's chunk is taken.
+  - id: 3
+    from: node
+    to: node
+    function: trigger_file_accept
+    payload: {peer: alice, id: a1b2c3d4e5f60718293a4b5c6d7e8f90}
+  - id: 4
+    from: mallory
+    to: node
+    function: peer_file_chunk
+    payload: {id: a1b2c3d4e5f60718293a4b5c6d7e8f90, i: 0, content: the fake terms}
+    description: |
+        mallory knows the id and sends a chunk of the right length. It is
+        dropped: a transfer is keyed by who offered it, so nobody else can
+        write into it. Had it landed, the hash check would have failed the
+        transfer instead of finishing it below.
+  - id: 5
+    from: alice
+    to: node
+    function: peer_file_chunk
+    payload: {id: a1b2c3d4e5f60718293a4b5c6d7e8f90, i: 0, content: the real terms}
+
+expected_state:
+  node:
+    file_xfer:
+      alice: {dir: in, state: 2, done: 14, name: contract.pdf}
+      mallory: {absent: true}

@@ -19,7 +19,7 @@ from autonomous_trust.core.identity.protocol import IdentityProtocol
 from autonomous_trust.social.protocol import SocialProtocol
 
 
-def test_the_22_verbs():
+def test_the_26_verbs():
     """Iterates the social verbs.
 
         - opt-in coarse position, the "with-distance" feature
@@ -69,15 +69,21 @@ def test_the_22_verbs():
           moderator's labels on one post (relayed by followers, like a
           business post). Two verbs because they are two artifacts with
           two carriage rules; neither bundle is opened here.
+        - file sharing in a DM thread (file_offer, file_ctl, file_req,
+          file_chunk) — the offer, one control verb for every answer and
+          end (accept, decline, cancel, done, fail), and the receiver's
+          pull: a request for a run of chunks and the chunks themselves.
+          No freshness seq on any of them; each is keyed by (peer, id).
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update.
     """
     values = list(SocialProtocol)
-    assert len(values) == 22
+    assert len(values) == 26
     for verb in ('report', 'business_ad', 'business_post', 'cosign_request',
                  'cosign_sig', 'dm', 'proximity_trigger', 'post_digest',
-                 'post_want', 'post_backfill', 'community_policy', 'post_label'):
+                 'post_want', 'post_backfill', 'community_policy', 'post_label',
+                 'file_offer', 'file_ctl', 'file_req', 'file_chunk'):
         assert verb in values, verb
 
 

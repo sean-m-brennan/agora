@@ -1,0 +1,62 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: file-sender-serves-what-is-asked
+byte_pinning: false
+description: |
+    The sender's side. node offers a file it holds; alice accepts, asks for
+    chunk 0, gets it, asks past the end and gets nothing, and says done.
+
+participants:
+  - id: node
+    role: border_guard
+  - id: alice
+    role: group_member
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: trigger_file_offer
+    payload: {peer: alice, id: a1b2c3d4e5f60718293a4b5c6d7e8f90, name: photo.jpg, content: pixels, repeat: 300}
+    description: node's person drops a file on alice's thread (1800 bytes).
+  - id: 2
+    from: node
+    to: alice
+    function: peer_file_offer
+    in_response_to: 1
+  - id: 3
+    from: alice
+    to: node
+    function: peer_file_ctl
+    payload: {id: a1b2c3d4e5f60718293a4b5c6d7e8f90, op: accept}
+  - id: 4
+    from: alice
+    to: node
+    function: peer_file_req
+    payload: {id: a1b2c3d4e5f60718293a4b5c6d7e8f90, first: 0, count: 1}
+    description: The default chunk is 16 KiB, so the whole file is chunk 0.
+  - id: 5
+    from: node
+    to: alice
+    function: peer_file_chunk
+    in_response_to: 4
+  - id: 6
+    from: alice
+    to: node
+    function: peer_file_req
+    payload: {id: a1b2c3d4e5f60718293a4b5c6d7e8f90, first: 1, count: 1}
+    description: Past the end; nothing is served.
+  - id: 7
+    from: alice
+    to: node
+    function: peer_file_ctl
+    payload: {id: a1b2c3d4e5f60718293a4b5c6d7e8f90, op: done}
+
+expected_state:
+  node:
+    file_xfer:
+      alice: {dir: out, state: 2, done: 1800, name: photo.jpg}
+    file_frames_emitted:
+      peer_file_offer: 1
+      peer_file_chunk: 1

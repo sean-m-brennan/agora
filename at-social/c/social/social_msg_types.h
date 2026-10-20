@@ -35,6 +35,7 @@
  */
 
 #include "utilities/msg_types.h"
+#include "file_xfer.h"   /* AT_FILE_* bounds */
 
 /* Social message ids (reserved range AT_MSG_TYPE_SOCIAL_MIN..MAX). Typed
  * constants, not an anonymous enum: every use is a message_type_t, and GCC
@@ -67,6 +68,8 @@
 #define PEER_COMMUNITY_POLICY_OBSERVED   ((message_type_t)(AT_MSG_TYPE_SOCIAL_MIN + 12))
 /** Identity → app: a moderator's labels on one post — one opaque, member-signed Ethne label — received over the group channel (Phase 4, @ref peer_post_label_msg_t). Local IPC only. Signature-verified, GATED on this node following the community, and content-id-deduped before emit; whether the label COUNTS is the app's call, against the policy it holds. */
 #define PEER_POST_LABEL_OBSERVED         ((message_type_t)(AT_MSG_TYPE_SOCIAL_MIN + 13))
+/** Identity → app: a file transfer in a DM thread changed — an offer arrived, an answer, progress, the end (@ref peer_file_msg_t). Local IPC only. Bytes never cross here: the core reads and writes the file itself. */
+#define PEER_FILE_OBSERVED               ((message_type_t)(AT_MSG_TYPE_SOCIAL_MIN + 14))
 
 /* Max geohash length carried across the AT->app boundary. The app shares a
  * ~5-char geohash (the ~5km "neighborhood" bucket); the buffer allows finer
@@ -481,6 +484,30 @@ typedef struct {
     double  ts;          /**< The signer's send time (epoch seconds). */
 } peer_cosign_sig_msg_t;
 
+/**
+ * @brief AT → app: one file transfer's state (DM file sharing).
+ *
+ * Emitted for an inbound offer (state offered or too_large, @c outgoing 0), for
+ * every answer and end on either side, and for progress while under way,
+ * throttled to about four a second. @c peer_uuid is the other end,
+ * crypto_box-authenticated; @c xfer_id with it names the transfer. @c path is
+ * the source on an outgoing transfer and, on an incoming one, the finished
+ * file once @c state is done. @c name is already sanitized (a bare file name,
+ * never a path). Local IPC only — the wire carries peer_file_*, not this.
+ */
+typedef struct {
+    uuid_t  peer_uuid;
+    char    xfer_id[AT_FILE_ID_HEX_LEN + 1];
+    int32_t state;      /**< at_file_state_t */
+    int32_t outgoing;   /**< 1 = we are sending */
+    int64_t size;
+    int64_t bytes_done;
+    double  ts;
+    char    name[AT_FILE_NAME_MAX + 1];
+    char    reason[AT_FILE_REASON_MAX + 1];
+    char    path[AT_FILE_PATH_MAX + 1];
+} peer_file_msg_t;
+
 /****************************
  * The app verbs (App → AT, local-only), moved from utilities/message.h when
  * social left the core (FEATURE_SPLIT_PLAN Phase 5). Each is routed to the
@@ -683,6 +710,27 @@ typedef struct {
  * signature inside the bundle; this verb confers none. Twenty-third verb on the
  * app→AT allowlist. */
 #define AT_APP_PUBLISH_POST_LABEL "app_publish_post_label"
+
+/* App→AT: offer a file to one device of a peer (DM file sharing). The payload
+ * is {"peer": "<uuid_str>", "id": "<32 hex>", "path": "<local path>"}; identity
+ * hashes the file, keeps the offer (file_xfer.cfg.json) and sends a directed
+ * ENCRYPTED peer_file_offer. The app picks the id, the same for every device
+ * of the person, so the thread shows one transfer. Nothing moves until the
+ * receiver accepts. Locally originated only. Twenty-fourth verb on the app→AT
+ * allowlist. */
+#define AT_APP_FILE_OFFER "app_file_offer"
+
+/* App→AT: accept an inbound file offer. The payload is {"peer", "id"};
+ * identity starts pulling chunks into var/agora/files/.partial and emits
+ * progress, then done with the finished path. Twenty-fifth verb. */
+#define AT_APP_FILE_ACCEPT "app_file_accept"
+
+/* App→AT: decline an inbound file offer. {"peer", "id"}. Twenty-sixth verb. */
+#define AT_APP_FILE_DECLINE "app_file_decline"
+
+/* App→AT: cancel a transfer in either direction, offered or under way.
+ * {"peer", "id"}; a partial file is deleted. Twenty-seventh verb. */
+#define AT_APP_FILE_CANCEL "app_file_cancel"
 
 /**
  * @brief Pull the social type registrations into a static link.

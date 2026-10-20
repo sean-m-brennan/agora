@@ -35,6 +35,7 @@ from autonomous_trust.core.identity import Identity
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.system import CfgIds
 from autonomous_trust.social import handlers as social_handlers
+from autonomous_trust.social import file_xfer as social_files
 from autonomous_trust.social.protocol import SocialProtocol
 
 from conformance.harness.python.adapters.identity import IdentityAdapter, _Participant
@@ -729,6 +730,110 @@ def _trigger_publish_post_label(self: IdentityAdapter, participant: _Participant
                                        str(spec.get('bundle', '')))
     return participant.drain_outbox()
 
+# -- file sharing (the C runtime's app verbs, as triggers) ------------------ #
+# {peer: <pid>, id, name?, content?, repeat?}: offer writes `content` (repeated
+# `repeat` times) to a file named
+# `name` under the scenario's scratch root and offers it; accept / decline /
+# cancel name the transfer; sweep runs the periodic resume. Mirrors the C
+# adapter's _fx_dispatch.
+
+def _trigger_file(self: IdentityAdapter, participant: _Participant, inbound: Message):
+    import os
+    fn = inbound.function
+    proc, queues = participant.process, participant.queues
+    if fn == 'trigger_file_sweep':
+        social_files.periodic(proc, queues)
+        return participant.drain_outbox()
+    spec = from_json_string(inbound.obj) if inbound.obj else {}
+    peer_uuid = str(participant._uuid_for_pid(str(spec.get('peer', ''))))
+    xid = str(spec.get('id', ''))
+    if fn == 'trigger_file_offer':
+        src = os.path.join(social_files._root(), 'src')
+        os.makedirs(src, exist_ok=True)
+        path = os.path.join(src, str(spec.get('name') or 'file'))
+        with open(path, 'wb') as f:
+            f.write((str(spec.get('content', '')) * max(1, int(spec.get('repeat', 1))))
+                    .encode('utf-8'))
+        social_files.offer_file(proc, queues, peer_uuid, xid, path)
+    elif fn == 'trigger_file_accept':
+        social_files.accept_file(proc, queues, peer_uuid, xid)
+    elif fn == 'trigger_file_decline':
+        social_files.decline_file(proc, queues, peer_uuid, xid)
+    elif fn == 'trigger_file_cancel':
+        social_files.cancel_file(proc, queues, peer_uuid, xid)
+    else:
+        raise AssertionError(f'unknown file trigger {fn!r}')
+    return participant.drain_outbox()
+
+
+def _build_file(self: IdentityAdapter, participants, sender: _Participant,
+        sender_identity, *, from_id: str, to_id: str, function: str,
+        payload: dict[str, Any]) -> str:
+    # A scenario names CONTENT, never bytes or hashes (`repeat: N` repeats it,
+    # for a file of several chunks). An offer {id, name,
+    # content, chunk?} gets size, total and BLAKE2b computed as the sender's
+    # node computes them; a chunk {id, i, content, chunk?, corrupt?} is sliced
+    # from the same content and base64-encoded (`corrupt: true` flips its first
+    # byte). ts defaults to now. Other fields pass through; ctl and req pass
+    # through whole. Mirrors the C peer_file_* builders.
+    import base64
+    import hashlib
+    import time as _time
+    body = dict(payload) if isinstance(payload, dict) else {}
+    content = body.pop('content', None)
+    repeat = body.pop('repeat', 1)
+    if isinstance(content, str) and isinstance(repeat, int) and repeat > 1:
+        content = content * repeat
+    corrupt = bool(body.pop('corrupt', False))
+    raw = content.encode('utf-8') if isinstance(content, str) else None
+    chunk = body.get('chunk') if isinstance(body.get('chunk'), int) and body.get('chunk') else 1024
+    if function == SocialProtocol.file_offer:
+        if raw is not None:
+            body['size'] = len(raw)
+            body['chunk'] = chunk
+            body['total'] = (len(raw) + chunk - 1) // chunk
+            body.setdefault('hash', hashlib.blake2b(raw, digest_size=32).hexdigest())
+        body.setdefault('ts', _time.time())
+    elif function == SocialProtocol.file_chunk and raw is not None:
+        i = int(body.get('i', 0))
+        piece = bytearray(raw[i * chunk:(i + 1) * chunk])
+        if corrupt and piece:
+            piece[0] ^= 0xff
+        body['data'] = base64.b64encode(bytes(piece)).decode()
+        body.pop('chunk', None)
+    return to_json_string(body)
+
+
+def _check_file_xfer(self: _Participant, key: str, expected: Any) -> None:
+    # {peer_id: {dir?, state?, done?, name?, reason?} | {absent: true}}: the
+    # transfer this participant holds with another. Mirrors the C
+    # file_xfer_dump check.
+    records = social_files.dump(self.process)
+    for peer_id, want in (expected or {}).items():
+        peer_uuid = str(self._uuid_for_pid(peer_id))
+        rec = next((r for r in records if r['peer'] == peer_uuid
+                    and ('dir' not in want or r['dir'] == want['dir'])), None)
+        if want.get('absent'):
+            if rec is not None:
+                raise AssertionError(f'{self.id}: file_xfer[{peer_id!r}] present, '
+                                     'expected ABSENT')
+            continue
+        if rec is None:
+            raise AssertionError(f'{self.id}: file_xfer[{peer_id!r}] absent')
+        for k, v in want.items():
+            if rec.get(k) != v:
+                raise AssertionError(f'{self.id}: file_xfer[{peer_id!r}].{k}='
+                                     f'{rec.get(k)!r}, expected {v!r}')
+
+
+def _check_file_frames_emitted(self: _Participant, key: str, expected: Any) -> None:
+    for fn, want in (expected or {}).items():
+        got = self.emit_tally.get(fn, 0)
+        if got != want:
+            raise AssertionError(f'{self.id}: file_frames_emitted[{fn}]={got}, '
+                                 f'expected {want}')
+
+
 def _trigger_advertise_communities(self: IdentityAdapter, participant: _Participant, inbound: Message):
     social_handlers.advertise_communities(participant.process, participant.queues)
     return participant.drain_outbox()
@@ -1233,6 +1338,11 @@ class SocialAdapter(IdentityAdapter):
                 _TRIGGER_UNFOLLOW_COMMUNITY: _trigger_unfollow_community,
                 _TRIGGER_PUBLISH_POST_LABEL: _trigger_publish_post_label,
                 _TRIGGER_ADVERTISE_COMMUNITIES: _trigger_advertise_communities,
+                'trigger_file_offer': _trigger_file,
+                'trigger_file_accept': _trigger_file,
+                'trigger_file_decline': _trigger_file,
+                'trigger_file_cancel': _trigger_file,
+                'trigger_file_sweep': _trigger_file,
                 }
     INBOUND_BUILDERS = {**IdentityAdapter.INBOUND_BUILDERS,
                         SocialProtocol.position_query: _build_position_query,
@@ -1254,6 +1364,10 @@ class SocialAdapter(IdentityAdapter):
                         SocialProtocol.post_backfill: _build_post_backfill,
                         SocialProtocol.community_policy: _build_community_policy,
                         SocialProtocol.post_label: _build_post_label,
+                        SocialProtocol.file_offer: _build_file,
+                        SocialProtocol.file_ctl: _build_file,
+                        SocialProtocol.file_req: _build_file,
+                        SocialProtocol.file_chunk: _build_file,
                         }
     STATE_CHECKS = {**IdentityAdapter.STATE_CHECKS,
                     'peer_position': _check_peer_position,
@@ -1283,6 +1397,8 @@ class SocialAdapter(IdentityAdapter):
                     'post_label_last': _check_post_label_last,
                     'community_policies_emitted': _check_community_emitted,
                     'post_labels_emitted': _check_community_emitted,
+                    'file_xfer': _check_file_xfer,
+                    'file_frames_emitted': _check_file_frames_emitted,
                     }
 
     def _run_proximity_probe(self, initiator: _Participant,

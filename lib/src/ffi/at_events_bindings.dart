@@ -125,6 +125,25 @@ const int agoraEventContact = 19;
 /// ([AtRawEvent.fcKind] is an `atBackup*` kind).
 const int agoraEventBackup = 20;
 
+/// A file transfer in a DM thread changed: an offer, an answer, progress or
+/// the end ([AtRawEvent.fileState] is an `agoraFile*` state).
+const int agoraEventFile = 21;
+
+/// [AtRawEvent.fileState]. MUST match AGORA_FILE_* (at_agora_shim.h).
+const int agoraFileOffered = 0;
+const int agoraFileAccepted = 1;
+const int agoraFileDone = 2;
+const int agoraFileDeclined = 3;
+const int agoraFileCancelled = 4;
+const int agoraFileFailed = 5;
+const int agoraFileTooLarge = 6;
+
+/// File-sharing bounds. MUST match AGORA_FILE_*_MAX.
+const int agoraFileIdMax = 32;
+const int agoraFileNameMax = 255;
+const int agoraFilePathMax = 4095;
+const int agoraFileReasonMax = 31;
+
 /// AT first-contact kinds (at_first_contact.h) carried in [AtRawEvent.fcKind].
 const int atFcInvitation = 1000;
 const int atFcHelloSent = 1001;
@@ -592,6 +611,33 @@ final class AgoraEvent extends Struct {
 
   @Int32()
   external int backupRemoved;
+
+  @Int64()
+  external int fileSize;
+
+  @Int64()
+  external int fileDone;
+
+  @Double()
+  external double fileTs;
+
+  @Int32()
+  external int fileState;
+
+  @Int32()
+  external int fileOutgoing;
+
+  @Array(agoraFileIdMax + 1)
+  external Array<Uint8> fileXferId;
+
+  @Array(agoraFileNameMax + 1)
+  external Array<Uint8> fileName;
+
+  @Array(agoraFileReasonMax + 1)
+  external Array<Uint8> fileReason;
+
+  @Array(agoraFilePathMax + 1)
+  external Array<Uint8> filePath;
 }
 
 /// A pure-Dart copy of one decoded event. Decoupled from native memory so it
@@ -694,6 +740,15 @@ class AtRawEvent {
     this.backupAdded = 0,
     this.backupUpdated = 0,
     this.backupRemoved = 0,
+    this.fileXferId = '',
+    this.fileState = 0,
+    this.fileOutgoing = false,
+    this.fileSize = 0,
+    this.fileDone = 0,
+    this.fileTs = 0,
+    this.fileName = '',
+    this.fileReason = '',
+    this.filePath = '',
   });
 
   final int kind;
@@ -921,6 +976,20 @@ class AtRawEvent {
   final int backupAdded;
   final int backupUpdated;
   final int backupRemoved;
+
+  /// [agoraEventFile]: [uuid] is the other end and, with [fileXferId], names
+  /// the transfer. [fileDone] is the bytes held (incoming) or served
+  /// (outgoing). [fileName] is a bare, sanitized name. [filePath] is the
+  /// source when [fileOutgoing], else the finished file once DONE.
+  final String fileXferId;
+  final int fileState;
+  final bool fileOutgoing;
+  final int fileSize;
+  final int fileDone;
+  final double fileTs;
+  final String fileName;
+  final String fileReason;
+  final String filePath;
 }
 
 typedef _SetRootC = Void Function(Pointer<Utf8>);
@@ -974,6 +1043,14 @@ typedef _ReturnCosignDart = int Function(Pointer<Void>, Pointer<Utf8>,
     Pointer<Uint8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
 
 typedef _BlockC = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
+typedef _FileOfferC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _FileOfferDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _FileVerbC = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Pointer<Utf8>);
+typedef _FileVerbDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Pointer<Utf8>);
 typedef _BlockDart = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>);
 // agora_unblock and agora_report_peer share block's shape: (handle, queue, uuid).
 typedef _PeerStandingC = Int32 Function(Pointer<Void>, Pointer<Utf8>,
@@ -1236,6 +1313,14 @@ class AtEvents {
       _lib.lookupFunction<_ConnRespC, _ConnRespDart>('agora_connect_respond');
   static final _SendDmDart _sendDm =
       _lib.lookupFunction<_SendDmC, _SendDmDart>('agora_send_dm');
+  static final _FileOfferDart _fileOffer =
+      _lib.lookupFunction<_FileOfferC, _FileOfferDart>('agora_file_offer');
+  static final _FileVerbDart _fileAccept =
+      _lib.lookupFunction<_FileVerbC, _FileVerbDart>('agora_file_accept');
+  static final _FileVerbDart _fileDecline =
+      _lib.lookupFunction<_FileVerbC, _FileVerbDart>('agora_file_decline');
+  static final _FileVerbDart _fileCancel =
+      _lib.lookupFunction<_FileVerbC, _FileVerbDart>('agora_file_cancel');
   static final _PublishPostDart _publishPost = _lib
       .lookupFunction<_PublishPostC, _PublishPostDart>('agora_publish_post');
   static final _ReactDart _react =
@@ -1445,6 +1530,60 @@ class AtEvents {
       calloc.free(t);
       calloc.free(u);
     }
+  }
+
+  /// Offer the file at [path] to one device, [peerUuid] (16 raw identity
+  /// bytes), as transfer [xferId] (32 lowercase hex, the same for every device
+  /// of the person). The core hashes the file and sends the offer; nothing
+  /// moves until the peer accepts. Returns 0, or negative (-2 == not ready).
+  int fileOffer(
+      String sendQueue, List<int> peerUuid, String xferId, String path) {
+    final q = sendQueue.toNativeUtf8();
+    final x = xferId.toNativeUtf8();
+    final p = path.toNativeUtf8();
+    final u = _uuidBuf(peerUuid);
+    try {
+      return _fileOffer(_handle, q, u, x, p);
+    } finally {
+      calloc.free(q);
+      calloc.free(x);
+      calloc.free(p);
+      calloc.free(u);
+    }
+  }
+
+  /// Accept an inbound offer; the file lands under var/agora/files.
+  int fileAccept(String sendQueue, List<int> peerUuid, String xferId) =>
+      _fileVerb(_fileAccept, sendQueue, peerUuid, xferId);
+
+  /// Decline an inbound offer.
+  int fileDecline(String sendQueue, List<int> peerUuid, String xferId) =>
+      _fileVerb(_fileDecline, sendQueue, peerUuid, xferId);
+
+  /// Cancel a transfer either way, offered or under way.
+  int fileCancel(String sendQueue, List<int> peerUuid, String xferId) =>
+      _fileVerb(_fileCancel, sendQueue, peerUuid, xferId);
+
+  int _fileVerb(_FileVerbDart fn, String sendQueue, List<int> peerUuid,
+      String xferId) {
+    final q = sendQueue.toNativeUtf8();
+    final x = xferId.toNativeUtf8();
+    final u = _uuidBuf(peerUuid);
+    try {
+      return fn(_handle, q, u, x);
+    } finally {
+      calloc.free(q);
+      calloc.free(x);
+      calloc.free(u);
+    }
+  }
+
+  static Pointer<Uint8> _uuidBuf(List<int> uuid) {
+    final u = calloc<Uint8>(agoraUuidLen);
+    for (var i = 0; i < agoraUuidLen && i < uuid.length; i++) {
+      u[i] = uuid[i];
+    }
+    return u;
   }
 
   /// Ask each peer in [peerUuids] (16 raw identity bytes apiece) to co-sign one
@@ -2099,6 +2238,15 @@ class AtEvents {
           backupAdded: e.backupAdded,
           backupUpdated: e.backupUpdated,
           backupRemoved: e.backupRemoved,
+          fileXferId: _boundedString(e.fileXferId, agoraFileIdMax),
+          fileState: e.fileState,
+          fileOutgoing: e.fileOutgoing != 0,
+          fileSize: e.fileSize,
+          fileDone: e.fileDone,
+          fileTs: e.fileTs,
+          fileName: _boundedString(e.fileName, agoraFileNameMax),
+          fileReason: _boundedString(e.fileReason, agoraFileReasonMax),
+          filePath: _boundedString(e.filePath, agoraFilePathMax),
         );
       }, growable: false);
     } finally {

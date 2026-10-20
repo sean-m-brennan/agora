@@ -127,6 +127,22 @@ extern "C" {
                                               asking/answering, devices, siblings */
 /* The encrypted backup (Phase 4, multi-device). fc_kind is 1031..1033. */
 #define AGORA_EVENT_BACKUP             20
+/* File sharing in a DM thread: one transfer's state (the file_* fields). */
+#define AGORA_EVENT_FILE               21
+
+/* File-sharing bounds; MUST match AT_APP_FILE_*_LEN in at_agora.h. */
+#define AGORA_FILE_ID_MAX     32
+#define AGORA_FILE_NAME_MAX   255
+#define AGORA_FILE_PATH_MAX   4095
+#define AGORA_FILE_REASON_MAX 31
+/* file_state; MUST match AT_APP_FILE_* and the Dart FileTransferState. */
+#define AGORA_FILE_OFFERED   0
+#define AGORA_FILE_ACCEPTED  1
+#define AGORA_FILE_DONE      2
+#define AGORA_FILE_DECLINED  3
+#define AGORA_FILE_CANCELLED 4
+#define AGORA_FILE_FAILED    5
+#define AGORA_FILE_TOO_LARGE 6
 
 /* First-contact field bounds; MUST match at_first_contact.h. */
 #define AGORA_FC_REF_MAX      63
@@ -436,6 +452,26 @@ typedef struct {
     int32_t backup_added;
     int32_t backup_updated;
     int32_t backup_removed;
+    /* File sharing in a DM thread. Appended LAST after backup_removed, so
+     * every prior offset is unchanged; the Dart AgoraEvent and the cohort
+     * ctypes Ev mirror this order and re-check the new sizeof.
+     *
+     * AGORA_EVENT_FILE: peer_uuid is the other end (crypto_box-authenticated)
+     * and with file_xfer_id names the transfer. file_outgoing is 1 when we
+     * send. file_state is AGORA_FILE_*; file_done the bytes held (incoming)
+     * or served (outgoing); file_reason a token on FAILED. file_name is a
+     * bare, sanitized name, never a path. file_path is the source on an
+     * outgoing transfer and the finished file on an incoming one once DONE.
+     * The bytes never cross this boundary. */
+    int64_t file_size;
+    int64_t file_done;
+    double  file_ts;
+    int32_t file_state;
+    int32_t file_outgoing;                     /* 0/1 */
+    char    file_xfer_id[AGORA_FILE_ID_MAX + 1];
+    char    file_name[AGORA_FILE_NAME_MAX + 1];
+    char    file_reason[AGORA_FILE_REASON_MAX + 1];
+    char    file_path[AGORA_FILE_PATH_MAX + 1];
 } agora_event_t;
 
 /* ---- Proximity hubs (Phase 4, §4.1). Each needs first contact on in the
@@ -546,6 +582,21 @@ int agora_connect_respond(void *handle, const char *send_queue,
  *  Returns 0 on success, negative on error (AT_APP_NOT_READY == -2). */
 int agora_send_dm(void *handle, const char *send_queue,
                   const uint8_t *peer_uuid, const char *text);
+
+/** Offer a file to one device of a peer (DM file sharing). `xfer_id` is 32
+ *  lowercase hex the app chose, the SAME for every device of the person;
+ *  `path` a regular file this node can read. Nothing moves until the peer
+ *  accepts; an AGORA_EVENT_FILE (outgoing, OFFERED) comes back, or FAILED
+ *  with a reason. Returns 0, AGORA_NOT_READY, or -1. */
+int agora_file_offer(void *handle, const char *send_queue, const uint8_t *peer_uuid,
+                     const char *xfer_id, const char *path);
+/** Accept / decline an inbound offer, or cancel a transfer either way. */
+int agora_file_accept(void *handle, const char *send_queue, const uint8_t *peer_uuid,
+                      const char *xfer_id);
+int agora_file_decline(void *handle, const char *send_queue, const uint8_t *peer_uuid,
+                       const char *xfer_id);
+int agora_file_cancel(void *handle, const char *send_queue, const uint8_t *peer_uuid,
+                      const char *xfer_id);
 
 /** Publish a feed post to the local group (Increment 7). `send_queue` is the
  *  app -> AT queue; `body` is the post body (truncated to AGORA_POST_BODY_MAX

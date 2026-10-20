@@ -31,6 +31,19 @@
 cmake_minimum_required(VERSION 3.23)
 project(agora_native C CXX)
 
+# MSYS2 ships two CMakes. /usr/bin/cmake (package `cmake`) targets the MSYS
+# runtime: CMAKE_SYSTEM_NAME is MSYS and WIN32 is NOT set, so every Windows
+# branch below and in AT is skipped and the POSIX ones run instead, which ends
+# in "LIBUUID_INCLUDE_DIR not found" (it finds MinGW's libuuid.a, a COM GUID
+# library, and no <uuid/uuid.h>). Only the UCRT64 one targets Windows.
+if(CMAKE_SYSTEM_NAME MATCHES "^(MSYS|CYGWIN)$")
+    message(FATAL_ERROR
+        "This CMake (${CMAKE_COMMAND}) targets ${CMAKE_SYSTEM_NAME}, not Windows. "
+        "Use the UCRT64 CMake: pacman -S mingw-w64-ucrt-x86_64-cmake, then run "
+        "./build.sh windows from a UCRT64 shell (it calls /ucrt64/bin/cmake). "
+        "Remove native/build first.")
+endif()
+
 # Location of the AutonomousTrust C core, inside the autonomous_trust submodule.
 # apps/agora/native -> ../../../lib/autonomous_trust/src/c
 set(AT_C_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../lib/autonomous_trust/src/c"

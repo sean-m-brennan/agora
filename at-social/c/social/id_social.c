@@ -62,6 +62,7 @@
 #include "social_store.h"
 #include "community.h"
 #include "proximity.h"
+#include "id_file_xfer.h"
 
 /* Emit one event to the app's queue (AT_MAIN_QUEUE). One try, then KEPT for
  * this process's tick (utilities/send_retry.h, ISSUES §2.14): most of these
@@ -478,6 +479,17 @@ static bool _is_blocked(const uuid_t uuid)
     bool blocked = _is_blocked_locked(uuid_str);
     pthread_mutex_unlock(&social_state.lock);
     return blocked;
+}
+
+/* For file sharing (id_file_xfer.c), which keeps its own state and asks. */
+bool social_peer_is_blocked(const uuid_t uuid)
+{
+    return _is_blocked(uuid);
+}
+
+int social_emit(generic_msg_t *msg, const char *what)
+{
+    return _social_emit(msg, what);
 }
 /* Conformance/harness seam: set (or clear) THIS node's opt-in coarse position
  * in the singleton id_state (Increment 2, the "with-distance" feature). The
@@ -6213,6 +6225,8 @@ static void _social_init(void)
 
 static void _social_reset(void)
 {
+    /* File sharing keeps its own state, initialized or not. */
+    file_xfer_reset();
     /* at_extensions_reset reaches this with identity never initialized. */
     if (!social_state.initialized)
         return;
@@ -6317,6 +6331,8 @@ static void _social_run_start(process_t *proc)
                          "Identity: restored %zu local block(s)\n", n);
         }
     }
+    /* File transfers under way when the node stopped resume from here. */
+    file_xfer_run_start(proc);
 }
 
 static void _social_peer_confirmed(const process_t *proc, const public_identity_t *peer)
@@ -6408,6 +6424,8 @@ static void _social_periodic_resync(const process_t *proc)
     _maybe_send_post_digest(proc);
     /* Communities (Phase 4): carry the policies we follow, first-person. */
     _maybe_advertise_communities(proc);
+    /* File sharing: resume stalled pulls, expire old offers. */
+    file_xfer_periodic(proc);
 }
 
 static bool _social_roster_replay(const process_t *proc, int n)
@@ -6415,9 +6433,10 @@ static bool _social_roster_replay(const process_t *proc, int n)
     int p = identity_emit_all_positions(proc);
     int f = identity_emit_all_profiles(proc);
     int c = identity_emit_all_connections(proc);
+    int t = file_xfer_replay(proc);
     log_debug(proc->logger,
               "Identity: peer roster request -> %d observation(s), %d position(s), "
-              "%d profile(s), %d connection(s)\n", n, p, f, c);
+              "%d profile(s), %d connection(s), %d file transfer(s)\n", n, p, f, c, t);
     return true;
 }
 
@@ -6504,6 +6523,7 @@ static int _social_register(process_t *proc, const char *proc_name)
     process_register_handler(proc, ID_POST_DIGEST,   (handler_ptr_t)handle_post_digest);
     process_register_handler(proc, ID_POST_WANT,     (handler_ptr_t)handle_post_want);
     process_register_handler(proc, ID_POST_BACKFILL, (handler_ptr_t)handle_post_backfill);
+    file_xfer_register_handlers(proc);
     return 0;
 }
 

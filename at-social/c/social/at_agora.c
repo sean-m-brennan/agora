@@ -31,6 +31,7 @@
 #include "utilities/msg_types_priv.h"   /* net_msg_pack_json */
 #include "social_msg_types.h"
 #include "cosign.h"             /* at_cosign_op_ok / at_cosign_bytes_ok */
+#include "file_xfer.h"          /* at_file_id_ok */
 
 /* ---- AT -> app: one decoder per social message type. The poll zeroes the
  * event before calling, so a short string stays terminated after each
@@ -308,6 +309,31 @@ static int decode_reaction(const generic_msg_t *msg, at_app_event_t *ev)
     return 0;
 }
 AT_APP_EVENT_DECODER_REGISTER(decode_reaction, PEER_REACTION_OBSERVED, decode_reaction)
+
+static int decode_file(const generic_msg_t *msg, at_app_event_t *ev)
+{
+    const peer_file_msg_t *in = AT_MSG_EXT_CONST(msg, peer_file_msg_t);
+    at_app_file_t *out = AT_APP_EVENT_EXT(ev, at_app_file_t);
+    ev->kind = AT_APP_EVENT_FILE;
+    memcpy(out->peer_uuid, in->peer_uuid, AT_APP_UUID_LEN);
+    /* The emitter NUL-caps every string; the event was memset, so a short
+     * string stays terminated after the bounded copy. */
+    memcpy(out->xfer_id, in->xfer_id, AT_APP_FILE_ID_LEN);
+    out->xfer_id[AT_APP_FILE_ID_LEN] = '\0';
+    out->state = in->state;
+    out->outgoing = in->outgoing;
+    out->size = in->size;
+    out->bytes_done = in->bytes_done;
+    out->ts = in->ts;
+    memcpy(out->name, in->name, AT_APP_FILE_NAME_LEN);
+    out->name[AT_APP_FILE_NAME_LEN] = '\0';
+    memcpy(out->reason, in->reason, AT_APP_FILE_REASON_LEN);
+    out->reason[AT_APP_FILE_REASON_LEN] = '\0';
+    memcpy(out->path, in->path, AT_APP_FILE_PATH_LEN);
+    out->path[AT_APP_FILE_PATH_LEN] = '\0';
+    return 0;
+}
+AT_APP_EVENT_DECODER_REGISTER(decode_file, PEER_FILE_OBSERVED, decode_file)
 
 void at_agora_link(void)
 {
@@ -865,7 +891,10 @@ static int _send_verb(const char *q_out, const char *verb, json_t *env)
         return -1;
     }
     json_decref(env);
-    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+    /* The send serializes; the packed buffer is still ours (net_msg_t.obj). */
+    int rc = messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+    net_msg_free_obj(&req.info.net_msg);
+    return rc;
 }
 
 int at_app_events_publish_post_scoped(at_app_events_t *handle, const char *q_out,
@@ -944,4 +973,53 @@ int at_app_events_publish_post_label(at_app_events_t *handle, const char *q_out,
                       json_pack("{s:s, s:s, s:s, s:I}", "community", community,
                                 "post_id", post_id, "bundle", bundle, "seq",
                                 (json_int_t)seq));
+}
+
+/* {"peer","id"[,"path"]}: the four file verbs share a shape. The id is checked
+ * here as well as in identity, so a malformed one fails at the call. */
+static int _file_verb(at_app_events_t *handle, const char *q_out, const char *verb,
+                      const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                      const char *xfer_id, const char *path)
+{
+    if (handle == NULL || !at_app_name_survives(q_out) || peer_uuid == NULL
+        || !at_file_id_ok(xfer_id))
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    char uuid_str[37];
+    uuid_unparse_lower((const unsigned char *)peer_uuid, uuid_str);
+    json_t *env = json_pack("{s:s, s:s}", "peer", uuid_str, "id", xfer_id);
+    if (env != NULL && path != NULL)
+        json_object_set_new(env, "path", json_string(path));
+    return _send_verb(q_out, verb, env);
+}
+
+int at_app_events_file_offer(at_app_events_t *handle, const char *q_out,
+                             const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                             const char *xfer_id, const char *path)
+{
+    if (path == NULL || path[0] == '\0')
+        return -1;
+    return _file_verb(handle, q_out, AT_APP_FILE_OFFER, peer_uuid, xfer_id, path);
+}
+
+int at_app_events_file_accept(at_app_events_t *handle, const char *q_out,
+                              const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                              const char *xfer_id)
+{
+    return _file_verb(handle, q_out, AT_APP_FILE_ACCEPT, peer_uuid, xfer_id, NULL);
+}
+
+int at_app_events_file_decline(at_app_events_t *handle, const char *q_out,
+                               const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                               const char *xfer_id)
+{
+    return _file_verb(handle, q_out, AT_APP_FILE_DECLINE, peer_uuid, xfer_id, NULL);
+}
+
+int at_app_events_file_cancel(at_app_events_t *handle, const char *q_out,
+                              const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                              const char *xfer_id)
+{
+    return _file_verb(handle, q_out, AT_APP_FILE_CANCEL, peer_uuid, xfer_id, NULL);
 }

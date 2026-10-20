@@ -6,7 +6,8 @@
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show File, Platform;
+import 'dart:io' show File, FileSystemEntity, FileSystemEntityType, Platform;
+import 'dart:math' show Random;
 
 import 'package:flutter/foundation.dart';
 
@@ -25,6 +26,7 @@ import '../model/cosign_exchanges.dart';
 import '../model/device_cert.dart';
 import '../model/dm.dart';
 import '../model/feed_entry.dart';
+import '../model/file_transfer.dart';
 import '../model/member_roll.dart';
 import '../model/moderation.dart';
 import '../model/moderation_store.dart';
@@ -38,6 +40,7 @@ import '../model/tie_strength.dart';
 import 'agora_daemon.dart';
 import 'compact_border.dart';
 import 'compact_engine.dart';
+import 'file_verbs.dart';
 import 'moderation_verbs.dart';
 import 'polity_acts.dart';
 
@@ -56,6 +59,7 @@ class PeerService extends ChangeNotifier {
     @visibleForTesting CosignDescriber? cosignDescriber,
     @visibleForTesting RollPublisher? rollPublisher,
     @visibleForTesting ModerationVerbs? moderationVerbs,
+    @visibleForTesting FileVerbs? fileVerbs,
     @visibleForTesting PolityActs? polityActs,
     @visibleForTesting CommunityCrypto? communityCrypto,
     @visibleForTesting CommunityGovernance? communityGovernance,
@@ -66,6 +70,7 @@ class PeerService extends ChangeNotifier {
         _governanceOverride = communityGovernance,
         _polityActsOverride = polityActs,
         _moderationVerbsOverride = moderationVerbs,
+        _fileVerbsOverride = fileVerbs,
         _bundleVerifierOverride = bundleVerifier,
         _staffOverride = staffIdentity,
         _rosterOverride = staffRoster,
@@ -96,6 +101,11 @@ class PeerService extends ChangeNotifier {
   final ModerationVerbs? _moderationVerbsOverride;
   late final ModerationVerbs _moderationVerbs =
       _moderationVerbsOverride ?? _ShimModerationVerbs(this);
+
+  /// Test-only stand-in for the four file-sharing verbs. Null in the app,
+  /// where they go to the core over the shim.
+  final FileVerbs? _fileVerbsOverride;
+  late final FileVerbs _fileVerbs = _fileVerbsOverride ?? _ShimFileVerbs(this);
 
   /// Test-only stand-in for the polity acts an expulsion needs. Null in the
   /// app, where they are the cdylib over this node's charter archive.
@@ -1267,6 +1277,200 @@ class PeerService extends ChangeNotifier {
   /// DMs dropped here because their sender is blocked. Should stay 0 — the core
   /// drops them first — so a non-zero count is worth seeing.
   int get dmsDroppedFromBlocked => _dmsDroppedFromBlocked;
+
+  // --- files in a DM thread --------------------------------------------------
+
+  /// File transfers per person thread (keyed as [_threadKey]), by transfer id.
+  /// Built from AGORA_EVENT_FILE; the core re-emits every transfer it holds on
+  /// the roster pull, so a restart rebuilds this.
+  final Map<String, Map<String, FileTransfer>> _files = {};
+
+  static final Random _idRng = Random.secure();
+
+  /// A fresh transfer id: 16 random bytes as lowercase hex.
+  static String newTransferId() =>
+      _hex(List<int>.generate(16, (_) => _idRng.nextInt(256)));
+
+  /// The files in [peer]'s thread, oldest first.
+  List<FileTransfer> filesFor(AgoraPeer peer) {
+    final m = _files[_threadKey(peer)];
+    if (m == null) return const [];
+    final l = m.values.toList();
+    // Insertion sort: tiny lists, and stable, unlike List.sort.
+    for (var i = 1; i < l.length; i++) {
+      final x = l[i];
+      var j = i - 1;
+      while (j >= 0 && l[j].ts > x.ts) {
+        l[j + 1] = l[j];
+        j--;
+      }
+      l[j + 1] = x;
+    }
+    return l;
+  }
+
+  /// [peer]'s thread, messages and files together, oldest first. A merge of two
+  /// lists already in order, so equal timestamps keep their arrival order.
+  List<ThreadItem> threadItems(AgoraPeer peer) {
+    final ms = messagesFor(peer);
+    final fs = filesFor(peer);
+    final out = <ThreadItem>[];
+    var i = 0, j = 0;
+    while (i < ms.length || j < fs.length) {
+      if (j >= fs.length || (i < ms.length && ms[i].ts <= fs[j].ts)) {
+        out.add(ThreadItem.message(ms[i++]));
+      } else {
+        out.add(ThreadItem.file(fs[j++]));
+      }
+    }
+    return out;
+  }
+
+  /// Offer the file at [path] to [peer]: to every device of theirs that is a
+  /// peer now, as ONE transfer under one id. It shows in the thread at once.
+  /// Nothing moves until they accept, and the first device to accept gets it
+  /// (the others' offers are withdrawn). Returns the shim rc: 0 when any device
+  /// took the offer, -2 when the daemon is not ready, -1 otherwise (no such
+  /// file, a blocked person, no channel).
+  int offerFile(AgoraPeer peer, String path) {
+    if (_personBlocked(peer)) return -1;
+    if (FileSystemEntity.typeSync(path) != FileSystemEntityType.file) return -1;
+    final int size;
+    try {
+      size = File(path).lengthSync();
+    } catch (_) {
+      return -1;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch / 1000.0;
+    _tend(peer, now);
+    final devices = devicesOfPeer(peer);
+    final t = FileTransfer(
+      id: newTransferId(),
+      peerUuidHex: _hex(peer.uuid),
+      name: _baseName(path),
+      size: size,
+      outgoing: true,
+      ts: now,
+      path: path,
+    );
+    for (final d in devices) {
+      t.deviceStates[_hex(d.uuid)] = FileTransferState.offered;
+    }
+    (_files[_threadKey(peer)] ??= {})[t.id] = t;
+    var rc = -1;
+    for (final d in devices) {
+      final r = _fileVerbs.offer(d.uuid, t.id, path);
+      if (rc != 0) rc = r;
+    }
+    notifyListeners();
+    return rc;
+  }
+
+  /// Accept an incoming offer. The file lands under var/agora/files; progress
+  /// and then the finished path arrive as events.
+  int acceptFile(FileTransfer t) =>
+      _answerFile(t, FileTransferState.accepted, _fileVerbs.accept);
+
+  /// Decline an incoming offer.
+  int declineFile(FileTransfer t) =>
+      _answerFile(t, FileTransferState.declined, _fileVerbs.decline);
+
+  int _answerFile(FileTransfer t, FileTransferState to,
+      int Function(List<int> uuid, String id) send) {
+    if (t.outgoing || t.state != FileTransferState.offered) return -1;
+    final rc = send(bytesOfHex(t.peerUuidHex), t.id);
+    if (rc == 0) {
+      // Optimistic; the core's event says the same thing a moment later.
+      t.deviceStates[t.peerUuidHex] = to;
+      notifyListeners();
+    }
+    return rc;
+  }
+
+  /// Cancel a transfer either way, offered or under way: every device it is
+  /// still live on. A partial incoming file is deleted by the core.
+  int cancelFile(FileTransfer t) {
+    var rc = -1;
+    for (final entry in t.deviceStates.entries.toList()) {
+      if (entry.value.isTerminal) continue;
+      final r = _fileVerbs.cancel(bytesOfHex(entry.key), t.id);
+      if (r == 0) t.deviceStates[entry.key] = FileTransferState.cancelled;
+      if (rc != 0) rc = r;
+    }
+    notifyListeners();
+    return rc;
+  }
+
+  int _filesDroppedFromBlocked = 0;
+
+  /// File offers dropped here because their sender is blocked. Should stay 0
+  /// — the core drops them first.
+  int get filesDroppedFromBlocked => _filesDroppedFromBlocked;
+
+  /// Route one AGORA_EVENT_FILE into its thread. Returns true if it was one.
+  bool _ingestFile(AtRawEvent e) {
+    if (e.kind != agoraEventFile) return false;
+    final key = _hex(e.uuid);
+    if (_ownUuidHex.isNotEmpty && key == _ownUuidHex) return true;
+    if (e.fileXferId.isEmpty) return true;
+    final peer = _peers.putIfAbsent(key, () => _newPeer(e.uuid));
+    final thread = _files[_threadKey(peer)] ??= {};
+    var t = thread[e.fileXferId];
+    final state = FileTransferState.fromWire(e.fileState);
+    if (t == null) {
+      // A new offer from a blocked person is dropped and counted, as a DM is.
+      if (!e.fileOutgoing && _personBlocked(peer)) {
+        _filesDroppedFromBlocked++;
+        return true;
+      }
+      t = FileTransfer(
+        id: e.fileXferId,
+        peerUuidHex: key,
+        name: e.fileName,
+        size: e.fileSize,
+        outgoing: e.fileOutgoing,
+        ts: e.fileTs > 0
+            ? e.fileTs
+            : DateTime.now().millisecondsSinceEpoch / 1000.0,
+        path: e.filePath,
+      );
+      thread[t.id] = t;
+      if (!t.outgoing && !state.isTerminal) {
+        _unreadPeers.add(_threadKey(peer));
+        _tend(peer);
+      }
+    }
+    t.deviceStates[key] = state;
+    if (e.fileName.isNotEmpty) t.name = e.fileName;
+    t.size = e.fileSize;
+    t.reason = e.fileReason;
+    if (!t.outgoing || state == FileTransferState.accepted ||
+        state == FileTransferState.done) {
+      t.bytesDone = e.fileDone;
+    }
+    if (!t.outgoing && e.filePath.isNotEmpty) t.path = e.filePath;
+    // The first device to take it gets it: withdraw the offer from the rest.
+    if (t.outgoing &&
+        (state == FileTransferState.accepted ||
+            state == FileTransferState.done)) {
+      for (final other in t.deviceStates.entries.toList()) {
+        if (other.key == key || other.value != FileTransferState.offered) {
+          continue;
+        }
+        _fileVerbs.cancel(bytesOfHex(other.key), t.id);
+        t.deviceStates[other.key] = FileTransferState.cancelled;
+      }
+    }
+    return true;
+  }
+
+  static String _baseName(String path) {
+    final parts = path.split(RegExp(r'[/\\]'));
+    for (var i = parts.length - 1; i >= 0; i--) {
+      if (parts[i].isNotEmpty) return parts[i];
+    }
+    return path;
+  }
 
   /// Peers ordered by tie strength (§3.2) descending — the proximity-weighted
   /// social ranking that makes local, tended, trusted ties surface first. Ties
@@ -2600,6 +2804,8 @@ class PeerService extends ChangeNotifier {
       // A DM is a live-stream message, not peer state — routed into the per-peer
       // thread rather than merged into the AgoraPeer by applyEvent.
       if (_ingestDm(e)) continue;
+      // A file in a DM thread: offer, answer, progress or end.
+      if (_ingestFile(e)) continue;
       // A post is a live-stream feed item — routed into the FeedStore.
       if (_ingestPost(e)) continue;
       // A reaction to one of our posts — tallied, not merged into a peer.
@@ -2876,6 +3082,29 @@ class _ArchiveCommunityGovernance implements CommunityGovernance, CompactGoverna
 }
 
 /// The moderation verbs over the shim. -1 while no event channel is open.
+class _ShimFileVerbs implements FileVerbs {
+  _ShimFileVerbs(this._svc);
+  final PeerService _svc;
+
+  String get _q => _svc._daemon.queues.appToAt;
+
+  @override
+  int offer(List<int> deviceUuid, String xferId, String path) =>
+      _svc._events?.fileOffer(_q, deviceUuid, xferId, path) ?? -1;
+
+  @override
+  int accept(List<int> deviceUuid, String xferId) =>
+      _svc._events?.fileAccept(_q, deviceUuid, xferId) ?? -1;
+
+  @override
+  int decline(List<int> deviceUuid, String xferId) =>
+      _svc._events?.fileDecline(_q, deviceUuid, xferId) ?? -1;
+
+  @override
+  int cancel(List<int> deviceUuid, String xferId) =>
+      _svc._events?.fileCancel(_q, deviceUuid, xferId) ?? -1;
+}
+
 class _ShimModerationVerbs implements ModerationVerbs {
   _ShimModerationVerbs(this._svc);
   final PeerService _svc;

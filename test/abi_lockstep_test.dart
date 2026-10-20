@@ -21,6 +21,7 @@ import 'package:ffi/ffi.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:agora/src/ffi/at_events_bindings.dart';
+import 'package:agora/src/model/file_transfer.dart';
 
 void main() {
   // The struct can be byte-perfect and the events still never arrive. In
@@ -75,11 +76,12 @@ void main() {
     // P3.3 co-signing tail, 17872 -> 22152 with the P3.4 business-post tail,
     // 22152 -> 22168 with the P4.1 moderation tail, 22168 -> 28600 with the
     // Phase 4 communities tail, 28600 -> 29200 with the proximity-hub tail, and
-    // 29200 -> 41296 with the multi-device address-book / backup tail. When
-    // this fails, the C struct moved: update at_agora_shim.c's _Static_assert,
-    // ALL NINE cohort ctypes Ev asserts, and this one TOGETHER, and check that
-    // only the tail grew.
-    expect(sizeOf<AgoraEvent>(), 41296,
+    // 29200 -> 41296 with the multi-device address-book / backup tail, and
+    // 41296 -> 45752 with the DM file-sharing tail. When this fails, the C
+    // struct moved: update at_agora_shim.c's _Static_assert, ALL ELEVEN cohort
+    // ctypes Ev asserts, and this one TOGETHER, and check that only the tail
+    // grew.
+    expect(sizeOf<AgoraEvent>(), 45752,
         reason: 'agora_event_t drift — poll() would misread every field '
             'past the drift point');
   });
@@ -98,6 +100,9 @@ void main() {
     const labelBundleOffset = 27060; // Phase 4 communities, measured
     const areaNameOffset = 29054; // proximity hubs, measured
     const fcCountOffset = 29192; // proximity hubs, measured
+    const backupRemovedOffset = 41292; // multi-device, measured
+    const fileStateOffset = 41320; // DM file sharing, measured
+    const filePathOffset = 41649; // DM file sharing, measured
     final mem = calloc<Uint8>(sizeOf<AgoraEvent>());
     try {
       mem[businessBundleOffset] = 0x41; // 'A'
@@ -114,6 +119,10 @@ void main() {
       mem[areaNameOffset] = 0x66; // 'f'
       mem[areaNameOffset + 1] = 0x00;
       mem[fcCountOffset] = 0x07;
+      mem[backupRemovedOffset] = 0x09;
+      mem[fileStateOffset] = 0x05;
+      mem[filePathOffset] = 0x67; // 'g'
+      mem[filePathOffset + 1] = 0x00;
       final ev = mem.cast<AgoraEvent>().ref;
       expect(ev.businessBundle[0], 0x41,
           reason: 'business_bundle moved — a later tail was not appended');
@@ -130,6 +139,12 @@ void main() {
       expect(ev.areaName[0], 0x66,
           reason: 'area_name is not where the C struct puts it');
       expect(ev.fcCount, 7, reason: 'fc_count is not where the C struct puts it');
+      expect(ev.backupRemoved, 9,
+          reason: 'backup_removed moved — the file tail was not appended');
+      expect(ev.fileState, 5,
+          reason: 'file_state is not where the C struct puts it');
+      expect(ev.filePath[0], 0x67,
+          reason: 'file_path is not where the C struct puts it');
     } finally {
       calloc.free(mem);
     }
@@ -197,6 +212,24 @@ void main() {
     expect(agoraEventArea, 18);
     expect(agoraEventContact, 19);
     expect(agoraEventBackup, 20);
+    expect(agoraEventFile, 21);
+  });
+
+  test('the file-sharing bounds and states match the C header', () {
+    // at_agora.h AT_APP_FILE_*_LEN, which the shim _Static_asserts its copies
+    // against; the states are AT_APP_FILE_* and FileTransferState's indexes.
+    expect(agoraFileIdMax, 32);
+    expect(agoraFileNameMax, 255);
+    expect(agoraFilePathMax, 4095);
+    expect(agoraFileReasonMax, 31);
+    expect([agoraFileOffered, agoraFileAccepted, agoraFileDone,
+            agoraFileDeclined, agoraFileCancelled, agoraFileFailed,
+            agoraFileTooLarge],
+        [0, 1, 2, 3, 4, 5, 6]);
+    expect(FileTransferState.values.map((s) => s.index),
+        [0, 1, 2, 3, 4, 5, 6]);
+    expect(FileTransferState.fromWire(agoraFileTooLarge),
+        FileTransferState.tooLarge);
   });
 
   test('the address-book and backup bounds and kinds match the C header', () {

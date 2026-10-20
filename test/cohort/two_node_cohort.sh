@@ -352,8 +352,18 @@ class Ev(ctypes.Structure):
         ("backup_added", ctypes.c_int32),
         ("backup_updated", ctypes.c_int32),
         ("backup_removed", ctypes.c_int32),
+        # DM file sharing (45752): the file_* tail.
+        ("file_size", ctypes.c_int64),
+        ("file_done", ctypes.c_int64),
+        ("file_ts", ctypes.c_double),
+        ("file_state", ctypes.c_int32),
+        ("file_outgoing", ctypes.c_int32),
+        ("file_xfer_id", ctypes.c_char * (32 + 1)),
+        ("file_name", ctypes.c_char * (255 + 1)),
+        ("file_reason", ctypes.c_char * (31 + 1)),
+        ("file_path", ctypes.c_char * (4095 + 1)),
     ]
-# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (41296 with
+# ABI guard: this MUST equal sizeof(agora_event_t) in at_agora_shim.h (45752 with
 # the geohash + profile_json + connection_state + DM + POST + REACTION + in_group +
 # proximity_band + BUSINESS_AD tail; rtt@116, geohash@120, profile_json@133,
 # connection_state@2696, dm_seq@2704, post_id@3745, post_seq@3752, reaction tail after
@@ -362,7 +372,7 @@ class Ev(ctypes.Structure):
 # tail from 22149, communities tail from 22168, hub tail from 28600, multi-device
 # tail from 29196). If the C struct grows and this is not updated in lockstep, poll() would
 # misread every field past the drift.
-assert ctypes.sizeof(Ev) == 41296, f"Ev size {ctypes.sizeof(Ev)} != 41296 (ABI drift)"
+assert ctypes.sizeof(Ev) == 45752, f"Ev size {ctypes.sizeof(Ev)} != 45752 (ABI drift)"
 
 lib = ctypes.CDLL(shim)
 lib.agora_set_root.argtypes = [ctypes.c_char_p]; lib.agora_set_root.restype = None

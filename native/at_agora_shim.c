@@ -173,9 +173,22 @@ _Static_assert(AGORA_FC_ORIGIN_SIBLING == AT_FC_ORIGIN_SIBLING
  * assumed. The union did not grow on AT's side: these payloads were already
  * in at_app_event_t. A batch of 16 is now ~660 KB, still heap-allocated by
  * every caller. */
-_Static_assert(sizeof(agora_event_t) == 41296,
+/* 41296 -> 45752 at DM file sharing (the file_* tail: file_size at 41296,
+ * file_state 41320, file_xfer_id 41328, file_path 41649); every prior offset
+ * is unchanged. A batch of 16 is ~730 KB, still heap-allocated by every
+ * caller. */
+_Static_assert(AGORA_FILE_ID_MAX == AT_APP_FILE_ID_LEN
+               && AGORA_FILE_NAME_MAX == AT_APP_FILE_NAME_LEN
+               && AGORA_FILE_PATH_MAX == AT_APP_FILE_PATH_LEN
+               && AGORA_FILE_REASON_MAX == AT_APP_FILE_REASON_LEN,
+               "the file-sharing bounds are out of sync with at_agora.h");
+_Static_assert(AGORA_FILE_OFFERED == AT_APP_FILE_OFFERED
+               && AGORA_FILE_DONE == AT_APP_FILE_DONE
+               && AGORA_FILE_TOO_LARGE == AT_APP_FILE_TOO_LARGE,
+               "AGORA_FILE_* out of sync with AT_APP_FILE_*");
+_Static_assert(sizeof(agora_event_t) == 45752,
                "agora_event_t size changed — update the Dart struct and ALL "
-               "NINE cohort ctypes Ev asserts in lockstep");
+               "ELEVEN cohort ctypes Ev asserts in lockstep");
 
 /* This file reads at_app_event_t through at_agora.h's accessors; a change to
  * that layout is announced by a bump of AT_APP_ABI_VERSION. Pinned here so the
@@ -232,6 +245,34 @@ int agora_send_dm(void *handle, const char *send_queue,
 {
     return at_app_events_send_dm((at_app_events_t *)handle, send_queue,
                                  peer_uuid, text);
+}
+
+int agora_file_offer(void *handle, const char *send_queue, const uint8_t *peer_uuid,
+                     const char *xfer_id, const char *path)
+{
+    return at_app_events_file_offer((at_app_events_t *)handle, send_queue,
+                                    peer_uuid, xfer_id, path);
+}
+
+int agora_file_accept(void *handle, const char *send_queue, const uint8_t *peer_uuid,
+                      const char *xfer_id)
+{
+    return at_app_events_file_accept((at_app_events_t *)handle, send_queue,
+                                     peer_uuid, xfer_id);
+}
+
+int agora_file_decline(void *handle, const char *send_queue, const uint8_t *peer_uuid,
+                       const char *xfer_id)
+{
+    return at_app_events_file_decline((at_app_events_t *)handle, send_queue,
+                                      peer_uuid, xfer_id);
+}
+
+int agora_file_cancel(void *handle, const char *send_queue, const uint8_t *peer_uuid,
+                      const char *xfer_id)
+{
+    return at_app_events_file_cancel((at_app_events_t *)handle, send_queue,
+                                     peer_uuid, xfer_id);
 }
 
 int agora_publish_post(void *handle, const char *send_queue,
@@ -619,6 +660,28 @@ int agora_events_poll(void *handle, agora_event_t *out, int max)
             /* raw text is already NUL-bounded by AT; copy and re-terminate. */
             memcpy(e->dm_text, ev->text, AGORA_DM_TEXT_MAX);
             e->dm_text[AGORA_DM_TEXT_MAX] = '\0';
+            w++;
+            break;
+        }
+
+        case AT_APP_EVENT_FILE: {
+            const at_app_file_t *ev = at_agora_event_file(&raw[i]);
+            e->kind = AGORA_EVENT_FILE;
+            memcpy(e->peer_uuid, ev->peer_uuid, AGORA_UUID_LEN);
+            e->file_size = ev->size;
+            e->file_done = ev->bytes_done;
+            e->file_ts = ev->ts;
+            e->file_state = ev->state;
+            e->file_outgoing = ev->outgoing;
+            /* Each string is NUL-bounded by AT; copy and re-terminate. */
+            memcpy(e->file_xfer_id, ev->xfer_id, AGORA_FILE_ID_MAX);
+            e->file_xfer_id[AGORA_FILE_ID_MAX] = '\0';
+            memcpy(e->file_name, ev->name, AGORA_FILE_NAME_MAX);
+            e->file_name[AGORA_FILE_NAME_MAX] = '\0';
+            memcpy(e->file_reason, ev->reason, AGORA_FILE_REASON_MAX);
+            e->file_reason[AGORA_FILE_REASON_MAX] = '\0';
+            memcpy(e->file_path, ev->path, AGORA_FILE_PATH_MAX);
+            e->file_path[AGORA_FILE_PATH_MAX] = '\0';
             w++;
             break;
         }

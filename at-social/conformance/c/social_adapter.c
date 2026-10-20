@@ -77,6 +77,8 @@ extern const char *at_runner_corpus_json_root(void);
 #include "social/cosign.h"        /* AT_COSIGN_* bounds for the cosign_*_last checks */
 #include "social/id_social.h"
 #include "social/social_msg_types.h"
+#include "social/file_xfer.h"       /* file sharing: builders and the file_xfer seam */
+#include "social/id_file_xfer.h"
 
 /* Each participant's opt-in EXACT position, from fixtures.exact_positions; hung
  * on impl->ext (formerly fields of ic_impl_t). */
@@ -100,10 +102,82 @@ static sx_impl_t *_sx(ic_impl_t *impl)
     return (sx_impl_t *)impl->ext;
 }
 
+/* File sharing writes under the node's root (etc/at/file_xfer.cfg.json and
+ * var/agora/files), and this harness's default root is not writable. A
+ * scenario's first file step points AUTONOMOUS_TRUST_ROOT at a fresh temp
+ * root, and the participant teardown puts the environment back, so no other
+ * scenario runs with a writable root it never asked for (a block would be
+ * persisted there). Mirrors the Python adapter's _fx_root. */
+static char g_fx_root[64] = {0};
+static char *g_fx_prev_root = NULL;
+static bool g_fx_had_prev = false;
+
+static const char *_fx_root(void)
+{
+    if (g_fx_root[0] != '\0')
+        return g_fx_root;
+    const char *prev = getenv("AUTONOMOUS_TRUST_ROOT");
+    g_fx_had_prev = prev != NULL;
+    free(g_fx_prev_root);
+    g_fx_prev_root = prev != NULL ? strdup(prev) : NULL;
+    snprintf(g_fx_root, sizeof(g_fx_root), "/tmp/at-conf-files-XXXXXX");
+    if (mkdtemp(g_fx_root) == NULL) {
+        g_fx_root[0] = '\0';
+        return NULL;
+    }
+    char sub[128];
+    snprintf(sub, sizeof(sub), "%s/etc/at", g_fx_root);
+    makedirs(sub, 0700);
+    snprintf(sub, sizeof(sub), "%s/src", g_fx_root);
+    makedirs(sub, 0700);
+    setenv("AUTONOMOUS_TRUST_ROOT", g_fx_root, 1);
+    return g_fx_root;
+}
+
+static void _fx_root_restore(void)
+{
+    if (g_fx_root[0] == '\0')
+        return;
+    if (g_fx_had_prev && g_fx_prev_root != NULL)
+        setenv("AUTONOMOUS_TRUST_ROOT", g_fx_prev_root, 1);
+    else
+        unsetenv("AUTONOMOUS_TRUST_ROOT");
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_fx_root);
+    if (system(cmd) != 0) { /* a temp dir left behind is harmless */ }
+    g_fx_root[0] = '\0';
+}
+
+/* A step's `content`, repeated `repeat` times (a file of several chunks
+ * without a page of YAML). Caller frees; NULL if there is none. */
+static char *_fx_content(json_t *payload)
+{
+    json_t *jc = json_object_get(payload, "content");
+    if (!json_is_string(jc))
+        return NULL;
+    json_t *jr = json_object_get(payload, "repeat");
+    size_t rep = json_is_integer(jr) && json_integer_value(jr) > 1
+                     ? (size_t)json_integer_value(jr) : 1;
+    size_t one = json_string_length(jc);
+    char *out = malloc(one * rep + 1);
+    if (out == NULL)
+        return NULL;
+    for (size_t k = 0; k < rep; k++)
+        memcpy(out + k * one, json_string_value(jc), one);
+    out[one * rep] = '\0';
+    return out;
+}
+
+static bool _fx_verb(const char *function)
+{
+    return function != NULL && strncmp(function, "peer_file_", 10) == 0;
+}
+
 static void _social_impl_free(ic_impl_t *impl)
 {
     free(impl->ext);
     impl->ext = NULL;
+    _fx_root_restore();
 }
 
 /* A private-proximity probe/reply payload the send hook grabbed for the current
@@ -768,13 +842,75 @@ static int _social_inbound(sce_run_ctx_t *ctx, sce_participant_t *sender,
          || strcmp(function, "trigger_report") == 0
          || strcmp(function, "trigger_follow_community") == 0
          || strcmp(function, "trigger_unfollow_community") == 0
-         || strcmp(function, "trigger_publish_post_label") == 0)
+         || strcmp(function, "trigger_publish_post_label") == 0
+         || strncmp(function, "trigger_file_", 13) == 0)
         && json_is_object(payload)) {
         json_t *body = json_deep_copy(payload);
         if (body != NULL) {
             net_msg_pack_json(&out->info.net_msg, body);
             json_decref(body);
         }
+        return 0;
+    }
+
+    /* File sharing. A scenario names CONTENT, never bytes or hashes: an offer
+     * {id, name, content, chunk?} gets its size, total and BLAKE2b computed
+     * here as the sender's node computes them (`repeat: N` repeats the
+     * content), and a chunk {id, i, content, chunk?, corrupt?} is sliced from the same content and base64-encoded
+     * (`corrupt: true` flips its first byte, a sender whose bytes are not what
+     * it hashed). `ts` defaults to now, so an offer is never stale. Every other
+     * field passes through, so a malformed frame can still be written by hand.
+     * ctl and req pass through whole. Mirrors the Python file builders. */
+    if (_fx_verb(function) && json_is_object(payload)) {
+        json_t *body = json_deep_copy(payload);
+        char *content = _fx_content(payload);
+        size_t clen = content != NULL ? strlen(content) : 0;
+        json_t *jchunk = json_object_get(payload, "chunk");
+        size_t chunk = json_is_integer(jchunk) ? (size_t)json_integer_value(jchunk) : 1024;
+        if (chunk == 0) chunk = 1024;
+        json_object_del(body, "content");
+        json_object_del(body, "repeat");
+        json_object_del(body, "corrupt");
+        if (strcmp(function, "peer_file_offer") == 0) {
+            if (content != NULL) {
+                uint8_t h[32];
+                char hex[65];
+                crypto_generichash(h, sizeof(h), (const unsigned char *)content, clen, NULL, 0);
+                for (int k = 0; k < 32; k++)
+                    snprintf(hex + 2 * k, 3, "%02x", h[k]);
+                json_object_set_new(body, "size", json_integer((json_int_t)clen));
+                json_object_set_new(body, "chunk", json_integer((json_int_t)chunk));
+                json_object_set_new(body, "total",
+                                    json_integer((json_int_t)((clen + chunk - 1) / chunk)));
+                if (json_object_get(body, "hash") == NULL)
+                    json_object_set_new(body, "hash", json_string(hex));
+            }
+            if (json_object_get(body, "ts") == NULL)
+                json_object_set_new(body, "ts", json_real((double)time(NULL)));
+        } else if (strcmp(function, "peer_file_chunk") == 0 && content != NULL) {
+            json_t *ji = json_object_get(payload, "i");
+            size_t i = json_is_integer(ji) ? (size_t)json_integer_value(ji) : 0;
+            size_t off = i * chunk;
+            size_t len = off < clen ? (clen - off < chunk ? clen - off : chunk) : 0;
+            uint8_t *raw = malloc(len + 1);
+            if (raw != NULL) {
+                memcpy(raw, content + (off < clen ? off : 0), len);
+                if (len > 0 && json_is_true(json_object_get(payload, "corrupt")))
+                    raw[0] ^= 0xff;
+                size_t enc = sodium_base64_encoded_len(len, sodium_base64_VARIANT_ORIGINAL);
+                char *b64 = malloc(enc);
+                if (b64 != NULL) {
+                    sodium_bin2base64(b64, enc, raw, len, sodium_base64_VARIANT_ORIGINAL);
+                    json_object_set_new(body, "data", json_string(b64));
+                    free(b64);
+                }
+                free(raw);
+            }
+            json_object_del(body, "chunk");
+        }
+        free(content);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
         return 0;
     }
 
@@ -1268,11 +1404,107 @@ static int _social_inbound(sce_run_ctx_t *ctx, sce_participant_t *sender,
     return 1;
 }
 
+/* Drive one file app verb on @p impl with {peer, id[, path]}. */
+static void _fx_app_verb(ic_impl_t *impl, const char *verb, const char *peer_uuid,
+                         const char *id, const char *path)
+{
+    json_t *jp = json_pack("{s:s, s:s}", "peer", peer_uuid, "id", id != NULL ? id : "");
+    if (path != NULL)
+        json_object_set_new(jp, "path", json_string(path));
+    generic_msg_t m = {0};
+    m.type = NET_MESSAGE;
+    strncpy(m.info.net_msg.process, "identity", PROC_NAME_LEN);
+    m.info.net_msg.function = (char *)verb;
+    net_msg_pack_json(&m.info.net_msg, jp);
+    json_decref(jp);
+    run_message_handlers(impl->proc, NULL, NET_MESSAGE, &m);
+    net_msg_free_obj(&m.info.net_msg);
+}
+
+/* File sharing: the app verbs as triggers ({peer: <pid>, id[, name, content]}),
+ * and a sweep. Returns 0 if @p fn was one, 1 if not, -1 on a bad step. */
+static int _fx_dispatch(sce_run_ctx_t *ctx, ic_impl_t *impl, const char *fn,
+                        generic_msg_t *inbound)
+{
+    if (strncmp(fn, "trigger_file_", 13) != 0)
+        return 1;
+    _sx(impl);   /* so impl_free runs and restores the root */
+    if (_fx_root() == NULL) {
+        snprintf(ctx->err, sizeof(ctx->err), "%s: no writable temp root", fn);
+        return -1;
+    }
+    if (strcmp(fn, "trigger_file_sweep") == 0) {
+        file_xfer_periodic(impl->proc);
+        return 0;
+    }
+    json_t *jp = NULL;
+    if (net_msg_unpack_json(&inbound->info.net_msg, &jp) != 0 || jp == NULL) {
+        snprintf(ctx->err, sizeof(ctx->err), "%s: no payload", fn);
+        return -1;
+    }
+    const char *peer_pid = json_string_value(json_object_get(jp, "peer"));
+    const char *id = json_string_value(json_object_get(jp, "id"));
+    sce_participant_t *tp = peer_pid != NULL ? sce_find_participant(ctx, peer_pid) : NULL;
+    if (tp == NULL || id == NULL) {
+        snprintf(ctx->err, sizeof(ctx->err), "%s: needs peer and id", fn);
+        json_decref(jp);
+        return -1;
+    }
+    ic_impl_t *peer = (ic_impl_t *)tp->impl;
+    _sf_admit(impl->proc, peer->pub);
+    char peer_uuid[UUID_STR_LEN + 1];
+    uuid_unparse_lower(peer->pub->uuid, peer_uuid);
+    if (strcmp(fn, "trigger_file_offer") == 0) {
+        const char *name = json_string_value(json_object_get(jp, "name"));
+        char *content = _fx_content(jp);
+        char path[256];
+        snprintf(path, sizeof(path), "%s/src/%s", g_fx_root,
+                 name != NULL ? name : "file");
+        FILE *f = fopen(path, "wb");
+        if (f != NULL) {
+            if (content != NULL)
+                fwrite(content, 1, strlen(content), f);
+            fclose(f);
+        }
+        free(content);
+        _fx_app_verb(impl, AT_APP_FILE_OFFER, peer_uuid, id, path);
+    } else {
+        const char *verb = strcmp(fn, "trigger_file_accept") == 0 ? AT_APP_FILE_ACCEPT
+                         : strcmp(fn, "trigger_file_decline") == 0 ? AT_APP_FILE_DECLINE
+                         : strcmp(fn, "trigger_file_cancel") == 0 ? AT_APP_FILE_CANCEL
+                         : NULL;
+        if (verb == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err), "unknown file trigger %s", fn);
+            json_decref(jp);
+            return -1;
+        }
+        _fx_app_verb(impl, verb, peer_uuid, id, NULL);
+    }
+    json_decref(jp);
+    return 0;
+}
+
 static int _social_dispatch(sce_run_ctx_t *ctx, sce_participant_t *target,
                             generic_msg_t *inbound)
 {
     ic_impl_t *impl = (ic_impl_t *)target->impl;
     (void)impl;
+    if (inbound->type == NET_MESSAGE && _fx_verb(inbound->info.net_msg.function)) {
+        /* A file frame from a peer: admit the sender (one-hop scenarios, the
+         * C state is a singleton), make sure the root is writable, then let
+         * the real handler run. */
+        _sx(impl);
+        _fx_root();
+        ic_impl_t *snd = _ic_impl_for_uuid(ctx, inbound->info.net_msg.from_whom.uuid);
+        if (snd != NULL && snd->pub != NULL)
+            _sf_admit(impl->proc, snd->pub);
+        return 1;
+    }
+    if (inbound->type == NET_MESSAGE && inbound->info.net_msg.function != NULL) {
+        int rc = _fx_dispatch(ctx, impl, inbound->info.net_msg.function, inbound);
+        if (rc != 1)
+            return rc;
+    }
     if (inbound->type == NET_MESSAGE && _sf_verb(inbound->info.net_msg.function)) {
         /* Admit the sender the way the Python adapter's rosters already do
          * (see _sf_admit), then let the real handler run. */
@@ -2401,6 +2633,89 @@ static int _social_check_key(sce_run_ctx_t *ctx, const char *pid,
                              pid, got, want);
                     return -1;
                 }
+            } else if (strcmp(key, "file_frames_emitted") == 0) {
+                /* {peer_file_<verb>: n}: file frames this participant sent.
+                 * Mirrors the Python emit tallies. */
+                const char *fn;
+                json_t *jn;
+                json_object_foreach(val, fn, jn) {
+                    int want = (int)json_integer_value(jn);
+                    int got = 0;
+                    for (size_t i = 0; i < ctx->captured_count; i++)
+                        if (strcmp(ctx->captured[i].from, pid) == 0
+                            && strcmp(ctx->captured[i].function, fn) == 0)
+                            got++;
+                    if (got != want) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: file_frames_emitted[%s]=%d, expected %d",
+                                 pid, fn, got, want);
+                        return -1;
+                    }
+                }
+            } else if (strcmp(key, "file_xfer") == 0) {
+                /* {peer_id: {dir?, state?, done?, name?, reason?} | {absent:
+                 * true}}: the transfer this participant holds with another,
+                 * from file_xfer_dump. Mirrors the Python adapter's file_xfer. */
+                char *dump = file_xfer_dump();
+                json_t *arr = dump != NULL ? json_loads(dump, 0, NULL) : NULL;
+                free(dump);
+                const char *fpid;
+                json_t *fwant;
+                int rc = 0;
+                json_object_foreach(val, fpid, fwant) {
+                    sce_participant_t *other = sce_find_participant(ctx, fpid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: file_xfer names unknown participant %s", pid, fpid);
+                        rc = -1;
+                        break;
+                    }
+                    char want_uuid[UUID_STR_LEN + 1];
+                    uuid_unparse_lower(((ic_impl_t *)other->impl)->pub->uuid, want_uuid);
+                    const char *want_dir = json_string_value(json_object_get(fwant, "dir"));
+                    json_t *rec = NULL;
+                    for (size_t i = 0; arr != NULL && i < json_array_size(arr); i++) {
+                        json_t *r = json_array_get(arr, i);
+                        if (strcmp(json_string_value(json_object_get(r, "peer")), want_uuid) == 0
+                            && (want_dir == NULL
+                                || strcmp(json_string_value(json_object_get(r, "dir")), want_dir) == 0)) {
+                            rec = r;
+                            break;
+                        }
+                    }
+                    bool absent = json_is_true(json_object_get(fwant, "absent"));
+                    if (absent || rec == NULL) {
+                        if (absent != (rec == NULL)) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: file_xfer[%s] %s", pid, fpid,
+                                     absent ? "present, expected ABSENT" : "absent");
+                            rc = -1;
+                            break;
+                        }
+                        continue;
+                    }
+                    const char *fk;
+                    json_t *fv;
+                    json_object_foreach(fwant, fk, fv) {
+                        json_t *g = json_object_get(rec, fk);
+                        if (!json_equal(g, fv)) {
+                            char *gs = g != NULL ? json_dumps(g, JSON_ENCODE_ANY) : NULL;
+                            char *ws = json_dumps(fv, JSON_ENCODE_ANY);
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: file_xfer[%s].%s=%s, expected %s", pid, fpid,
+                                     fk, gs != NULL ? gs : "(none)", ws != NULL ? ws : "?");
+                            free(gs);
+                            free(ws);
+                            rc = -1;
+                            break;
+                        }
+                    }
+                    if (rc != 0)
+                        break;
+                }
+                json_decref(arr);
+                if (rc != 0)
+                    return -1;
             } else if (strcmp(key, "proximity_probes_emitted") == 0
                        || strcmp(key, "proximity_replies_emitted") == 0) {
                 /* peer_proximity_probe/reply emissions attributed to this

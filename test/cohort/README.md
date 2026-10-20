@@ -70,6 +70,7 @@ exists.
 | `hub_cohort.sh` | 5, two segments | Ethne | Phase 4 proximity hubs: two islands with no route between them meet at their community's area hub. The roll seats the hub, its roster rides inside the policy, only people listed in the area see who is, a listing outside the hub's area is refused, a request becomes a direct peer only on the other's yes, and withdrawing takes effect at once |
 | `device_cohort.sh` | 5, routed /30 links | libsodium | Phase 4 multi-device: a contact added and verified by safety number, a pairing refused across operators and accepted within one, the address book following to the new device, the contact filing it under the same person (live and in the list), a DM reaching the other device, and a lost-both restore from a 0600 backup that keeps the contact verified and links a third device |
 | `compact_cohort.sh` | 5 | Ethne | Phase 5 federation: three communities seal their kith-covenant rites (one recited by an Inductor on its own device), two found a compact by detached co-signing, the third is sponsored, examined by a panel of 3 and admitted, two anathematize it, a policy hides its posts by standing (D39), and a forged or older compact view is refused |
+| `file_share_cohort.sh` | 2 | root | DM file sharing: a 150 MB file arrives whole (SHA-256 matched, rate printed), a receiver killed -9 mid-transfer resumes from its bitmap, a decline is final, and a sender's cancel stops both sides with no partial left |
 
 ### `two_node_cohort.sh`
 
@@ -347,6 +348,22 @@ sudo -E env "PATH=$PATH" ./test/cohort/device_cohort.sh
 
 Knobs: `WAIT` (120), `SUBNET` (10.9.10), `LOG_LEVEL`, `KEEP=1`.
 
+### `file_share_cohort.sh`
+
+Two nodes on one bridged /24, as `two_node_cohort.sh`, driven through the real
+app-event queues one verb at a time (`offer`, `accept`, `decline`, `cancel`,
+`wait`). Transfers are a state type, so each `wait` pulls the roster and reads
+the transfer's current state. Phase 1 times the big transfer and prints MB/s:
+it is the throughput figure for the UDP chunk path, and under about 1 MB/s is
+worth raising. `AT_FILE_CHUNK` and `AT_FILE_WINDOW` pass through to both nodes
+for tuning. Logs are kept on failure. netns only.
+
+```
+sudo -E env "PATH=$PATH" ./test/cohort/file_share_cohort.sh
+SIZE_MB=20 RESUME_MB=10 CANCEL_MB=10 ./test/cohort/file_share_cohort.sh
+AT_FILE_WINDOW=32 AT_FILE_CHUNK=32768 ./test/cohort/file_share_cohort.sh
+```
+
 ## Options
 
 All options are environment variables.
@@ -381,6 +398,7 @@ All options are environment variables.
 | `moderation_cohort.sh` | 90 | `10.9.5` | `GATE_WINDOW` (how long a negative waits, default 20); `NEUTRAL` (`AT_REP_NEUTRAL`, default 0.70); `RESCORE_SEC` (`AT_REP_RESCORE_SEC`, default 5); `CHECKPOINT_SEC` (default 20) |
 | `device_cohort.sh` | 120 | `10.9.10` (one /30 per node behind router netns `agdvrouter`) | `LOG_LEVEL` (default 2). Operator keys are random per run and never written to a node |
 | `compact_cohort.sh` | 180 | `10.9.11` (bridge `agbr11`) | `POLICY_SEC` (as community_policy, default 10; the compact view rides the same carrier); `LOG_LEVEL` (default 2). Each node's app log is `<run>/<node>.agent.log` |
+| `file_share_cohort.sh` | 60 (discovery) | `10.9.12` (bridge `agfbr0`) | `SIZE_MB` (default 150), `RESUME_MB` (40), `CANCEL_MB` (40), `XFER_WAIT` (per-transfer timeout, default 1800); `AT_FILE_CHUNK` / `AT_FILE_WINDOW` (pass through to both nodes); `LOG_LEVEL` (default 2). Run directory `/tmp/agora-files.XXXX`, kept on failure |
 
 ## Where the evidence goes
 

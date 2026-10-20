@@ -18,7 +18,7 @@
  * at_agora.h — the Agora social feature's half of the flat app-event ABI.
  *
  * app_events.h is the core's surface and is the same in every build. This
- * header adds what the social feature carries over it: the event kinds 4..17,
+ * header adds what the social feature carries over it: the event kinds 4..18,
  * their flat payload structs, kind-checked accessors, and the app→AT social
  * verbs. It is installed only by a core built with AT_SOCIAL.
  *
@@ -137,6 +137,28 @@ extern "C" {
  *  (social/cosign.h), AT_COSIGN_TOKEN_LEN (social/social_msg_types.h) and AGORA_COSIGN_TOKEN_MAX. */
 #define AT_APP_COSIGN_TOKEN_LEN 15
 
+/** A file transfer's id: 16 bytes as lowercase hex, chosen by the sending app.
+ *  MUST match AT_FILE_ID_HEX_LEN (social/file_xfer.h) and AGORA_FILE_ID_MAX. */
+#define AT_APP_FILE_ID_LEN 32
+/** A sanitized file name. MUST match AT_FILE_NAME_MAX and AGORA_FILE_NAME_MAX. */
+#define AT_APP_FILE_NAME_LEN 255
+/** A local path. MUST match AT_FILE_PATH_MAX and AGORA_FILE_PATH_MAX. */
+#define AT_APP_FILE_PATH_LEN 4095
+/** A failure reason token. MUST match AT_FILE_REASON_MAX and AGORA_FILE_REASON_MAX. */
+#define AT_APP_FILE_REASON_LEN 31
+
+/** A file transfer's state (@ref at_app_file_t::state). MUST match
+ *  at_file_state_t in social/file_xfer.h. */
+enum {
+    AT_APP_FILE_OFFERED   = 0,
+    AT_APP_FILE_ACCEPTED  = 1,
+    AT_APP_FILE_DONE      = 2,
+    AT_APP_FILE_DECLINED  = 3,
+    AT_APP_FILE_CANCELLED = 4,
+    AT_APP_FILE_FAILED    = 5,
+    AT_APP_FILE_TOO_LARGE = 6
+};
+
 /** The Agora event kinds, carried in @ref at_app_event_t::kind. */
 enum {
     /** A peer's shared coarse position (@ref at_agora_event_position), as an opt-in geohash
@@ -220,7 +242,13 @@ enum {
      *  It reaches you only because this node follows the community. Whether it
      *  COUNTS is decided against the policy you hold, which must list the
      *  moderator who signed it. */
-    AT_APP_EVENT_POST_LABEL = 17
+    AT_APP_EVENT_POST_LABEL = 17,
+
+    /** A file transfer in a DM thread changed (@ref at_app_file_t): an offer
+     *  arrived, the other end answered, progress, or the end. The bytes never
+     *  cross this boundary; the core reads the source and writes the result
+     *  itself, and @c path says where. */
+    AT_APP_EVENT_FILE = 18
 };
 
 /** One peer's shared coarse position. Mirrors `peer_position_msg_t`. */
@@ -449,6 +477,30 @@ typedef struct {
     char    bundle[AT_APP_BUSINESS_POST_BUNDLE_LEN + 1];
 } at_app_business_post_t;
 
+/** One file transfer's state (DM file sharing). Mirrors `peer_file_msg_t`.
+ *
+ *  @c peer_uuid is the other end, crypto_box-authenticated, and with
+ *  @c xfer_id it names the transfer. @c outgoing is 1 when this node sends.
+ *  @c state is AT_APP_FILE_*; @c bytes_done the progress while ACCEPTED;
+ *  @c reason a token on FAILED ("source_changed", "hash_mismatch", ...).
+ *  @c name is a bare, sanitized file name — never a path. @c path is the
+ *  source on an outgoing transfer and, on an incoming one, the finished file
+ *  under var/agora/files once DONE ("" before).
+ *
+ *  Carried by AT_APP_EVENT_FILE. A live stream: the app keeps the thread. */
+typedef struct {
+    uint8_t peer_uuid[AT_APP_UUID_LEN];
+    char    xfer_id[AT_APP_FILE_ID_LEN + 1];
+    int32_t state;
+    int32_t outgoing;
+    int64_t size;
+    int64_t bytes_done;
+    double  ts;
+    char    name[AT_APP_FILE_NAME_LEN + 1];
+    char    reason[AT_APP_FILE_REASON_LEN + 1];
+    char    path[AT_APP_FILE_PATH_LEN + 1];
+} at_app_file_t;
+
 AT_APP_STATIC_ASSERT(sizeof(at_app_position_t) <= AT_APP_EVENT_PAYLOAD_MAX, "at_app_position_t outgrew AT_APP_EVENT_PAYLOAD_MAX");
 AT_APP_STATIC_ASSERT(sizeof(at_app_profile_t) <= AT_APP_EVENT_PAYLOAD_MAX, "at_app_profile_t outgrew AT_APP_EVENT_PAYLOAD_MAX");
 AT_APP_STATIC_ASSERT(sizeof(at_app_connection_t) <= AT_APP_EVENT_PAYLOAD_MAX, "at_app_connection_t outgrew AT_APP_EVENT_PAYLOAD_MAX");
@@ -462,6 +514,7 @@ AT_APP_STATIC_ASSERT(sizeof(at_app_cosign_sig_t) <= AT_APP_EVENT_PAYLOAD_MAX, "a
 AT_APP_STATIC_ASSERT(sizeof(at_app_business_post_t) <= AT_APP_EVENT_PAYLOAD_MAX, "at_app_business_post_t outgrew AT_APP_EVENT_PAYLOAD_MAX");
 AT_APP_STATIC_ASSERT(sizeof(at_app_community_policy_t) <= AT_APP_EVENT_PAYLOAD_MAX, "at_app_community_policy_t outgrew AT_APP_EVENT_PAYLOAD_MAX");
 AT_APP_STATIC_ASSERT(sizeof(at_app_post_label_t) <= AT_APP_EVENT_PAYLOAD_MAX, "at_app_post_label_t outgrew AT_APP_EVENT_PAYLOAD_MAX");
+AT_APP_STATIC_ASSERT(sizeof(at_app_file_t) <= AT_APP_EVENT_PAYLOAD_MAX, "at_app_file_t outgrew AT_APP_EVENT_PAYLOAD_MAX");
 
 /** @brief Keep the Agora event decoders in a STATIC link.
  *
@@ -536,6 +589,10 @@ static inline const at_app_community_policy_t *at_agora_event_community_policy(c
 static inline const at_app_post_label_t *at_agora_event_post_label(const at_app_event_t *ev)
 {
     return (ev != NULL && ev->kind == AT_APP_EVENT_POST_LABEL) ? (const at_app_post_label_t *)(const void *)ev->data.payload : NULL;
+}
+static inline const at_app_file_t *at_agora_event_file(const at_app_event_t *ev)
+{
+    return (ev != NULL && ev->kind == AT_APP_EVENT_FILE) ? (const at_app_file_t *)(const void *)ev->data.payload : NULL;
 }
 /** @} */
 
@@ -888,6 +945,41 @@ int at_app_events_unfollow_community(at_app_events_t *handle, const char *q_out,
 int at_app_events_publish_post_label(at_app_events_t *handle, const char *q_out,
                                      const char *community, const char *post_id,
                                      const char *bundle, int64_t seq);
+
+/**
+ * @brief Offer a file to one device of a peer (DM file sharing).
+ *
+ * Sends `AT_APP_FILE_OFFER` with {"peer","id","path"}. @p xfer_id is 32
+ * lowercase hex the app chose — the SAME for every device of the person, so
+ * that one transfer shows in the thread. @p path is a regular file this node
+ * can read; identity hashes it, keeps the offer, and sends the peer the name,
+ * size and hash. Nothing moves until the peer accepts. An AT_APP_EVENT_FILE
+ * (outgoing, OFFERED) comes back, or FAILED with a reason if the file could
+ * not be read.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 otherwise.
+ */
+int at_app_events_file_offer(at_app_events_t *handle, const char *q_out,
+                             const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                             const char *xfer_id, const char *path);
+
+/** @brief Accept an inbound offer: `AT_APP_FILE_ACCEPT` {"peer","id"}. The
+ *  file lands under var/agora/files; AT_APP_EVENT_FILE reports progress and
+ *  then DONE with its path. */
+int at_app_events_file_accept(at_app_events_t *handle, const char *q_out,
+                              const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                              const char *xfer_id);
+
+/** @brief Decline an inbound offer: `AT_APP_FILE_DECLINE` {"peer","id"}. */
+int at_app_events_file_decline(at_app_events_t *handle, const char *q_out,
+                               const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                               const char *xfer_id);
+
+/** @brief Cancel a transfer either way, offered or under way:
+ *  `AT_APP_FILE_CANCEL` {"peer","id"}. A partial file is deleted. */
+int at_app_events_file_cancel(at_app_events_t *handle, const char *q_out,
+                              const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                              const char *xfer_id);
 
 #ifdef __cplusplus
 }

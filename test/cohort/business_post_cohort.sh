@@ -532,11 +532,21 @@ class Ev(ctypes.Structure):
         ("backup_added", ctypes.c_int32),
         ("backup_updated", ctypes.c_int32),
         ("backup_removed", ctypes.c_int32),
+        # DM file sharing (45752): the file_* tail.
+        ("file_size", ctypes.c_int64),
+        ("file_done", ctypes.c_int64),
+        ("file_ts", ctypes.c_double),
+        ("file_state", ctypes.c_int32),
+        ("file_outgoing", ctypes.c_int32),
+        ("file_xfer_id", ctypes.c_char * (32 + 1)),
+        ("file_name", ctypes.c_char * (255 + 1)),
+        ("file_reason", ctypes.c_char * (31 + 1)),
+        ("file_path", ctypes.c_char * (4095 + 1)),
     ]
 
 # ABI guard: MUST equal sizeof(agora_event_t) in at_agora_shim.h. A silent drift
 # here would decode every field past the drift point as garbage.
-assert ctypes.sizeof(Ev) == 41296, f"Ev size {ctypes.sizeof(Ev)} != 41296 (ABI drift)"
+assert ctypes.sizeof(Ev) == 45752, f"Ev size {ctypes.sizeof(Ev)} != 45752 (ABI drift)"
 
 def connect(lib, timeout):
     """Open the app-event channel, retrying until the daemon binds its queue."""

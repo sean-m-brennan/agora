@@ -40,6 +40,8 @@ at_extension_library(social
         proximity.c
         social_msg_types.c
         at_agora.c
+        file_xfer.c
+        id_file_xfer.c
 )
 
 # The app-facing headers, at the path they were installed to from the core.
@@ -63,6 +65,8 @@ at_extension_tests(social
     app_events_test
     social_link_test
     post_store_test
+    file_xfer_test
+    file_xfer_flow_test
 )
 
 # The social halves of three AT core tests (app_node_test, msg_types3_test,

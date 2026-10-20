@@ -1,0 +1,46 @@
+schema_version: "1"
+kind: scenario
+protocol: social
+name: file-offer-declined
+byte_pinning: false
+description: |
+    The receiver declines. alice is told, nothing is requested, and the decision
+    is final: an Accept after it changes nothing.
+
+participants:
+  - id: node
+    role: border_guard
+  - id: alice
+    role: group_member
+
+steps:
+  - id: 1
+    from: alice
+    to: node
+    function: peer_file_offer
+    payload: {id: a1b2c3d4e5f60718293a4b5c6d7e8f90, name: big.iso, content: x}
+  - id: 2
+    from: node
+    to: node
+    function: trigger_file_decline
+    payload: {peer: alice, id: a1b2c3d4e5f60718293a4b5c6d7e8f90}
+  - id: 3
+    from: node
+    to: alice
+    function: peer_file_ctl
+    in_response_to: 2
+    description: alice is told no.
+  - id: 4
+    from: node
+    to: node
+    function: trigger_file_accept
+    payload: {peer: alice, id: a1b2c3d4e5f60718293a4b5c6d7e8f90}
+    description: A declined offer cannot be accepted afterwards.
+
+expected_state:
+  node:
+    file_xfer:
+      alice: {dir: in, state: 3, done: 0}
+    file_frames_emitted:
+      peer_file_ctl: 1
+      peer_file_req: 0

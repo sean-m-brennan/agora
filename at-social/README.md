@@ -64,14 +64,14 @@ for it: a build has social when `AT_EXTERNAL_EXTENSIONS` names `c/social` (below
 from load-time constructors:
 
 - the identity hooks (AT's `identity/id_ext.h`, below);
-- its 42 identity verbs, 21 from the wire and 21 from the app, through
+- its 50 identity verbs, 25 from the wire and 25 from the app, through
   `processes/extension.h` on "identity" only;
-- its 14 message types and 21 `AT_APP_*` verbs (`social/social_msg_types.h`);
+- its 15 message types and 25 `AT_APP_*` verbs (`social/social_msg_types.h`);
 - the app-event decoders behind `at_agora.h`.
 
 The app-facing API kept its names: `at_agora.h`, `at_app_events_*`,
 `at_agora_event_*` and event kinds 4–15, to which Agora has appended 16 and 17
-(Phase 4 communities). The Agora shim and the Dart bindings
+(Phase 4 communities) and 18 (file sharing). The Agora shim and the Dart bindings
 changed only their link and include lines. The anchor is `at_social_link()`
 (`social/at_social.h`).
 
@@ -129,13 +129,15 @@ prefix `autonomous_trust.social.`), found by its entry point or its
 `_at_extension.py` marker. The modules are:
 
 - `protocol` holds `SocialProtocol`: the 17 verbs moved off `IdentityProtocol`
-  with their strings unchanged, the three store-and-forward verbs, and the two
-  community verbs;
+  with their strings unchanged, the three store-and-forward verbs, the two
+  community verbs, and the four file verbs;
 - `extension` is the `Extension`;
 - `handlers` holds the handlers and senders, as module functions `f(proc, …)`;
 - `state` holds `SocialState`, on `proc.social`;
 - `codec`, `proximity` and `social_store` are the canonical forms, grid tags
-  and durable store.
+  and durable store;
+- `file_xfer` is file sharing: wire forms, names, the bitmap and store, and
+  the state machine.
 
 Handlers register as `functools.partial(fn, proc)`, so the process still
 pickles. The core's identity process calls the extension through
@@ -320,3 +322,36 @@ conformance scenarios (`cosign-ask-{compact-act,rite,commitment,kc-record,
 kc-seal,kc-attest,kc-recite,kc-conduct}-delivered` and
 `community-compact-view-carried-and-survives-reload`) cover them on both
 runtimes. `../test/cohort/compact_cohort.sh` runs it live.
+
+## File sharing in a DM thread (2026-10)
+
+A file goes from one person to one device of another after that person
+accepts; the receiver pulls it in chunks and the core, not the app, reads and
+writes the bytes. The design is `../doc/agora/design.md` §4.3.
+
+**C.** `c/social/file_xfer.{h,c}` is the pure half: bounds, the four wire
+forms, name sanitizing, the chunk bitmap, BLAKE2b of a file, and the
+persisted store (`etc/at/file_xfer.cfg.json`). `c/social/id_file_xfer.{h,c}`
+is the state machine on the identity process, behind its own leaf lock, and
+id_social.c reaches it through five calls from its register, run_start,
+periodic-resync, roster-replay and reset hooks. Wire verbs: `peer_file_offer`,
+`peer_file_ctl`, `peer_file_req`, `peer_file_chunk`; app verbs:
+`app_file_offer`, `app_file_accept`, `app_file_decline`, `app_file_cancel`;
+event: `PEER_FILE_OBSERVED` → `AT_APP_EVENT_FILE` (18), a state type, so the
+roster pull replays it.
+
+**Python.** `_python/file_xfer.py` is the twin. Its app-side functions
+(`offer_file`, `accept_file`, ...) are what the conformance adapter calls, as
+for the other app-driven sends; it emits no app events.
+
+**Tests.** `file_xfer_test.c` (names, wire forms, bitmap, store) and
+`file_xfer_flow_test.c` (each side through the handlers: serve, pull and place,
+resume from the bitmap after a restart, wrong-peer chunks, a corrupt file, a
+blocked sender, the size cap, a peer driving our app verb). `test_file_xfer.py`
+holds the same name table as the C test. Six conformance scenarios (`file-*`)
+run on both runtimes. Scenarios name file CONTENT (`content`, `repeat`) and
+the adapters compute sizes, hashes and base64 the way the nodes do. The C
+adapter gives a scenario a temp `AUTONOMOUS_TRUST_ROOT` from its first file
+step, because the harness root is not writable. Resume is not a conformance
+case, because it waits on a 3 s request timeout that the harness has no clock
+for.

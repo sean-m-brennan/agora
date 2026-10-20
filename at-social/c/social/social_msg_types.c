@@ -44,6 +44,9 @@ SOCIAL_TYPE(cosign_sig,         PEER_COSIGN_SIG_OBSERVED,         peer_cosign_si
 SOCIAL_TYPE(business_post,      PEER_BUSINESS_POST_OBSERVED,      peer_business_post_msg_t)
 SOCIAL_TYPE(community_policy,   PEER_COMMUNITY_POLICY_OBSERVED,   peer_community_policy_msg_t)
 SOCIAL_TYPE(post_label,         PEER_POST_LABEL_OBSERVED,         peer_post_label_msg_t)
+/* A transfer's state is re-emitted on the roster pull (file_xfer_replay), so
+ * an app that was not attached catches up on its next pull. */
+SOCIAL_STATE_TYPE(file,             PEER_FILE_OBSERVED,               peer_file_msg_t)
 
 /* The app verbs the social feature accepts. Every one is forwarded ONLY to
  * identity, which owns each store and each signed or encrypted send:
@@ -51,8 +54,8 @@ SOCIAL_TYPE(post_label,         PEER_POST_LABEL_OBSERVED,         peer_post_labe
  * posts (7), reactions, local block/unblock and reports (8, P4.1), presence
  * pull, local-only exact position and the proximity probe (Phase 2), business
  * page + customer edge (P3.2), both halves of a detached co-signature (P3.3),
- * the envoy-signed business post (P3.4), and following a community and
- * publishing a moderator's label (Phase 4). */
+ * the envoy-signed business post (P3.4), following a community and
+ * publishing a moderator's label (Phase 4), and file sharing in a DM thread. */
 AT_APP_VERB_REGISTER(set_position,           AT_APP_SET_POSITION,          "identity")
 AT_APP_VERB_REGISTER(set_profile,            AT_APP_SET_PROFILE,           "identity")
 AT_APP_VERB_REGISTER(connect_request,        AT_APP_CONNECT_REQUEST,       "identity")
@@ -74,5 +77,9 @@ AT_APP_VERB_REGISTER(request_proximity,      AT_APP_REQUEST_PROXIMITY,     "iden
 AT_APP_VERB_REGISTER(follow_community,       AT_APP_FOLLOW_COMMUNITY,      "identity")
 AT_APP_VERB_REGISTER(unfollow_community,     AT_APP_UNFOLLOW_COMMUNITY,    "identity")
 AT_APP_VERB_REGISTER(publish_post_label,     AT_APP_PUBLISH_POST_LABEL,    "identity")
+AT_APP_VERB_REGISTER(file_offer,             AT_APP_FILE_OFFER,            "identity")
+AT_APP_VERB_REGISTER(file_accept,            AT_APP_FILE_ACCEPT,           "identity")
+AT_APP_VERB_REGISTER(file_decline,           AT_APP_FILE_DECLINE,          "identity")
+AT_APP_VERB_REGISTER(file_cancel,            AT_APP_FILE_CANCEL,           "identity")
 
 void at_social_msg_types_link(void) {}

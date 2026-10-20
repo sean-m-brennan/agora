@@ -121,7 +121,21 @@ if [ "$PLATFORM" = "windows" ]; then
   AGORA_MINGW_BIN="$(cygpath -m "$MSYSTEM_PREFIX/bin")"
   export AGORA_MINGW_BIN
   PLATFORM_CMAKE_ARGS=(-G Ninja)
+  # The UCRT64 CMake, by path. MSYS2's other one (/usr/bin/cmake, package
+  # `cmake`) targets the MSYS runtime, where WIN32 is unset: every Windows
+  # branch is skipped and the build dies looking for <uuid/uuid.h>. Whichever
+  # comes first on PATH, this one is used, and its Ninja and GCC beside it.
+  AGORA_CMAKE="$MSYSTEM_PREFIX/bin/cmake"
+  if [ ! -x "$AGORA_CMAKE.exe" ] && [ ! -x "$AGORA_CMAKE" ]; then
+    echo "error: $AGORA_CMAKE not found; install it: pacman -S mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja (or ./setup.sh)" >&2
+    exit 2
+  fi
+  export PATH="$MSYSTEM_PREFIX/bin:$PATH"
+  if [ "$(command -v cmake)" != "$(command -v "$AGORA_CMAKE")" ]; then
+    echo "==> note: 'cmake' on PATH is $(command -v cmake); using $AGORA_CMAKE"
+  fi
 fi
+AGORA_CMAKE="${AGORA_CMAKE:-cmake}"
 
 # --- locate flutter ----------------------------------------------------------
 # On PATH, else where ./setup.sh puts it ($FLUTTER_HOME; /opt/flutter on Linux,
@@ -169,6 +183,17 @@ elif [ -f native/build/CMakeCache.txt ]; then
   if [ -z "$stale" ] && grep -qiE '^CMAKE_(C|CXX)_COMPILER(_LAUNCHER)?:[^=]*=[^ ]*(miniforge|miniconda|anaconda|/conda|/envs/)' native/build/CMakeCache.txt; then
     stale="conda-configured compiler"
   fi
+  # Windows: a cache another CMake made (MSYS2's /usr/bin/cmake, say) is
+  # reused as-is by the next one, wrong platform and all.
+  if [ -z "$stale" ] && [ "$PLATFORM" = "windows" ]; then
+    made_by="$(sed -n 's/^CMAKE_COMMAND:INTERNAL=//p' native/build/CMakeCache.txt)"
+    want="$(cygpath -m "$(command -v "$AGORA_CMAKE")")"
+    # Drive-letter case and the .exe vary between the two spellings.
+    if [ "$(printf '%s' "${made_by%.exe}" | tr 'A-Z' 'a-z')" != \
+         "$(printf '%s' "${want%.exe}" | tr 'A-Z' 'a-z')" ]; then
+      stale="configured by $made_by, not $want"
+    fi
+  fi
   if [ -n "$stale" ]; then
     echo "==> Stale native/build cache ($stale); reconfiguring clean"
     rm -rf native/build
@@ -194,14 +219,14 @@ if [ "${AGORA_STRICT:-0}" != "1" ]; then
   )
 fi
 
-cmake -S native -B native/build "${NATIVE_CMAKE_ARGS[@]}" ${PLATFORM_CMAKE_ARGS[@]+"${PLATFORM_CMAKE_ARGS[@]}"}
+"$AGORA_CMAKE" -S native -B native/build "${NATIVE_CMAKE_ARGS[@]}" ${PLATFORM_CMAKE_ARGS[@]+"${PLATFORM_CMAKE_ARGS[@]}"}
 # ethne_ffi (businesses = Ethne polities) is built too when cargo is available;
 # its CMake target does not exist if Rust is not installed (a warning at
 # configure). The core targets build either way; an ethne failure is reported,
 # not fatal, since businesses are the only feature it carries.
-cmake --build native/build --target agorad agora_shim -j"$JOBS"
+"$AGORA_CMAKE" --build native/build --target agorad agora_shim -j"$JOBS"
 if grep -q '^CARGO_EXECUTABLE:FILEPATH=/' native/build/CMakeCache.txt 2>/dev/null; then
-  cmake --build native/build --target ethne_ffi -j"$JOBS" \
+  "$AGORA_CMAKE" --build native/build --target ethne_ffi -j"$JOBS" \
     || echo "==> WARNING: ethne_ffi (businesses) failed to build; the app runs without it" >&2
 fi
 

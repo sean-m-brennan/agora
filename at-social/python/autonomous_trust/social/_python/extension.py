@@ -15,7 +15,7 @@
 # ******************
 """The social feature as an identity extension (FEATURE_SPLIT_PLAN Phase 5).
 
-Registers social's 22 verbs on the identity process (``functools.partial`` of
+Registers social's 26 verbs on the identity process (``functools.partial`` of
 module functions, so the process still pickles), sets ``proc.social``, and
 follows identity through the IdentityHooks the core calls: admission, the
 periodic resync, and the blocked-peer check behind ``get_peer_tier``. Its
@@ -29,6 +29,7 @@ import functools
 from autonomous_trust.core._python.extensions import Extension, IdentityHooks
 from .protocol import SocialProtocol
 from . import handlers
+from . import file_xfer
 from .state import SocialState
 
 
@@ -69,6 +70,11 @@ def _register(proc, proc_name: str) -> None:
                                    functools.partial(handlers.handle_connection_response, proc))
     proc.protocol.register_handler(SocialProtocol.dm,
                                    functools.partial(handlers.handle_dm, proc))
+    for verb, fn in ((SocialProtocol.file_offer, file_xfer.handle_file_offer),
+                     (SocialProtocol.file_ctl, file_xfer.handle_file_ctl),
+                     (SocialProtocol.file_req, file_xfer.handle_file_req),
+                     (SocialProtocol.file_chunk, file_xfer.handle_file_chunk)):
+        proc.protocol.register_handler(verb, functools.partial(fn, proc))
     proc.protocol.register_handler(SocialProtocol.post,
                                    functools.partial(handlers.handle_post, proc))
     proc.protocol.register_handler(SocialProtocol.reaction,
@@ -98,6 +104,8 @@ def _post_fork(proc) -> None:
     n = handlers.load_social_blocks(proc)
     if n:
         proc.logger.info('Identity: restored %d local block(s)', n)
+    # File transfers under way when the node stopped resume from here.
+    file_xfer.restore(proc)
 
 
 def _on_peer_confirmed(proc, queues, peer) -> None:
@@ -170,6 +178,8 @@ def _periodic_resync(proc, queues) -> None:
     handlers.maybe_send_post_digest(proc, queues)
     # Communities (Phase 4): carry the policies we follow, first-person.
     handlers.maybe_advertise_communities(proc, queues)
+    # File sharing: save progress, resume stalled pulls, expire old offers.
+    file_xfer.periodic(proc, queues)
 
 
 def _is_blocked_locked(proc, uuid_str) -> bool:

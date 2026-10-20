@@ -123,6 +123,14 @@ class SocialProtocol(Protocol):
     # signature on the end.
     cosign_request = 'peer_cosign_request'  # msg.obj <- json {record,op,polity,cid,bytes,seq,ts}
     cosign_sig = 'peer_cosign_sig'  # msg.obj <- json {cid,signer,sig,seq,ts}
+    # File sharing in a DM thread (file_xfer.py): four directed, ENCRYPTED
+    # verbs, none in UNENCRYPTED_VERBS. The receiver pulls a window of chunks
+    # after accepting; no freshness seq, every verb is idempotent and keyed by
+    # (peer, id).
+    file_offer = 'peer_file_offer'  # msg.obj <- json {id,name,size,chunk,total,hash,ts}
+    file_ctl = 'peer_file_ctl'  # msg.obj <- json {id,op,reason?}
+    file_req = 'peer_file_req'  # msg.obj <- json {id,first,count}
+    file_chunk = 'peer_file_chunk'  # msg.obj <- json {id,i,data}
     # STORE-AND-FORWARD (Agora Phase 4 DDIL). A post is a fire-and-forget
     # multicast, so a node off the segment when it went out (the other island of
     # a partition) never hears it. The digest (group, encrypted) advertises the
