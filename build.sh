@@ -16,6 +16,11 @@
 #   ./build.sh [linux|macos|windows] --run  # build the native layer, then
 #                                           # `flutter run` the app against it
 #                                           # (what ./run-dev.sh does)
+#   ./build.sh [linux|macos|windows] --no-app
+#                                           # build only the native layer
+#                                           # (agorad, libagora_shim, AT core,
+#                                           # ethne_ffi): no Flutter, and on
+#                                           # macOS no full Xcode, needed
 #
 # Env:
 #   AGORA_STRICT=1   keep AT's hardcoded -Werror (default: strip it via
@@ -41,12 +46,19 @@ set -euo pipefail
 
 PLATFORM="linux"
 RUN=0
+NO_APP=0
 for arg in "$@"; do
   case "$arg" in
-    --run) RUN=1 ;;
-    *)     PLATFORM="$arg" ;;
+    --run)    RUN=1 ;;
+    --no-app) NO_APP=1 ;;
+    -*)       echo "error: unknown option '$arg' (want: --run | --no-app)" >&2; exit 2 ;;
+    *)        PLATFORM="$arg" ;;
   esac
 done
+if [ "$RUN" = "1" ] && [ "$NO_APP" = "1" ]; then
+  echo "error: --run and --no-app are mutually exclusive" >&2
+  exit 2
+fi
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 FLUTTER_MODE="${FLUTTER_MODE:---debug}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -139,8 +151,8 @@ AGORA_CMAKE="${AGORA_CMAKE:-cmake}"
 
 # --- locate flutter ----------------------------------------------------------
 # On PATH, else where ./setup.sh puts it ($FLUTTER_HOME; /opt/flutter on Linux,
-# ~/flutter on macOS and Windows).
-if ! command -v flutter >/dev/null 2>&1; then
+# ~/flutter on macOS and Windows). Not needed for --no-app.
+if [ "$NO_APP" != "1" ] && ! command -v flutter >/dev/null 2>&1; then
   for fh in "${FLUTTER_HOME:-}" /opt/flutter "$HOME/flutter"; do
     if [ -n "$fh" ] && [ -x "$fh/bin/flutter" ]; then
       export PATH="$PATH:$fh/bin"
@@ -228,6 +240,19 @@ fi
 if grep -q '^CARGO_EXECUTABLE:FILEPATH=/' native/build/CMakeCache.txt 2>/dev/null; then
   "$AGORA_CMAKE" --build native/build --target ethne_ffi -j"$JOBS" \
     || echo "==> WARNING: ethne_ffi (businesses) failed to build; the app runs without it" >&2
+fi
+
+if [ "$NO_APP" = "1" ]; then
+  case "$PLATFORM" in
+    windows) ext=dll exe=.exe ;;
+    macos)   ext=dylib exe= ;;
+    *)       ext=so exe= ;;
+  esac
+  echo
+  echo "==> Native layer built (--no-app: Flutter app skipped)."
+  echo "    native : native/build/{agorad$exe,libagora_shim.$ext,at_core/libautonomous_trust.$ext}"
+  echo "             + at_core/extensions/<layer>/libat_<layer>.$ext"
+  exit 0
 fi
 
 # --- 2. Flutter app ----------------------------------------------------------
