@@ -171,7 +171,9 @@ while IFS='|' read -r file _; do
     case "$rp" in /*) install_name_tool -delete_rpath "$rp" "$file" ;; esac
   done < <(rpaths_of "$file")
   if [ "$(dirname "$file")" = "$FW" ]; then want="@loader_path"; else want="@executable_path/../Frameworks"; fi
-  rpaths_of "$file" | grep -qxF "$want" || install_name_tool -add_rpath "$want" "$file"
+  # A here-string, not a pipe: under pipefail, grep -q exiting on the first
+  # match can SIGPIPE the writer, and the 141 would re-add an existing rpath.
+  grep -qxF "$want" <<< "$(rpaths_of "$file")" || install_name_tool -add_rpath "$want" "$file"
 done < "$EMBEDDED"
 
 # --- 4. Sign, inside-out -----------------------------------------------------
